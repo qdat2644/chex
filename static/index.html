@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CheXpert Web Reader</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="workspace" aria-labelledby="title">
+        <div class="panel upload-panel">
+          <p class="eyebrow">Chest X-ray AI</p>
+          <h1 id="title">CheXpert Web Reader</h1>
+          <form id="upload-form">
+            <label class="dropzone" for="xray-file">
+              <span class="dropzone-title">Upload X-ray image</span>
+              <span id="file-name" class="dropzone-meta">PNG, JPG, or JPEG</span>
+              <input id="xray-file" name="file" type="file" accept="image/*" required />
+            </label>
+            <button type="submit">Analyze</button>
+          </form>
+          <p class="notice">
+            Research prototype only. Do not use results for medical decisions.
+          </p>
+        </div>
+
+        <div class="panel preview-panel">
+          <div class="image-viewer">
+            <div class="image-frame">
+              <img id="preview" alt="Uploaded chest X-ray preview" hidden />
+              <div id="empty-preview" class="empty-preview">No image selected</div>
+            </div>
+            <div id="heatmap-wrap" class="heatmap-wrap" hidden>
+              <div class="heatmap-heading">
+                <h2>Model focus</h2>
+                <span id="heatmap-label" class="status"></span>
+              </div>
+              <img id="heatmap" alt="Model focus heatmap" />
+            </div>
+          </div>
+        </div>
+
+        <div class="panel result-panel">
+          <div class="result-heading">
+            <h2>Findings</h2>
+            <span id="status" class="status">Waiting</span>
+          </div>
+          <div id="message" class="message" hidden></div>
+          <div id="report" class="report" hidden></div>
+          <div id="results" class="results"></div>
+        </div>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
