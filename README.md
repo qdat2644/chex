@@ -44,7 +44,7 @@ The loader accepts CSV rows with a `Path` column and CheXpert finding columns. I
 ## Quick Start
 
 ```powershell
-conda activate chex
+conda activate dat
 pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
@@ -59,16 +59,28 @@ With a checkpoint, the API returns probabilities, a short generated report, and 
 Once the dataset exists:
 
 ```powershell
-python scripts/train.py --data-root archive --epochs 3 --batch-size 16 --output checkpoints/chexpert_densenet121.pt
+python scripts/train.py --data-root archive --epochs 5 --batch-size 32 --num-workers 4 --pretrained --view frontal --output checkpoints/chexpert_densenet121.pt
 ```
 
 Add `--pretrained` if you want ImageNet initialization and the machine can download/cache torchvision weights.
 Add `--label-preset all` to train all 14 CheXpert labels instead of the 5 competition labels.
+Training defaults to frontal-only images, mixed precision on CUDA, fixed seed `42`, and class imbalance `pos_weight`.
+Each run writes:
+
+- best checkpoint: `checkpoints/chexpert_densenet121.pt`
+- last checkpoint: `checkpoints/chexpert_densenet121_last.pt`
+- metrics/config JSON: `checkpoints/chexpert_densenet121.metrics.json`
+
+CUDA smoke test before full training:
+
+```powershell
+python scripts/train.py --data-root archive --epochs 1 --batch-size 32 --num-workers 4 --limit 2048 --pretrained --view frontal --output checkpoints/smoke_cuda.pt
+```
 
 ## Evaluate
 
 ```powershell
-python scripts/evaluate.py --checkpoint checkpoints/chexpert_densenet121.pt --data-root archive --batch-size 16
+python scripts/evaluate.py --checkpoint checkpoints/chexpert_densenet121.pt --data-root archive --batch-size 32 --num-workers 4
 ```
 
 If `archive/valid.csv` is missing, evaluation falls back to `archive/train.csv`. Use `--limit` for a quick smoke run.
@@ -82,7 +94,7 @@ python scripts/predict.py --checkpoint checkpoints/chexpert_densenet121.pt --ima
 ## Run With A Checkpoint
 
 ```powershell
-conda activate chex
+conda activate dat
 $env:CHEXPERT_CHECKPOINT="checkpoints/chexpert_densenet121.pt"
 uvicorn app.main:app --reload
 ```
@@ -104,7 +116,7 @@ These are the common CheXpert competition labels. Use `--label-preset all` durin
 ## Test
 
 ```powershell
-conda activate chex
+conda activate dat
 python -m unittest discover
 python scripts/train.py --data-root archive --epochs 0 --batch-size 2 --limit 8
 ```

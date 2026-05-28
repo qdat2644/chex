@@ -26,6 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--uncertain-policy", choices=["zero", "one", "ignore"], default="zero")
+    parser.add_argument("--view", choices=["frontal", "lateral", "all"], default=None)
     return parser.parse_args()
 
 
@@ -47,6 +48,8 @@ def main() -> None:
     predictor = CheXpertPredictor(args.checkpoint)
     if predictor.model is None:
         raise RuntimeError("Checkpoint failed to load.")
+    metadata = getattr(predictor, "metadata", {})
+    view = args.view or metadata.get("view", "all")
 
     csv_path = args.csv or args.data_root / "valid.csv"
     if not csv_path.exists():
@@ -58,6 +61,7 @@ def main() -> None:
         predictor.transform,
         labels=predictor.labels,
         uncertain_policy=args.uncertain_policy,
+        view=view,
     )
     if args.limit:
         dataset = Subset(dataset, range(min(args.limit, len(dataset))))
@@ -89,6 +93,7 @@ def main() -> None:
     result = {
         "checkpoint": str(args.checkpoint),
         "csv": str(csv_path),
+        "view": view,
         "rows": len(dataset),
         "loss": total_loss / len(dataset),
         "mean_auc": float(sum(valid_aucs) / len(valid_aucs)) if valid_aucs else None,

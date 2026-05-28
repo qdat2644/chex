@@ -39,6 +39,38 @@ class CheXpertDatasetTest(unittest.TestCase):
             self.assertEqual(tuple(image.shape), (3, 8, 8))
             self.assertEqual(target.tolist(), [1.0, 1.0, 0.0, 0.0, 1.0])
 
+    def test_filters_by_view(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for folder in ["frontal", "lateral"]:
+                image_path = root / "train" / folder / "view.jpg"
+                image_path.parent.mkdir(parents=True)
+                Image.new("L", (8, 8), color=128).save(image_path)
+
+            csv_path = root / "train.csv"
+            rows = []
+            for view, folder in [("Frontal", "frontal"), ("Lateral", "lateral")]:
+                rows.append(
+                    {
+                        "Path": f"CheXpert-v1.0-small/train/{folder}/view.jpg",
+                        "Frontal/Lateral": view,
+                        "Atelectasis": 0,
+                        "Cardiomegaly": 0,
+                        "Consolidation": 0,
+                        "Edema": 0,
+                        "Pleural Effusion": 0,
+                    }
+                )
+            pd.DataFrame(rows).to_csv(csv_path, index=False)
+
+            frontal = CheXpertDataset(csv_path, root, transforms.ToTensor(), view="frontal")
+            lateral = CheXpertDataset(csv_path, root, transforms.ToTensor(), view="lateral")
+            all_views = CheXpertDataset(csv_path, root, transforms.ToTensor(), view="all")
+
+            self.assertEqual(len(frontal), 1)
+            self.assertEqual(len(lateral), 1)
+            self.assertEqual(len(all_views), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

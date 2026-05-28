@@ -51,6 +51,7 @@ class CheXpertPredictor:
             ]
         )
         self.model: torch.nn.Module | None = None
+        self.metadata: dict[str, object] = {}
 
         if checkpoint_path:
             self.load(checkpoint_path)
@@ -60,10 +61,16 @@ class CheXpertPredictor:
         return self.model is not None
 
     def load(self, checkpoint_path: str | Path) -> None:
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+        except (TypeError, pickle.UnpicklingError):
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
         labels = checkpoint.get("labels") if isinstance(checkpoint, dict) else None
         if labels:
             self.labels = list(labels)
+        metadata = checkpoint.get("metadata") if isinstance(checkpoint, dict) else None
+        if isinstance(metadata, dict):
+            self.metadata = metadata
 
         model = models.densenet121(weights=None)
         in_features = model.classifier.in_features
@@ -155,3 +162,4 @@ class CheXpertPredictor:
         image.save(buffer, format="PNG")
         encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
         return f"data:image/png;base64,{encoded}"
+import pickle

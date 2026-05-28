@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import json
+import random
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Subset
@@ -31,6 +34,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--uncertain-policy", choices=["zero", "one", "ignore"], default="zero")
     parser.add_argument("--label-preset", choices=["competition", "all"], default="competition")
+    parser.add_argument("--view", choices=["frontal", "lateral", "all"], default="frontal")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--pos-weight", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--pretrained", action="store_true", help="Initialize DenseNet121 with ImageNet weights.")
     return parser.parse_args()
 
@@ -68,6 +75,8 @@ def run_epoch(
     criterion: torch.nn.Module,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None = None,
+    scaler: torch.amp.GradScaler | None = None,
+    use_amp: bool = False,
 ) -> tuple[float, list[list[float]], list[list[float]]]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -79,13 +88,18 @@ def run_epoch(
         images = images.to(device)
         targets = targets.to(device)
 
-        with torch.set_grad_enabled(is_train):
+        with torch.set_grad_enabled(is_train), torch.amp.autocast(device_type=device.type, enabled=use_amp):
             logits = model(images)
             loss = criterion(logits, targets)
             if optimizer:
                 optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
+                if scaler:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
 
         total_loss += float(loss.detach().cpu()) * images.size(0)
         all_targets.extend(targets.detach().cpu().tolist())
@@ -94,21 +108,106 @@ def run_epoch(
     return total_loss / len(loader.dataset), all_targets, all_probs
 
 
-def mean_auc(targets: list[list[float]], probs: list[list[float]], labels: list[str]) -> float | None:
-    aucs = []
-    for label_index in range(len(labels)):
+def label_aucs(targets: list[list[float]], probs: list[list[float]], labels: list[str]) -> dict[str, float | None]:
+    scores: dict[str, float | None] = {}
+    for label_index, label in enumerate(labels):
         y_true = [row[label_index] for row in targets]
         y_score = [row[label_index] for row in probs]
         if len(set(y_true)) < 2:
+            scores[label] = None
             continue
-        aucs.append(roc_auc_score(y_true, y_score))
+        scores[label] = float(roc_auc_score(y_true, y_score))
+    return scores
+
+
+def mean_auc(scores: dict[str, float | None]) -> float | None:
+    aucs = [score for score in scores.values() if score is not None]
     if not aucs:
         return None
     return float(sum(aucs) / len(aucs))
 
 
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = True
+
+
+def subset_dataset(dataset: CheXpertDataset, limit: int | None) -> CheXpertDataset | Subset:
+    if not limit:
+        return dataset
+    return Subset(dataset, range(min(limit, len(dataset))))
+
+
+def target_frame(dataset: CheXpertDataset | Subset) -> tuple[CheXpertDataset, list[int] | None]:
+    if isinstance(dataset, Subset):
+        base = dataset.dataset
+        if not isinstance(base, CheXpertDataset):
+            raise TypeError("Expected Subset over CheXpertDataset.")
+        return base, list(dataset.indices)
+    return dataset, None
+
+
+def calculate_pos_weight(dataset: CheXpertDataset | Subset, labels: list[str]) -> torch.Tensor:
+    base, indices = target_frame(dataset)
+    frame = base.frame.iloc[indices] if indices is not None else base.frame
+    targets = []
+    for label in labels:
+        values = frame[label].map(base._normalize_label)
+        targets.append(values.astype(float).to_numpy())
+    target_array = np.stack(targets, axis=1)
+    positives = target_array.sum(axis=0)
+    negatives = target_array.shape[0] - positives
+    weights = negatives / np.clip(positives, 1.0, None)
+    return torch.tensor(weights, dtype=torch.float32)
+
+
+def checkpoint_payload(
+    model: torch.nn.Module,
+    labels: list[str],
+    args: argparse.Namespace,
+    epoch: int,
+    metric: float,
+    metrics_history: list[dict[str, object]],
+) -> dict[str, object]:
+    return {
+        "model_state_dict": model.state_dict(),
+        "labels": labels,
+        "image_size": DEFAULT_IMAGE_SIZE,
+        "metadata": {
+            "epoch": epoch,
+            "best_metric": metric,
+            "label_preset": args.label_preset,
+            "uncertain_policy": args.uncertain_policy,
+            "view": args.view,
+            "seed": args.seed,
+            "amp": args.amp,
+            "pos_weight": args.pos_weight,
+            "pretrained": args.pretrained,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "torch_version": str(torch.__version__),
+            "cuda_available": torch.cuda.is_available(),
+            "cuda_version": torch.version.cuda,
+            "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+        },
+        "metrics": metrics_history,
+    }
+
+
+def write_metrics(path: Path, history: list[dict[str, object]], config: dict[str, object]) -> None:
+    payload = {
+        "config": config,
+        "history": history,
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
 def main() -> None:
     args = parse_args()
+    set_seed(args.seed)
     labels = resolve_label_preset(args.label_preset)
     train_csv = args.train_csv or args.data_root / "train.csv"
     valid_csv = args.valid_csv or args.data_root / "valid.csv"
@@ -119,17 +218,18 @@ def main() -> None:
         build_transforms(train=True),
         labels=labels,
         uncertain_policy=args.uncertain_policy,
+        view=args.view,
     )
 
     if valid_csv.exists():
-        if args.limit:
-            train_dataset = Subset(train_dataset, range(min(args.limit, len(train_dataset))))
+        train_dataset = subset_dataset(train_dataset, args.limit)
         valid_dataset = CheXpertDataset(
             valid_csv,
             args.data_root,
             build_transforms(train=False),
             labels=labels,
             uncertain_policy=args.uncertain_policy,
+            view=args.view,
         )
     else:
         valid_source = CheXpertDataset(
@@ -138,6 +238,7 @@ def main() -> None:
             build_transforms(train=False),
             labels=labels,
             uncertain_policy=args.uncertain_policy,
+            view=args.view,
         )
         row_count = min(args.limit, len(train_dataset)) if args.limit else len(train_dataset)
         valid_size = max(1, int(row_count * args.valid_split))
@@ -154,6 +255,7 @@ def main() -> None:
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=args.num_workers > 0,
     )
     valid_loader = DataLoader(
         valid_dataset,
@@ -161,32 +263,70 @@ def main() -> None:
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=args.num_workers > 0,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_model(len(labels), pretrained=args.pretrained).to(device)
-    criterion = torch.nn.BCEWithLogitsLoss()
+    pos_weight = calculate_pos_weight(train_dataset, labels).to(device) if args.pos_weight else None
+    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    scaler = torch.amp.GradScaler(device.type, enabled=args.amp and device.type == "cuda")
+    use_amp = args.amp and device.type == "cuda"
 
     best_auc = -1.0
+    metrics_history: list[dict[str, object]] = []
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    last_output = args.output.with_name(f"{args.output.stem}_last{args.output.suffix}")
+    metrics_output = args.output.with_suffix(".metrics.json")
+    config = {
+        "data_root": str(args.data_root),
+        "train_csv": str(train_csv),
+        "valid_csv": str(valid_csv) if valid_csv.exists() else None,
+        "train_rows": len(train_dataset),
+        "valid_rows": len(valid_dataset),
+        "labels": labels,
+        "label_preset": args.label_preset,
+        "uncertain_policy": args.uncertain_policy,
+        "view": args.view,
+        "seed": args.seed,
+        "amp": args.amp,
+        "pos_weight": args.pos_weight,
+        "pretrained": args.pretrained,
+        "batch_size": args.batch_size,
+        "lr": args.lr,
+        "num_workers": args.num_workers,
+        "device": str(device),
+    }
+    print(json.dumps(config, indent=2))
 
     for epoch in range(1, args.epochs + 1):
-        train_loss, _, _ = run_epoch(model, train_loader, criterion, device, optimizer)
-        valid_loss, valid_targets, valid_probs = run_epoch(model, valid_loader, criterion, device)
-        auc = mean_auc(valid_targets, valid_probs, labels)
+        train_loss, _, _ = run_epoch(model, train_loader, criterion, device, optimizer, scaler, use_amp)
+        valid_loss, valid_targets, valid_probs = run_epoch(model, valid_loader, criterion, device, use_amp=use_amp)
+        auc_scores = label_aucs(valid_targets, valid_probs, labels)
+        auc = mean_auc(auc_scores)
         auc_text = "n/a" if auc is None else f"{auc:.4f}"
         print(f"epoch={epoch} train_loss={train_loss:.4f} valid_loss={valid_loss:.4f} mean_auc={auc_text}")
 
         score = auc if auc is not None else -valid_loss
+        epoch_metrics = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "valid_loss": valid_loss,
+            "mean_auc": auc,
+            "label_auc": auc_scores,
+            "score": score,
+        }
+        metrics_history.append(epoch_metrics)
+        torch.save(
+            checkpoint_payload(model, labels, args, epoch, score, metrics_history),
+            last_output,
+        )
+        write_metrics(metrics_output, metrics_history, config)
         if score > best_auc:
             best_auc = score
             torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "labels": labels,
-                    "image_size": DEFAULT_IMAGE_SIZE,
-                },
+                checkpoint_payload(model, labels, args, epoch, score, metrics_history),
                 args.output,
             )
             print(f"saved={args.output}")

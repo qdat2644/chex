@@ -18,12 +18,14 @@ class CheXpertDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         transform,
         labels: list[str] | None = None,
         uncertain_policy: str = "zero",
+        view: str = "all",
     ) -> None:
         self.csv_path = Path(csv_path)
         self.data_root = Path(data_root)
         self.transform = transform
         self.labels = labels or DEFAULT_LABELS
         self.uncertain_policy = uncertain_policy
+        self.view = view
         self.frame = pd.read_csv(self.csv_path)
 
         missing = [label for label in self.labels if label not in self.frame.columns]
@@ -31,6 +33,13 @@ class CheXpertDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
             raise ValueError(f"Missing label columns in {self.csv_path}: {missing}")
         if "Path" not in self.frame.columns:
             raise ValueError(f"Missing Path column in {self.csv_path}")
+        if self.view != "all":
+            if "Frontal/Lateral" not in self.frame.columns:
+                raise ValueError(f"Missing Frontal/Lateral column in {self.csv_path}")
+            expected = "Frontal" if self.view == "frontal" else "Lateral"
+            self.frame = self.frame[self.frame["Frontal/Lateral"] == expected].reset_index(drop=True)
+            if self.frame.empty:
+                raise ValueError(f"No {expected} rows found in {self.csv_path}")
 
     def __len__(self) -> int:
         return len(self.frame)
