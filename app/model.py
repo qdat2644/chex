@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import pickle
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -162,4 +163,3 @@ class CheXpertPredictor:
         image.save(buffer, format="PNG")
         encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
         return f"data:image/png;base64,{encoded}"
-import pickle

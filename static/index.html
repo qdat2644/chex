@@ -3,54 +3,154 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>CheXpert Web Reader</title>
+    <meta name="description" content="CheXpert Web Reader — chest X-ray AI research prototype for multi-label pathology detection." />
+    <title>CheXpert Reader — Chest X-ray AI</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
-    <main class="shell">
-      <section class="workspace" aria-labelledby="title">
-        <div class="panel upload-panel">
-          <p class="eyebrow">Chest X-ray AI</p>
-          <h1 id="title">CheXpert Web Reader</h1>
-          <form id="upload-form">
-            <label class="dropzone" for="xray-file">
-              <span class="dropzone-title">Upload X-ray image</span>
-              <span id="file-name" class="dropzone-meta">PNG, JPG, or JPEG</span>
-              <input id="xray-file" name="file" type="file" accept="image/*" required />
-            </label>
-            <button type="submit">Analyze</button>
-          </form>
-          <p class="notice">
-            Research prototype only. Do not use results for medical decisions.
-          </p>
-        </div>
+    <main class="app-shell">
 
-        <div class="panel preview-panel">
-          <div class="image-viewer">
-            <div class="image-frame">
-              <img id="preview" alt="Uploaded chest X-ray preview" hidden />
-              <div id="empty-preview" class="empty-preview">No image selected</div>
-            </div>
-            <div id="heatmap-wrap" class="heatmap-wrap" hidden>
-              <div class="heatmap-heading">
-                <h2>Model focus</h2>
-                <span id="heatmap-label" class="status"></span>
-              </div>
-              <img id="heatmap" alt="Model focus heatmap" />
-            </div>
+      <!-- ── Hero ── -->
+      <section class="hero-card" aria-labelledby="app-title">
+        <div class="hero-left">
+          <div class="brand-mark" aria-hidden="true">CXR</div>
+          <div class="hero-text">
+            <p class="eyebrow">Medical AI Dashboard</p>
+            <h1 id="app-title">CheXpert Reader</h1>
+            <p class="subtitle">Chest X-ray AI Research Prototype</p>
           </div>
         </div>
-
-        <div class="panel result-panel">
-          <div class="result-heading">
-            <h2>Findings</h2>
-            <span id="status" class="status">Waiting</span>
-          </div>
-          <div id="message" class="message" hidden></div>
-          <div id="report" class="report" hidden></div>
-          <div id="results" class="results"></div>
+        <div class="hero-badges">
+          <span class="badge badge-warning">⚠ Research only</span>
+          <span id="model-status" class="badge badge-waiting">Checking model…</span>
         </div>
       </section>
+
+      <!-- ── Upload ── -->
+      <section class="upload-card" aria-labelledby="upload-title">
+        <div class="upload-info">
+          <div class="upload-glyph" aria-hidden="true">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 16V7M8.5 10.5 12 7l3.5 3.5M5 16.5v1.25A2.25 2.25 0 0 0 7.25 20h9.5A2.25 2.25 0 0 0 19 17.75V16.5"/>
+            </svg>
+          </div>
+          <div>
+            <h2 id="upload-title">Upload chest X-ray</h2>
+            <p id="upload-state">PNG, JPG, JPEG supported</p>
+          </div>
+        </div>
+
+        <form id="upload-form" class="upload-form">
+          <label id="file-dropzone" class="upload-dropzone" for="xray-file">
+            <span class="dropzone-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4.75 17.25a4 4 0 0 1 .44-7.98 6.25 6.25 0 0 1 12.08 1.67 3.25 3.25 0 0 1 .48 6.31"/>
+                <path d="M12 12v7m-3.25-3.25L12 12l3.25 3.25"/>
+              </svg>
+            </span>
+            <span class="dropzone-text">
+              <span class="dropzone-title">Choose image</span>
+              <span id="file-name" class="dropzone-meta">No file selected</span>
+            </span>
+            <input id="xray-file" name="file" type="file" accept="image/*" required />
+          </label>
+
+          <button id="analyze-button" class="analyze-button" type="submit" disabled>
+            <span class="btn-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="11" cy="11" r="7"/><path d="m16.5 16.5 3.5 3.5"/>
+              </svg>
+            </span>
+            <span id="button-label">Analyze</span>
+          </button>
+        </form>
+      </section>
+
+      <!-- ── Workspace ── -->
+      <div class="workspace-grid">
+
+        <!-- Image preview -->
+        <article class="panel image-panel" aria-labelledby="image-heading">
+          <div class="panel-header">
+            <div>
+              <p class="panel-label">Input image</p>
+              <h2 id="image-heading">Image</h2>
+            </div>
+            <span id="image-status" class="chip">Waiting</span>
+          </div>
+          <div class="preview-frame">
+            <img id="preview" alt="Uploaded chest X-ray preview" hidden />
+            <div id="empty-preview" class="empty-state">
+              <div class="empty-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="3" y="3" width="18" height="18" rx="3"/>
+                  <path d="m7 17 3.5-4.5 2.5 3 2-2.5L19 17"/>
+                  <circle cx="8.5" cy="8.5" r="1.5"/>
+                </svg>
+              </div>
+              <strong>No image selected</strong>
+              <span>Choose an X-ray image to preview it here.</span>
+            </div>
+          </div>
+        </article>
+
+        <!-- Findings -->
+        <article class="panel findings-panel" aria-labelledby="findings-heading">
+          <div class="panel-header">
+            <div>
+              <p class="panel-label">Prediction output</p>
+              <h2 id="findings-heading">Findings</h2>
+            </div>
+            <span id="status" class="chip">Waiting</span>
+          </div>
+          <div id="message" class="alert alert-error" hidden></div>
+          <div id="report" class="alert alert-info" hidden></div>
+          <div id="results" class="findings-list">
+            <div class="empty-state compact">
+              <strong>Upload an image to see findings</strong>
+              <span>Predictions will appear here after analysis.</span>
+            </div>
+          </div>
+        </article>
+      </div>
+
+      <!-- ── Heatmap ── -->
+      <section class="panel heatmap-panel" aria-labelledby="heatmap-heading">
+        <div class="panel-header">
+          <div>
+            <p class="panel-label">Explainability</p>
+            <h2 id="heatmap-heading">Model Focus</h2>
+            <p class="panel-desc">Grad-CAM attention heatmap overlay</p>
+          </div>
+          <span id="heatmap-label" class="chip">Not generated</span>
+        </div>
+        <div class="heatmap-stage">
+          <div id="heatmap-empty" class="empty-state heatmap-placeholder">
+            <div class="empty-icon heat-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" aria-hidden="true" style="fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;">
+                <path d="M12 4c3.5 2.8 5.5 5.5 5.5 8.5a5.5 5.5 0 0 1-11 0C6.5 9.5 8.5 6.8 12 4Z"/>
+                <path d="M12 16.5a2 2 0 0 0 2-2c0-1-.7-2-2-3.5-1.3 1.5-2 2.5-2 3.5a2 2 0 0 0 2 2Z"/>
+              </svg>
+            </div>
+            <strong>Heatmap will appear after analysis</strong>
+            <span>The model focus overlay is generated when inference runs.</span>
+          </div>
+          <figure id="heatmap-figure" class="heatmap-figure" hidden>
+            <img id="heatmap" alt="Grad-CAM model focus heatmap" />
+            <figcaption id="heatmap-caption">Visualization is for research interpretation only.</figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <!-- ── Disclaimer ── -->
+      <div class="disclaimer" role="note">
+        <span class="disclaimer-icon" aria-hidden="true">!</span>
+        <p>Research prototype only — do not use these results for medical decisions.</p>
+      </div>
+
     </main>
     <script src="/static/app.js"></script>
   </body>

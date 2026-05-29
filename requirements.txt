@@ -8,3 +8,4 @@ scikit-learn>=1.6
 torch>=2.5
 torchvision>=0.20
 httpx>=0.28
+tqdm>=4.66

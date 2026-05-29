@@ -65,6 +65,7 @@ python scripts/train.py --data-root archive --epochs 5 --batch-size 32 --num-wor
 Add `--pretrained` if you want ImageNet initialization and the machine can download/cache torchvision weights.
 Add `--label-preset all` to train all 14 CheXpert labels instead of the 5 competition labels.
 Training defaults to frontal-only images, mixed precision on CUDA, fixed seed `42`, and class imbalance `pos_weight`.
+The training loop shows progress bars with current batch, speed, loss, and ETA so long runs do not look frozen.
 Each run writes:
 
 - best checkpoint: `checkpoints/chexpert_densenet121.pt`

@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Subset
+from tqdm.auto import tqdm
 from torchvision import models, transforms
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -77,6 +78,7 @@ def run_epoch(
     optimizer: torch.optim.Optimizer | None = None,
     scaler: torch.amp.GradScaler | None = None,
     use_amp: bool = False,
+    desc: str = "epoch",
 ) -> tuple[float, list[list[float]], list[list[float]]]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -84,7 +86,8 @@ def run_epoch(
     all_targets: list[list[float]] = []
     all_probs: list[list[float]] = []
 
-    for images, targets in loader:
+    progress = tqdm(loader, desc=desc, unit="batch", leave=False, dynamic_ncols=True, ascii=True)
+    for images, targets in progress:
         images = images.to(device)
         targets = targets.to(device)
 
@@ -104,6 +107,7 @@ def run_epoch(
         total_loss += float(loss.detach().cpu()) * images.size(0)
         all_targets.extend(targets.detach().cpu().tolist())
         all_probs.extend(torch.sigmoid(logits).detach().cpu().tolist())
+        progress.set_postfix(loss=f"{float(loss.detach().cpu()):.4f}")
 
     return total_loss / len(loader.dataset), all_targets, all_probs
 
@@ -301,8 +305,24 @@ def main() -> None:
     print(json.dumps(config, indent=2))
 
     for epoch in range(1, args.epochs + 1):
-        train_loss, _, _ = run_epoch(model, train_loader, criterion, device, optimizer, scaler, use_amp)
-        valid_loss, valid_targets, valid_probs = run_epoch(model, valid_loader, criterion, device, use_amp=use_amp)
+        train_loss, _, _ = run_epoch(
+            model,
+            train_loader,
+            criterion,
+            device,
+            optimizer,
+            scaler,
+            use_amp,
+            desc=f"epoch {epoch}/{args.epochs} train",
+        )
+        valid_loss, valid_targets, valid_probs = run_epoch(
+            model,
+            valid_loader,
+            criterion,
+            device,
+            use_amp=use_amp,
+            desc=f"epoch {epoch}/{args.epochs} valid",
+        )
         auc_scores = label_aucs(valid_targets, valid_probs, labels)
         auc = mean_auc(auc_scores)
         auc_text = "n/a" if auc is None else f"{auc:.4f}"
