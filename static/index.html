@@ -25,6 +25,9 @@
         <div id="model-info" class="model-info" aria-label="Model information">
           DenseNet121 / 5 labels / mean AUC 0.8764 / valid rows 202
         </div>
+        <div class="domain-warning" role="note">
+          This model expects frontal chest X-ray images only. Results may be meaningless for other image types.
+        </div>
       </section>
 
       <section class="upload-card" aria-labelledby="upload-title">
@@ -139,7 +142,7 @@
 
       <div class="disclaimer" role="note">
         <span class="disclaimer-icon" aria-hidden="true">!</span>
-        <p>Research prototype only. Do not use these results for medical decisions.</p>
+        <p>Research prototype only. Do not use these results for medical decisions. This model expects frontal chest X-ray images only. Results may be meaningless for other image types.</p>
       </div>
     </main>
     <script src="/static/app.js"></script>

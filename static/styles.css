@@ -1,6 +1,6 @@
-/* ─────────────────────────────────────────
+/* -----------------------------------------
    Design tokens
-───────────────────────────────────────── */
+----------------------------------------- */
 :root {
   --bg: #0d1117;
   --surface: #161b22;
@@ -33,9 +33,9 @@
   --transition: 180ms cubic-bezier(0.4,0,0.2,1);
 }
 
-/* ─────────────────────────────────────────
+/* -----------------------------------------
    Reset & base
-───────────────────────────────────────── */
+----------------------------------------- */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 [hidden] { display: none !important; }
 html { min-width: 320px; scroll-behavior: smooth; }
@@ -59,9 +59,9 @@ img { display: block; max-width: 100%; }
 svg { display: block; }
 figure { margin: 0; }
 
-/* ─────────────────────────────────────────
+/* -----------------------------------------
    Layout shell
-───────────────────────────────────────── */
+----------------------------------------- */
 .app-shell {
   max-width: 1160px;
   margin: 0 auto;
@@ -71,9 +71,9 @@ figure { margin: 0; }
   gap: 20px;
 }
 
-/* ─────────────────────────────────────────
+/* -----------------------------------------
    Panel base (shared by all cards)
-───────────────────────────────────────── */
+----------------------------------------- */
 .hero-card,
 .upload-card,
 .panel,
@@ -84,9 +84,9 @@ figure { margin: 0; }
   box-shadow: var(--shadow-md);
 }
 
-/* ─────────────────────────────────────────
+/* -----------------------------------------
    Hero card
-───────────────────────────────────────── */
+----------------------------------------- */
 .hero-card {
   display: flex;
   align-items: center;
@@ -100,7 +100,8 @@ figure { margin: 0; }
   overflow: hidden;
 }
 
-.model-info {
+.model-info,
+.domain-warning {
   flex-basis: 100%;
   border: 1px solid rgba(45,212,191,0.18);
   border-radius: var(--radius-md);
@@ -108,6 +109,12 @@ figure { margin: 0; }
   color: var(--text-muted);
   font-size: 13px;
   padding: 10px 12px;
+}
+
+.domain-warning {
+  border-color: rgba(240,180,41,0.3);
+  background: var(--warning-bg);
+  color: var(--warning);
 }
 
 .hero-card::before {
@@ -172,9 +179,9 @@ figure { margin: 0; }
   flex-shrink: 0;
 }
 
-/* ─────────────────────────────────────────
+/* -----------------------------------------
    Badges / chips
-───────────────────────────────────────── */
+----------------------------------------- */
 .badge, .chip {
   display: inline-flex;
   align-items: center;
@@ -232,9 +239,9 @@ figure { margin: 0; }
 .chip-busy { background: var(--info-bg);    border-color: rgba(96,165,250,0.3); color: var(--info); }
 .chip-err  { background: var(--danger-bg);  border-color: rgba(248,113,113,0.3); color: var(--danger); }
 
-/* ─────────────────────────────────────────
+/* -----------------------------------------
    Upload card
-───────────────────────────────────────── */
+----------------------------------------- */
 .upload-card {
   display: grid;
   grid-template-columns: auto 1fr;
@@ -365,9 +372,9 @@ input[type="file"] {
   white-space: nowrap;
 }
 
-/* ─────────────────────────────────────────
+/* -----------------------------------------
    Analyze button
-───────────────────────────────────────── */
+----------------------------------------- */
 .analyze-button {
   display: flex;
   align-items: center;
@@ -427,9 +434,9 @@ input[type="file"] {
 
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* ─────────────────────────────────────────
+/* -----------------------------------------
    Workspace grid
-───────────────────────────────────────── */
+----------------------------------------- */
 .workspace-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -437,9 +444,9 @@ input[type="file"] {
   align-items: start;
 }
 
-/* ─────────────────────────────────────────
+/* -----------------------------------------
    Panel
-───────────────────────────────────────── */
+----------------------------------------- */
 .panel {
   padding: 22px;
 }
@@ -474,9 +481,9 @@ input[type="file"] {
   margin-top: 4px;
 }
 
-/* ─────────────────────────────────────────
+/* -----------------------------------------
    Image preview frame
-───────────────────────────────────────── */
+----------------------------------------- */
 .preview-frame {
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
@@ -496,9 +503,9 @@ input[type="file"] {
   background: #000;
 }
 
-/* ─────────────────────────────────────────
+/* -----------------------------------------
    Empty states
-───────────────────────────────────────── */
+----------------------------------------- */
 .empty-state {
   display: flex;
   flex-direction: column;
@@ -558,9 +565,9 @@ input[type="file"] {
   border-radius: var(--radius-lg);
 }
 
-/* ─────────────────────────────────────────
+/* -----------------------------------------
    Alerts
-───────────────────────────────────────── */
+----------------------------------------- */
 .alert {
   border-radius: var(--radius-md);
   padding: 12px 14px;
@@ -581,9 +588,9 @@ input[type="file"] {
   color: #5eead4;
 }
 
-/* ─────────────────────────────────────────
+/* -----------------------------------------
    Findings list
-───────────────────────────────────────── */
+----------------------------------------- */
 .findings-list {
   display: flex;
   flex-direction: column;
@@ -675,9 +682,9 @@ input[type="file"] {
 .finding-card.moderate .progress-fill { background: linear-gradient(90deg,#d97706,#fbbf24); }
 .finding-card.high     .progress-fill { background: linear-gradient(90deg,#dc2626,#f87171); }
 
-/* ─────────────────────────────────────────
+/* -----------------------------------------
    Heatmap panel
-───────────────────────────────────────── */
+----------------------------------------- */
 .heatmap-panel { padding: 22px; }
 
 .heatmap-stage {
@@ -709,9 +716,9 @@ input[type="file"] {
   border-top: 1px solid var(--border);
 }
 
-/* ─────────────────────────────────────────
+/* -----------------------------------------
    Disclaimer
-───────────────────────────────────────── */
+----------------------------------------- */
 .disclaimer {
   display: flex;
   align-items: center;
@@ -742,9 +749,9 @@ input[type="file"] {
   color: var(--warning);
 }
 
-/* ─────────────────────────────────────────
+/* -----------------------------------------
    Responsive
-───────────────────────────────────────── */
+----------------------------------------- */
 @media (max-width: 860px) {
   .app-shell { padding: 20px 14px 40px; gap: 16px; }
 

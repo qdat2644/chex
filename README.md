@@ -8,6 +8,28 @@ Build a web application where a user uploads a chest X-ray image and receives mo
 
 This is not a medical device. The app should be treated as research/demo software until the model, data handling, calibration, validation, and regulatory requirements are handled properly.
 
+This model expects frontal chest X-ray images only. Results may be meaningless for other image types.
+
+## Model checkpoint
+
+The trained checkpoint is not committed to this repository because it is a large binary artifact.
+
+To run the V2 web demo with model inference, download or place the checkpoint at:
+
+```text
+checkpoints/chexpert_densenet121_v2.pt
+```
+
+[TODO: add GitHub Release / Drive / Hugging Face checkpoint URL]
+
+If the checkpoint is missing, the app still starts. `/api/predict` returns `model_not_loaded` with no findings instead of pretending to run inference.
+
+## Screenshots
+
+![CheXpert Reader empty state](docs/images/chexpert-empty-state.png)
+
+![CheXpert Reader prediction result](docs/images/chexpert-prediction-result.png)
+
 ## Expected Dataset Layout
 
 Download the CheXpert dataset from Kaggle: [ashery/chexpert](https://www.kaggle.com/datasets/ashery/chexpert).
@@ -53,6 +75,7 @@ Open `http://127.0.0.1:8000`.
 
 Without a checkpoint, the API returns image metadata and a clear `model_not_loaded` status instead of pretending to diagnose.
 With a checkpoint, the API returns probabilities, a short generated report, and a Grad-CAM heatmap for the highest-probability finding.
+The V2 checkpoint expects frontal chest X-ray images only; do not interpret results for lateral images, non-X-ray images, or unrelated image types.
 
 The demo defaults to the current V2 checkpoint when present:
 
