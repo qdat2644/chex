@@ -40,6 +40,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--pos-weight", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--pretrained", action="store_true", help="Initialize DenseNet121 with ImageNet weights.")
+    parser.add_argument(
+        "--scheduler",
+        choices=["cosine", "plateau", "none"],
+        default="cosine",
+        help="LR scheduler: cosine=CosineAnnealingLR, plateau=ReduceLROnPlateau, none=fixed LR.",
+    )
     return parser.parse_args()
 
 
@@ -278,6 +284,17 @@ def main() -> None:
     scaler = torch.amp.GradScaler(device.type, enabled=args.amp and device.type == "cuda")
     use_amp = args.amp and device.type == "cuda"
 
+    if args.scheduler == "cosine":
+        scheduler: torch.optim.lr_scheduler.LRScheduler | None = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=args.lr * 1e-2
+        )
+    elif args.scheduler == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="max", factor=0.5, patience=2, min_lr=args.lr * 1e-2
+        )
+    else:
+        scheduler = None
+
     best_auc = -1.0
     metrics_history: list[dict[str, object]] = []
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -299,6 +316,7 @@ def main() -> None:
         "pretrained": args.pretrained,
         "batch_size": args.batch_size,
         "lr": args.lr,
+        "scheduler": args.scheduler,
         "num_workers": args.num_workers,
         "device": str(device),
     }
@@ -326,7 +344,17 @@ def main() -> None:
         auc_scores = label_aucs(valid_targets, valid_probs, labels)
         auc = mean_auc(auc_scores)
         auc_text = "n/a" if auc is None else f"{auc:.4f}"
-        print(f"epoch={epoch} train_loss={train_loss:.4f} valid_loss={valid_loss:.4f} mean_auc={auc_text}")
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(
+            f"epoch={epoch} train_loss={train_loss:.4f} valid_loss={valid_loss:.4f} "
+            f"mean_auc={auc_text} lr={current_lr:.2e}"
+        )
+
+        # Step scheduler
+        if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            scheduler.step(auc if auc is not None else -valid_loss)
+        elif scheduler is not None:
+            scheduler.step()
 
         score = auc if auc is not None else -valid_loss
         epoch_metrics = {
@@ -335,6 +363,7 @@ def main() -> None:
             "valid_loss": valid_loss,
             "mean_auc": auc,
             "label_auc": auc_scores,
+            "lr": current_lr,
             "score": score,
         }
         metrics_history.append(epoch_metrics)

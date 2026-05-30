@@ -1,37 +1,41 @@
-/* ─── DOM refs ─── */
-const form          = document.getElementById("upload-form");
-const fileInput     = document.getElementById("xray-file");
-const fileDropzone  = document.getElementById("file-dropzone");
-const fileName      = document.getElementById("file-name");
-const uploadState   = document.getElementById("upload-state");
-const preview       = document.getElementById("preview");
-const emptyPreview  = document.getElementById("empty-preview");
-const heatmapEmpty  = document.getElementById("heatmap-empty");
+const form = document.getElementById("upload-form");
+const fileInput = document.getElementById("xray-file");
+const fileDropzone = document.getElementById("file-dropzone");
+const fileName = document.getElementById("file-name");
+const uploadState = document.getElementById("upload-state");
+const preview = document.getElementById("preview");
+const emptyPreview = document.getElementById("empty-preview");
+const heatmapEmpty = document.getElementById("heatmap-empty");
 const heatmapFigure = document.getElementById("heatmap-figure");
-const heatmapImg    = document.getElementById("heatmap");
-const heatmapLabel  = document.getElementById("heatmap-label");
-const heatmapCaption= document.getElementById("heatmap-caption");
-const statusChip    = document.getElementById("status");
-const modelStatus   = document.getElementById("model-status");
-const imageStatus   = document.getElementById("image-status");
-const messageEl     = document.getElementById("message");
-const reportEl      = document.getElementById("report");
-const resultsEl     = document.getElementById("results");
-const button        = document.getElementById("analyze-button");
-const buttonLabel   = document.getElementById("button-label");
+const heatmapImg = document.getElementById("heatmap");
+const heatmapLabel = document.getElementById("heatmap-label");
+const heatmapCaption = document.getElementById("heatmap-caption");
+const statusChip = document.getElementById("status");
+const modelStatus = document.getElementById("model-status");
+const modelInfo = document.getElementById("model-info");
+const imageStatus = document.getElementById("image-status");
+const messageEl = document.getElementById("message");
+const reportEl = document.getElementById("report");
+const resultsEl = document.getElementById("results");
+const button = document.getElementById("analyze-button");
+const buttonLabel = document.getElementById("button-label");
 
-/* ─── Init ─── */
+let thresholdsLoaded = false;
+let thresholds = {};
+
 setInitialState();
-refreshModelStatus();
+refreshModelInfo();
 
-/* ─── File picker ─── */
 fileInput.addEventListener("change", () => {
   const file = fileInput.files?.[0];
-  if (!file) { setInitialState(); return; }
+  if (!file) {
+    setInitialState();
+    return;
+  }
 
   fileName.textContent = file.name;
   fileDropzone.classList.add("has-file");
-  uploadState.textContent = "Image selected — ready to analyze.";
+  uploadState.textContent = "Image selected - ready to analyze.";
   button.disabled = false;
   button.classList.remove("is-loading");
   buttonLabel.textContent = "Analyze";
@@ -39,7 +43,9 @@ fileInput.addEventListener("change", () => {
   setChip(statusChip, "Ready", "");
   setChip(imageStatus, "Selected", "chip-ok");
 
-  if (preview.src && preview.src.startsWith("blob:")) URL.revokeObjectURL(preview.src);
+  if (preview.src && preview.src.startsWith("blob:")) {
+    URL.revokeObjectURL(preview.src);
+  }
   preview.src = URL.createObjectURL(file);
   preview.hidden = false;
   emptyPreview.hidden = true;
@@ -49,25 +55,29 @@ fileInput.addEventListener("change", () => {
   renderEmpty("Upload an image to see findings", "Predictions will appear here after analysis.");
 });
 
-/* ─── Form submit ─── */
-form.addEventListener("submit", async (e) => {
-  e.preventDefault();
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
   const file = fileInput.files?.[0];
-  if (!file) { setInitialState(); return; }
+  if (!file) {
+    setInitialState();
+    return;
+  }
 
   const payload = new FormData();
   payload.append("file", file);
   setLoadingState();
 
   try {
-    const res  = await fetch("/api/predict", { method: "POST", body: payload });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "Prediction failed.");
+    const response = await fetch("/api/predict", { method: "POST", body: payload });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.detail || "Prediction failed.");
+    }
     renderResponse(data);
-  } catch (err) {
+  } catch (error) {
     setChip(statusChip, "Error", "chip-err");
     uploadState.textContent = "Analysis failed. Please try again.";
-    showAlert(messageEl, err.message || "Prediction failed.");
+    showAlert(messageEl, error.message || "Prediction failed.");
     renderEmpty("No results", "The analysis did not complete.");
   } finally {
     button.disabled = false;
@@ -76,18 +86,19 @@ form.addEventListener("submit", async (e) => {
   }
 });
 
-/* ─── States ─── */
 function setInitialState() {
   fileName.textContent = "No file selected";
   fileDropzone.classList.remove("has-file");
-  uploadState.textContent = "Choose a PNG, JPG, or JPEG image to begin.";
+  uploadState.textContent = "PNG, JPG, JPEG supported";
   button.disabled = true;
   button.classList.remove("is-loading");
   buttonLabel.textContent = "Analyze";
-  setChip(statusChip,  "Waiting", "");
+  setChip(statusChip, "Waiting", "");
   setChip(imageStatus, "Waiting", "");
 
-  if (preview.src && preview.src.startsWith("blob:")) URL.revokeObjectURL(preview.src);
+  if (preview.src && preview.src.startsWith("blob:")) {
+    URL.revokeObjectURL(preview.src);
+  }
   preview.removeAttribute("src");
   preview.hidden = true;
   emptyPreview.hidden = false;
@@ -100,30 +111,41 @@ function setInitialState() {
 function setLoadingState() {
   button.disabled = true;
   button.classList.add("is-loading");
-  buttonLabel.textContent = "Analyzing…";
+  buttonLabel.textContent = "Analyzing...";
   setChip(statusChip, "Analyzing", "chip-busy");
-  uploadState.textContent = "Running model inference…";
+  uploadState.textContent = "Running model inference...";
   hideAlerts();
   hideHeatmap();
   renderEmpty("Running model", "Findings will appear here shortly.");
 }
 
-/* ─── Model status badge ─── */
-async function refreshModelStatus() {
+async function refreshModelInfo() {
   try {
-    const res  = await fetch("/health");
-    if (!res.ok) throw new Error();
-    const data = await res.json();
+    const response = await fetch("/api/model-info");
+    if (!response.ok) {
+      throw new Error("Model info unavailable.");
+    }
+    const data = await response.json();
     const loaded = Boolean(data.model_loaded);
-    modelStatus.textContent = loaded ? "✓ Model loaded" : "Waiting for checkpoint";
-    modelStatus.className = "badge " + (loaded ? "badge-loaded" : "badge-waiting");
+    thresholdsLoaded = Boolean(data.thresholds_loaded);
+    thresholds = data.thresholds || {};
+    modelStatus.textContent = loaded ? "Model loaded" : "Waiting for checkpoint";
+    modelStatus.className = `badge ${loaded ? "badge-loaded" : "badge-waiting"}`;
+
+    const info = data.model_info || {};
+    const architecture = info.architecture || "DenseNet121";
+    const labelCount = info.label_count || (Array.isArray(data.labels) ? data.labels.length : 5);
+    const auc = info.mean_auc_display || formatNumber(info.mean_auc, 4) || "0.8764";
+    const validRows = info.valid_rows || 202;
+    const thresholdText = thresholdsLoaded ? "thresholds loaded" : "probability only";
+    modelInfo.textContent = `${architecture} / ${labelCount} labels / mean AUC ${auc} / valid rows ${validRows} / ${thresholdText}`;
   } catch {
     modelStatus.textContent = "Model status unknown";
     modelStatus.className = "badge badge-error";
+    modelInfo.textContent = "DenseNet121 / 5 labels / mean AUC 0.8764 / valid rows 202";
   }
 }
 
-/* ─── Render API response ─── */
 function renderResponse(data) {
   const findings = Array.isArray(data.findings) ? data.findings : [];
   const ok = data.status === "ok";
@@ -131,15 +153,19 @@ function renderResponse(data) {
   setChip(statusChip, ok ? "Complete" : "No model", ok ? "chip-ok" : "chip-err");
   uploadState.textContent = ok ? "Analysis complete." : "Model checkpoint not loaded.";
 
-  if (data.message) showAlert(messageEl, data.message);
-  if (data.report)  showAlert(reportEl,  data.report, "alert-info");
+  if (data.message) {
+    showAlert(messageEl, data.message);
+  }
+  if (data.report) {
+    showAlert(reportEl, data.report, "alert-info");
+  }
 
   if (data.heatmap?.image_data_url) {
-    const prob = clamp(data.heatmap.probability);
+    const probability = clamp(data.heatmap.probability);
     heatmapImg.src = data.heatmap.image_data_url;
-    setChip(heatmapLabel, `${data.heatmap.label || "Top finding"} ${pct(prob)}`, "chip-ok");
+    setChip(heatmapLabel, `${data.heatmap.label || "Top finding"} ${pct(probability)}`, "chip-ok");
     heatmapCaption.textContent = "Visualization is for research interpretation only.";
-    heatmapEmpty.hidden  = true;
+    heatmapEmpty.hidden = true;
     heatmapFigure.hidden = false;
   } else {
     hideHeatmap();
@@ -150,82 +176,113 @@ function renderResponse(data) {
     return;
   }
 
-  const frag = document.createDocumentFragment();
-  for (const item of findings) frag.append(buildFindingCard(item));
-  resultsEl.replaceChildren(frag);
+  const fragment = document.createDocumentFragment();
+  for (const item of findings) {
+    fragment.append(buildFindingCard(item));
+  }
+  resultsEl.replaceChildren(fragment);
 }
 
-/* ─── Finding card ─── */
 function buildFindingCard(item) {
-  const prob     = clamp(item.probability);
-  const level    = suspicionLevel(prob);
-  const article  = el("article", `finding-card ${level.cls}`);
+  const probability = clamp(item.probability);
+  const threshold = Number.isFinite(Number(item.threshold))
+    ? Number(item.threshold)
+    : Number.isFinite(Number(thresholds[item.label]))
+      ? Number(thresholds[item.label])
+      : null;
+  const level = suspicionLevel(probability, threshold);
+  const article = el("article", `finding-card ${level.cls}`);
 
   const titleDiv = el("div", "finding-title");
-  const label    = el("strong");
+  const label = el("strong");
   label.textContent = item.label || "Unlabeled";
 
   const badge = el("span", "suspicion-badge");
   badge.textContent = level.label;
 
-  const probDiv = el("div", "probability");
-  probDiv.textContent = pct(prob);
+  const thresholdText = el("span", "threshold-note");
+  thresholdText.textContent = threshold === null ? "No threshold loaded" : `Threshold ${pct(threshold)}`;
+
+  const probabilityDiv = el("div", "probability");
+  probabilityDiv.textContent = pct(probability);
 
   const track = el("div", "progress-track");
-  const fill  = el("div", "progress-fill");
-  fill.style.width = pct(prob);
+  const fill = el("div", "progress-fill");
+  fill.style.width = pct(probability);
   track.append(fill);
 
-  titleDiv.append(label, badge);
-  article.append(titleDiv, probDiv, track);
+  titleDiv.append(label, badge, thresholdText);
+  article.append(titleDiv, probabilityDiv, track);
   return article;
 }
 
-function suspicionLevel(p) {
-  if (p >= 0.65) return { cls: "high",     label: "High suspicion" };
-  if (p >= 0.35) return { cls: "moderate", label: "Moderate suspicion" };
-  return               { cls: "",          label: "Low suspicion" };
+function suspicionLevel(probability, threshold) {
+  if (threshold === null) {
+    return { cls: "", label: "Probability only" };
+  }
+  const highCutoff = Math.min(1, threshold + 0.15);
+  if (probability >= highCutoff) {
+    return { cls: "high", label: "High suspicion" };
+  }
+  if (probability >= threshold) {
+    return { cls: "moderate", label: "Moderate suspicion" };
+  }
+  return { cls: "", label: "Low suspicion" };
 }
 
-/* ─── Helpers ─── */
 function el(tag, className = "") {
   const node = document.createElement(tag);
-  if (className) node.className = className;
+  if (className) {
+    node.className = className;
+  }
   return node;
 }
 
-function clamp(v)  { const n = Number(v); return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 0; }
-function pct(v)    { return `${Math.round(v * 100)}%`; }
+function clamp(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.min(1, Math.max(0, number)) : 0;
+}
+
+function pct(value) {
+  return `${Math.round(value * 100)}%`;
+}
+
+function formatNumber(value, digits) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toFixed(digits) : "";
+}
 
 function setChip(chipEl, text, cls) {
   chipEl.textContent = text;
-  chipEl.className   = "chip" + (cls ? " " + cls : "");
+  chipEl.className = `chip${cls ? ` ${cls}` : ""}`;
 }
 
 function showAlert(node, text, cls = "alert-error") {
   node.textContent = text;
-  node.className   = `alert ${cls}`;
-  node.hidden      = false;
+  node.className = `alert ${cls}`;
+  node.hidden = false;
 }
 
 function hideAlerts() {
-  messageEl.hidden = true; messageEl.textContent = "";
-  reportEl.hidden  = true; reportEl.textContent  = "";
+  messageEl.hidden = true;
+  messageEl.textContent = "";
+  reportEl.hidden = true;
+  reportEl.textContent = "";
 }
 
 function hideHeatmap() {
   heatmapImg.removeAttribute("src");
   setChip(heatmapLabel, "Not generated", "");
-  heatmapEmpty.hidden  = false;
+  heatmapEmpty.hidden = false;
   heatmapFigure.hidden = true;
 }
 
 function renderEmpty(title, detail) {
-  const wrap   = el("div", "empty-state compact");
+  const wrap = el("div", "empty-state compact");
   const strong = el("strong");
-  const span   = el("span");
+  const span = el("span");
   strong.textContent = title;
-  span.textContent   = detail;
+  span.textContent = detail;
   wrap.append(strong, span);
   resultsEl.replaceChildren(wrap);
 }

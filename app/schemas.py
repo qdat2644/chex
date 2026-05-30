@@ -5,6 +5,7 @@ class FindingPrediction(BaseModel):
     label: str
     probability: float = Field(ge=0.0, le=1.0)
     positive: bool
+    threshold: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class HeatmapExplanation(BaseModel):

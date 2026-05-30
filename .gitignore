@@ -14,7 +14,11 @@ archive.zip
 *.zip
 checkpoints/
 runs/
-outputs/
+outputs/*
+!outputs/evaluation/
+!outputs/evaluation/threshold_report.csv
+!outputs/evaluation/thresholds.json
+!outputs/evaluation/sample_predictions.csv
 *.log
 
 .pytest_cache/

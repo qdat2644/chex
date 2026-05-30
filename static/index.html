@@ -3,17 +3,12 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="description" content="CheXpert Web Reader — chest X-ray AI research prototype for multi-label pathology detection." />
-    <title>CheXpert Reader — Chest X-ray AI</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet" />
+    <meta name="description" content="CheXpert Web Reader - chest X-ray AI research prototype for multi-label pathology detection." />
+    <title>CheXpert Reader - Chest X-ray AI</title>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
     <main class="app-shell">
-
-      <!-- ── Hero ── -->
       <section class="hero-card" aria-labelledby="app-title">
         <div class="hero-left">
           <div class="brand-mark" aria-hidden="true">CXR</div>
@@ -24,12 +19,14 @@
           </div>
         </div>
         <div class="hero-badges">
-          <span class="badge badge-warning">⚠ Research only</span>
-          <span id="model-status" class="badge badge-waiting">Checking model…</span>
+          <span class="badge badge-warning">Research only</span>
+          <span id="model-status" class="badge badge-waiting">Checking model...</span>
+        </div>
+        <div id="model-info" class="model-info" aria-label="Model information">
+          DenseNet121 / 5 labels / mean AUC 0.8764 / valid rows 202
         </div>
       </section>
 
-      <!-- ── Upload ── -->
       <section class="upload-card" aria-labelledby="upload-title">
         <div class="upload-info">
           <div class="upload-glyph" aria-hidden="true">
@@ -69,10 +66,7 @@
         </form>
       </section>
 
-      <!-- ── Workspace ── -->
       <div class="workspace-grid">
-
-        <!-- Image preview -->
         <article class="panel image-panel" aria-labelledby="image-heading">
           <div class="panel-header">
             <div>
@@ -97,7 +91,6 @@
           </div>
         </article>
 
-        <!-- Findings -->
         <article class="panel findings-panel" aria-labelledby="findings-heading">
           <div class="panel-header">
             <div>
@@ -117,7 +110,6 @@
         </article>
       </div>
 
-      <!-- ── Heatmap ── -->
       <section class="panel heatmap-panel" aria-labelledby="heatmap-heading">
         <div class="panel-header">
           <div>
@@ -145,12 +137,10 @@
         </div>
       </section>
 
-      <!-- ── Disclaimer ── -->
       <div class="disclaimer" role="note">
         <span class="disclaimer-icon" aria-hidden="true">!</span>
-        <p>Research prototype only — do not use these results for medical decisions.</p>
+        <p>Research prototype only. Do not use these results for medical decisions.</p>
       </div>
-
     </main>
     <script src="/static/app.js"></script>
   </body>

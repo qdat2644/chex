@@ -20,6 +20,7 @@ class Prediction:
     label: str
     probability: float
     positive: bool
+    threshold: float | None = None
 
 
 @dataclass(frozen=True)
@@ -35,10 +36,12 @@ class CheXpertPredictor:
         checkpoint_path: str | Path | None,
         labels: list[str] | None = None,
         threshold: float = DEFAULT_THRESHOLD,
+        thresholds: dict[str, float] | None = None,
         image_size: int = DEFAULT_IMAGE_SIZE,
     ) -> None:
         self.labels = labels or DEFAULT_LABELS
         self.threshold = threshold
+        self.thresholds = thresholds or {}
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.transform = transforms.Compose(
             [
@@ -56,6 +59,9 @@ class CheXpertPredictor:
 
         if checkpoint_path:
             self.load(checkpoint_path)
+
+    def set_thresholds(self, thresholds: dict[str, float]) -> None:
+        self.thresholds = {label: float(value) for label, value in thresholds.items()}
 
     @property
     def is_loaded(self) -> bool:
@@ -92,14 +98,19 @@ class CheXpertPredictor:
         logits = self.model(tensor)
         probabilities = torch.sigmoid(logits).squeeze(0).detach().cpu().tolist()
 
-        return [
-            Prediction(
-                label=label,
-                probability=float(probability),
-                positive=float(probability) >= self.threshold,
+        results: list[Prediction] = []
+        for label, probability in zip(self.labels, probabilities, strict=True):
+            threshold = self.thresholds.get(label)
+            is_positive = bool(threshold is not None and float(probability) >= threshold)
+            results.append(
+                Prediction(
+                    label=label,
+                    probability=float(probability),
+                    positive=is_positive,
+                    threshold=threshold,
+                )
             )
-            for label, probability in zip(self.labels, probabilities, strict=True)
-        ]
+        return results
 
     def explain_top_finding(self, image: Image.Image) -> Heatmap:
         if self.model is None:

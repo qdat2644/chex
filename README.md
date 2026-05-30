@@ -54,6 +54,18 @@ Open `http://127.0.0.1:8000`.
 Without a checkpoint, the API returns image metadata and a clear `model_not_loaded` status instead of pretending to diagnose.
 With a checkpoint, the API returns probabilities, a short generated report, and a Grad-CAM heatmap for the highest-probability finding.
 
+The demo defaults to the current V2 checkpoint when present:
+
+```text
+checkpoints/chexpert_densenet121_v2.pt
+```
+
+The web UI also reads calibrated per-label thresholds from:
+
+```text
+outputs/evaluation/thresholds.json
+```
+
 ## Train
 
 Once the dataset exists:
@@ -86,6 +98,38 @@ python scripts/evaluate.py --checkpoint checkpoints/chexpert_densenet121.pt --da
 
 If `archive/valid.csv` is missing, evaluation falls back to `archive/train.csv`. Use `--limit` for a quick smoke run.
 
+V2 evaluation:
+
+```powershell
+python scripts/evaluate.py --checkpoint checkpoints/chexpert_densenet121_v2.pt --data-root archive --batch-size 64 --num-workers 4 --uncertain-policy one --view frontal
+```
+
+Observed V2 metrics on `archive/valid.csv` frontal rows:
+
+- rows: 202
+- loss: 0.419824230788958
+- mean AUC: 0.8763721175369092
+
+Per-label AUC:
+
+- Atelectasis: 0.8424146981627297
+- Cardiomegaly: 0.7972370766488412
+- Consolidation: 0.8920955882352942
+- Edema: 0.9333333333333333
+- Pleural Effusion: 0.9167798913043478
+
+Generate threshold and sample-prediction artifacts:
+
+```powershell
+python scripts/threshold_report.py --checkpoint checkpoints/chexpert_densenet121_v2.pt --data-root archive --csv archive/valid.csv --batch-size 64 --num-workers 4 --uncertain-policy one --view frontal --output-dir outputs/evaluation
+```
+
+Outputs:
+
+- `outputs/evaluation/threshold_report.csv`
+- `outputs/evaluation/thresholds.json`
+- `outputs/evaluation/sample_predictions.csv`
+
 ## CLI Prediction
 
 ```powershell
@@ -96,11 +140,12 @@ python scripts/predict.py --checkpoint checkpoints/chexpert_densenet121.pt --ima
 
 ```powershell
 conda activate dat
-$env:CHEXPERT_CHECKPOINT="checkpoints/chexpert_densenet121.pt"
+$env:CHEXPERT_CHECKPOINT="checkpoints/chexpert_densenet121_v2.pt"
 uvicorn app.main:app --reload
 ```
 
 The prediction endpoint is `POST /api/predict`. It includes heatmaps by default; use `/api/predict?include_heatmap=false` when you only need probabilities.
+The model metadata endpoint is `GET /api/model-info`.
 
 ## Labels
 
