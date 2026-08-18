@@ -475,7 +475,7 @@ async def explain_label(
 @app.post("/api/predict-batch", response_model=BatchPredictionResponse)
 async def predict_batch_cxrs(
     files: list[UploadFile] = File(...),
-    client_ids: list[str] = Form(None),
+    client_ids: list[str] = Form(default=[]),
 ) -> BatchPredictionResponse:
     if not predictor.is_loaded:
         raise HTTPException(status_code=400, detail="Model is not loaded.")
@@ -492,7 +492,13 @@ async def predict_batch_cxrs(
     metadata_list: list[dict] = []
     errors: list[str] = []
 
-    client_id_list = client_ids or []
+    client_id_list: list[str] = []
+    if client_ids:
+        for item in client_ids:
+            if "," in item:
+                client_id_list.extend([x.strip() for x in item.split(",") if x.strip()])
+            elif item.strip():
+                client_id_list.append(item.strip())
 
     # Stream, decode, and generate previews in chunks of 8 to minimize RAM footprint
     for idx, f in enumerate(files):

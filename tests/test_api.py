@@ -116,10 +116,7 @@ class ApiTest(unittest.TestCase):
                 ("files", ("duplicate_cxr.png", buf1.getvalue(), "image/png")),
                 ("files", ("duplicate_cxr.png", buf2.getvalue(), "image/png")),
             ],
-            data=[
-                ("client_ids", custom_id_1),
-                ("client_ids", custom_id_2),
-            ]
+            data={"client_ids": f"{custom_id_1},{custom_id_2}"},
         )
         self.assertEqual(response.status_code, 200)
         payload = response.json()
