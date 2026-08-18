@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
+import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
+from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Subset
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -17,15 +21,32 @@ from app.dataset import CheXpertDataset
 from app.model import CheXpertPredictor
 
 
+def get_git_commit_sha() -> str:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except Exception:
+        return "UNKNOWN"
+
+
+def compute_file_sha256(filepath: Path) -> str:
+    if not filepath.exists():
+        return "NOT_FOUND"
+    h = hashlib.sha256()
+    with filepath.open("rb") as f:
+        while chunk := f.read(65536):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate per-label threshold metrics and sample predictions.")
+    parser = argparse.ArgumentParser(description="Generate per-label threshold metrics and sample predictions directly from dataset.")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--csv", type=Path)
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/evaluation"))
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--uncertain-policy", choices=["zero", "one", "ignore"], default="one")
+    parser.add_argument("--uncertain-policy", choices=["zero", "one", "ignore", "stanford", "smooth"], default="one")
     parser.add_argument("--view", choices=["frontal", "lateral", "all"], default=None)
     parser.add_argument("--sample-limit", type=int, default=202)
     return parser.parse_args()
@@ -35,7 +56,7 @@ def confusion_counts(targets: list[float], probs: list[float], threshold: float)
     tp = fp = tn = fn = 0
     for target, probability in zip(targets, probs, strict=True):
         predicted = probability >= threshold
-        actual = target == 1.0
+        actual = target >= 0.5
         if predicted and actual:
             tp += 1
         elif predicted and not actual:
@@ -81,7 +102,6 @@ def best_threshold(targets: list[float], probs: list[float]) -> dict[str, object
         if metrics["f1"] > best["f1"]:
             best = current
         elif metrics["f1"] == best["f1"]:
-            # Prefer the higher-specificity operating point when F1 ties.
             if metrics["specificity"] > best["specificity"]:
                 best = current
     if best is None:
@@ -95,27 +115,31 @@ def collect_predictions(
     dataset: CheXpertDataset | Subset,
     batch_size: int,
     num_workers: int,
-) -> tuple[list[list[float]], list[list[float]]]:
+) -> tuple[list[list[float]], list[list[float]], list[list[float]]]:
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
-        persistent_workers=num_workers > 0,
     )
     targets_all: list[list[float]] = []
     probs_all: list[list[float]] = []
+    masks_all: list[list[float]] = []
 
     if predictor.model is None:
         raise RuntimeError("Checkpoint failed to load.")
 
-    for images, targets in loader:
-        images = images.to(predictor.device)
+    for batch_item in loader:
+        images = batch_item[0].to(predictor.device)
+        targets = batch_item[1].to(predictor.device)
+        masks = batch_item[2].to(predictor.device) if len(batch_item) > 2 else torch.ones_like(targets)
+
         logits = predictor.model(images)
         targets_all.extend(targets.detach().cpu().tolist())
         probs_all.extend(torch.sigmoid(logits).detach().cpu().tolist())
-    return targets_all, probs_all
+        masks_all.extend(masks.detach().cpu().tolist())
+    return targets_all, probs_all, masks_all
 
 
 def write_threshold_csv(path: Path, rows: list[dict[str, object]]) -> None:
@@ -161,8 +185,8 @@ def write_sample_predictions(
             source = {"image_path": frame.iloc[row_index]["Path"]}
             for label_index, label in enumerate(labels):
                 probability = float(probs[row_index][label_index])
-                threshold = thresholds[label]
-                source[f"gt_{label}"] = int(targets[row_index][label_index])
+                threshold = thresholds.get(label, 0.5)
+                source[f"gt_{label}"] = int(targets[row_index][label_index] >= 0.5)
                 source[f"prob_{label}"] = probability
                 source[f"pred_{label}"] = int(probability >= threshold)
             writer.writerow(source)
@@ -185,15 +209,28 @@ def main() -> None:
         uncertain_policy=args.uncertain_policy,
         view=view,
     )
-    targets, probs = collect_predictions(predictor, dataset, args.batch_size, args.num_workers)
+    targets, probs, masks = collect_predictions(predictor, dataset, args.batch_size, args.num_workers)
 
     rows: list[dict[str, object]] = []
     threshold_map: dict[str, float] = {}
+    auc_map: dict[str, float | None] = {}
+
     for label_index, label in enumerate(predictor.labels):
-        label_targets = [row[label_index] for row in targets]
-        label_probs = [row[label_index] for row in probs]
-        positive_count = int(sum(label_targets))
+        valid_idx = [i for i, m in enumerate(masks) if m[label_index] > 0.5]
+        label_targets = [targets[i][label_index] for i in valid_idx]
+        label_probs = [probs[i][label_index] for i in valid_idx]
+
+        positive_count = int(sum(1 for t in label_targets if t >= 0.5))
         negative_count = int(len(label_targets) - positive_count)
+
+        if len(np.unique(label_targets)) >= 2:
+            try:
+                auc_map[label] = float(roc_auc_score(label_targets, label_probs))
+            except Exception:
+                auc_map[label] = None
+        else:
+            auc_map[label] = None
+
         best = best_threshold(label_targets, label_probs)
         threshold_map[label] = float(best["threshold"])
         rows.append(
@@ -214,6 +251,9 @@ def main() -> None:
             }
         )
 
+    valid_aucs = [v for v in auc_map.values() if v is not None]
+    mean_auc = float(sum(valid_aucs) / len(valid_aucs)) if valid_aucs else None
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
     write_threshold_csv(args.output_dir / "threshold_report.csv", rows)
     write_sample_predictions(
@@ -226,15 +266,22 @@ def main() -> None:
         args.sample_limit,
     )
 
+    commit_sha = get_git_commit_sha()
+    ckpt_hash = compute_file_sha256(args.checkpoint)
+    dataset_hash = compute_file_sha256(csv_path)
+
     thresholds_payload = {
+        "commit_sha": commit_sha,
         "checkpoint": str(args.checkpoint),
-        "csv": str(csv_path),
+        "checkpoint_sha256": ckpt_hash,
+        "dataset_csv": str(csv_path),
+        "dataset_sha256": dataset_hash,
         "view": view,
         "rows": len(dataset),
         "labels": predictor.labels,
-        "model": "DenseNet121",
-        "mean_auc": 0.8763721175369092,
-        "valid_rows": 202,
+        "model": predictor.architecture,
+        "mean_auc": mean_auc,
+        "label_auc": auc_map,
         "thresholds": threshold_map,
         "metrics": {row["label"]: row for row in rows},
         "disclaimer": "Research prototype only. Do not use these results for medical decisions.",

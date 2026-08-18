@@ -19,7 +19,6 @@ class CheXpertDataset(Dataset):
         labels: list[str] | None = None,
         uncertain_policy: str = "u_ones_zeros",
         view: str = "all",
-        return_mask: bool = False,
     ) -> None:
         self.csv_path = Path(csv_path)
         self.data_root = Path(data_root)
@@ -27,7 +26,6 @@ class CheXpertDataset(Dataset):
         self.labels = labels or DEFAULT_LABELS
         self.uncertain_policy = str(uncertain_policy).lower()
         self.view = str(view).lower()
-        self.return_mask = return_mask or (self.uncertain_policy == "ignore")
         self.frame = pd.read_csv(self.csv_path)
 
         missing = [label for label in self.labels if label not in self.frame.columns]
@@ -46,7 +44,12 @@ class CheXpertDataset(Dataset):
     def __len__(self) -> int:
         return len(self.frame)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Always returns (image_tensor, target_tensor, mask_tensor).
+        For valid binary/smooth targets, mask is 1.0.
+        For 'ignore' policy with -1 labels, mask is 0.0.
+        """
         row = self.frame.iloc[index]
         image_path = self._resolve_image_path(row["Path"])
         image = Image.open(image_path).convert("RGB")
@@ -62,9 +65,7 @@ class CheXpertDataset(Dataset):
         mask_tensor = torch.tensor(masks, dtype=torch.float32)
         img_tensor = self.transform(image)
 
-        if self.return_mask:
-            return img_tensor, target_tensor, mask_tensor
-        return img_tensor, target_tensor
+        return img_tensor, target_tensor, mask_tensor
 
     def _resolve_image_path(self, path_value: str) -> Path:
         path = Path(str(path_value))

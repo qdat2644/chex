@@ -55,22 +55,27 @@ class AsymmetricLoss(torch.nn.Module):
             one_sided_w = torch.pow(1.0 - pt, one_sided_gamma)
             loss = loss * one_sided_w
 
+        if mask is not None:
+            loss = loss * mask
+            return -loss.sum() / mask.sum().clamp(min=1.0)
         return -loss.sum() / max(1, x.size(0))
 
 
 class FocalLoss(torch.nn.Module):
     """
-    Multi-label Focal Loss.
+    Multi-label Focal Loss with optional masking.
     """
     def __init__(self, alpha: float = 0.25, gamma: float = 2.0):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
         pt = torch.exp(-bce_loss)
         focal_loss = self.alpha * (1.0 - pt) ** self.gamma * bce_loss
+        if mask is not None:
+            return (focal_loss * mask).sum() / mask.sum().clamp(min=1.0)
         return focal_loss.mean()
 
 
@@ -105,7 +110,7 @@ def parse_args() -> argparse.Namespace:
         "--uncertain-policy",
         choices=["u_ones_zeros", "smooth", "zero", "one", "ignore"],
         default="u_ones_zeros",
-        help="Policy for -1 uncertainty labels (u_ones_zeros=Stanford baseline, smooth=0.6, zero=0, one=1)",
+        help="Policy for -1 uncertainty labels (u_ones_zeros=Stanford baseline, smooth=0.6, zero=0, one=1, ignore=masked)",
     )
     parser.add_argument("--label-preset", choices=["competition", "all"], default="competition")
     parser.add_argument("--view", choices=["frontal", "lateral", "all"], default="frontal")
@@ -155,21 +160,32 @@ def run_epoch(
     scaler: torch.amp.GradScaler | None = None,
     use_amp: bool = False,
     desc: str = "epoch",
-) -> tuple[float, list[list[float]], list[list[float]]]:
+) -> tuple[float, list[list[float]], list[list[float]], list[list[float]]]:
     is_train = optimizer is not None
     model.train(is_train)
     total_loss = 0.0
     all_targets: list[list[float]] = []
     all_probs: list[list[float]] = []
+    all_masks: list[list[float]] = []
 
     progress = tqdm(loader, desc=desc, unit="batch", leave=True, dynamic_ncols=True)
-    for images, targets in progress:
-        images = images.to(device)
-        targets = targets.to(device)
+    for batch_item in progress:
+        images = batch_item[0].to(device)
+        targets = batch_item[1].to(device)
+        masks = batch_item[2].to(device) if len(batch_item) > 2 else torch.ones_like(targets)
 
         with torch.set_grad_enabled(is_train), torch.amp.autocast(device_type=device.type, enabled=use_amp):
             logits = model(images)
-            loss = criterion(logits, targets)
+            if isinstance(criterion, (AsymmetricLoss, FocalLoss)):
+                loss = criterion(logits, targets, mask=masks)
+            elif isinstance(criterion, torch.nn.BCEWithLogitsLoss):
+                bce = F.binary_cross_entropy_with_logits(
+                    logits, targets, pos_weight=criterion.pos_weight, reduction="none"
+                )
+                loss = (bce * masks).sum() / masks.sum().clamp(min=1.0)
+            else:
+                loss = criterion(logits, targets)
+
             if optimizer:
                 optimizer.zero_grad(set_to_none=True)
                 if scaler:
@@ -184,16 +200,28 @@ def run_epoch(
         total_loss += batch_loss * images.size(0)
         all_targets.extend(targets.detach().cpu().tolist())
         all_probs.extend(torch.sigmoid(logits).detach().cpu().tolist())
+        all_masks.extend(masks.detach().cpu().tolist())
         progress.set_postfix(loss=f"{batch_loss:.4f}")
 
-    return total_loss / max(1, len(loader.dataset)), all_targets, all_probs
+    return total_loss / max(1, len(loader.dataset)), all_targets, all_probs, all_masks
 
 
-def label_aucs(targets: list[list[float]], probs: list[list[float]], labels: list[str]) -> dict[str, float | None]:
+def label_aucs(
+    targets: list[list[float]],
+    probs: list[list[float]],
+    labels: list[str],
+    masks: list[list[float]] | None = None,
+) -> dict[str, float | None]:
     scores: dict[str, float | None] = {}
     for label_index, label in enumerate(labels):
-        y_true = [1.0 if row[label_index] >= 0.5 else 0.0 for row in targets]
-        y_score = [row[label_index] for row in probs]
+        if masks is not None:
+            valid_idx = [i for i, m in enumerate(masks) if m[label_index] > 0.5]
+        else:
+            valid_idx = list(range(len(targets)))
+
+        y_true = [1.0 if targets[i][label_index] >= 0.5 else 0.0 for i in valid_idx]
+        y_score = [probs[i][label_index] for i in valid_idx]
+
         if len(set(y_true)) < 2:
             scores[label] = None
             continue
@@ -465,7 +493,7 @@ def main() -> None:
 
     for epoch in range(start_epoch, args.epochs + 1):
         print(f"\n>>> Epoch {epoch}/{args.epochs} Starting...")
-        train_loss, _, _ = run_epoch(
+        train_loss, _, _, _ = run_epoch(
             model,
             train_loader,
             criterion,
@@ -475,7 +503,7 @@ def main() -> None:
             use_amp,
             desc=f"Epoch {epoch}/{args.epochs} [Train]",
         )
-        valid_loss, valid_targets, valid_probs = run_epoch(
+        valid_loss, valid_targets, valid_probs, valid_masks = run_epoch(
             model,
             valid_loader,
             criterion,
@@ -483,7 +511,7 @@ def main() -> None:
             use_amp=use_amp,
             desc=f"Epoch {epoch}/{args.epochs} [Valid]",
         )
-        auc_scores = label_aucs(valid_targets, valid_probs, labels)
+        auc_scores = label_aucs(valid_targets, valid_probs, labels, masks=valid_masks)
         auc = mean_auc(auc_scores)
         auc_text = "n/a" if auc is None else f"{auc:.4f}"
         current_lr = optimizer.param_groups[0]["lr"]

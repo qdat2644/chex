@@ -17,7 +17,7 @@ from torchvision import models, transforms
 
 from app.config import DEFAULT_IMAGE_SIZE, DEFAULT_LABELS, DEFAULT_THRESHOLD, PROJECT_ROOT
 
-GRADCAM_LOCK = threading.Lock()
+MODEL_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True)
@@ -158,37 +158,38 @@ class CheXpertPredictor:
         if self.model is None:
             raise RuntimeError("Model checkpoint is not loaded.")
 
-        tensor = self.transform(image).unsqueeze(0).to(self.device)
-        logits = self.model(tensor)
-        probabilities = torch.sigmoid(logits).squeeze(0).detach().cpu().tolist()
+        with MODEL_LOCK:
+            tensor = self.transform(image).unsqueeze(0).to(self.device)
+            logits = self.model(tensor)
+            probabilities = torch.sigmoid(logits).squeeze(0).detach().cpu().tolist()
 
-        results: list[Prediction] = []
-        for label, probability in zip(self.labels, probabilities, strict=True):
-            prob = float(probability)
-            threshold = self.thresholds.get(label, self.threshold)
-            is_positive = bool(threshold is not None and prob >= threshold)
+            results: list[Prediction] = []
+            for label, probability in zip(self.labels, probabilities, strict=True):
+                prob = float(probability)
+                threshold = self.thresholds.get(label, self.threshold)
+                is_positive = bool(threshold is not None and prob >= threshold)
 
-            # Determine clinical suspicion level
-            if threshold is not None:
-                if prob >= min(1.0, threshold + 0.15):
-                    suspicion = "High suspicion"
-                elif prob >= threshold:
-                    suspicion = "Moderate suspicion"
+                # Determine clinical suspicion level
+                if threshold is not None:
+                    if prob >= min(1.0, threshold + 0.15):
+                        suspicion = "High suspicion"
+                    elif prob >= threshold:
+                        suspicion = "Moderate suspicion"
+                    else:
+                        suspicion = "Low suspicion"
                 else:
-                    suspicion = "Low suspicion"
-            else:
-                suspicion = "Probability only"
+                    suspicion = "Probability only"
 
-            results.append(
-                Prediction(
-                    label=label,
-                    probability=prob,
-                    positive=is_positive,
-                    threshold=threshold,
-                    suspicion_level=suspicion,
+                results.append(
+                    Prediction(
+                        label=label,
+                        probability=prob,
+                        positive=is_positive,
+                        threshold=threshold,
+                        suspicion_level=suspicion,
+                    )
                 )
-            )
-        return results
+            return results
 
     @torch.inference_mode()
     def predict_batch(self, images: list[Image.Image], chunk_size: int = 16) -> list[list[Prediction]]:
@@ -198,41 +199,42 @@ class CheXpertPredictor:
             return []
 
         all_results: list[list[Prediction]] = []
-        # Chunked batch processing to prevent GPU/CPU memory overflow (OOM)
-        for i in range(0, len(images), chunk_size):
-            chunk = images[i : i + chunk_size]
-            tensors = torch.stack([self.transform(img.convert("RGB")) for img in chunk]).to(self.device)
-            logits = self.model(tensors)
-            batch_probs = torch.sigmoid(logits).detach().cpu().numpy()
+        with MODEL_LOCK:
+            # Chunked batch processing to prevent GPU/CPU memory overflow (OOM)
+            for i in range(0, len(images), chunk_size):
+                chunk = images[i : i + chunk_size]
+                tensors = torch.stack([self.transform(img.convert("RGB")) for img in chunk]).to(self.device)
+                logits = self.model(tensors)
+                batch_probs = torch.sigmoid(logits).detach().cpu().numpy()
 
-            for probs in batch_probs:
-                img_results: list[Prediction] = []
-                for label, prob_val in zip(self.labels, probs, strict=True):
-                    prob = float(prob_val)
-                    threshold = self.thresholds.get(label, self.threshold)
-                    is_positive = bool(threshold is not None and prob >= threshold)
+                for probs in batch_probs:
+                    img_results: list[Prediction] = []
+                    for label, prob_val in zip(self.labels, probs, strict=True):
+                        prob = float(prob_val)
+                        threshold = self.thresholds.get(label, self.threshold)
+                        is_positive = bool(threshold is not None and prob >= threshold)
 
-                    if threshold is not None:
-                        if prob >= min(1.0, threshold + 0.15):
-                            suspicion = "High suspicion"
-                        elif prob >= threshold:
-                            suspicion = "Moderate suspicion"
+                        if threshold is not None:
+                            if prob >= min(1.0, threshold + 0.15):
+                                suspicion = "High suspicion"
+                            elif prob >= threshold:
+                                suspicion = "Moderate suspicion"
+                            else:
+                                suspicion = "Low suspicion"
                         else:
-                            suspicion = "Low suspicion"
-                    else:
-                        suspicion = "Probability only"
+                            suspicion = "Probability only"
 
-                    img_results.append(
-                        Prediction(
-                            label=label,
-                            probability=prob,
-                            positive=is_positive,
-                            threshold=threshold,
-                            suspicion_level=suspicion,
+                        img_results.append(
+                            Prediction(
+                                label=label,
+                                probability=prob,
+                                positive=is_positive,
+                                threshold=threshold,
+                                suspicion_level=suspicion,
+                            )
                         )
-                    )
-                all_results.append(img_results)
-        return all_results
+                    all_results.append(img_results)
+            return all_results
 
     def explain_finding(self, image: Image.Image, target_label: str | None = None) -> Heatmap:
         if self.model is None:
@@ -241,7 +243,7 @@ class CheXpertPredictor:
         if target_label is not None and target_label not in self.labels:
             raise ValueError(f"Invalid target label '{target_label}'. Valid labels are: {self.labels}")
 
-        with GRADCAM_LOCK:
+        with MODEL_LOCK:
             original = image.convert("RGB")
             tensor = self.transform(original).unsqueeze(0).to(self.device)
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import concurrent.futures
 import io
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -8,7 +10,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 import app.main as main_module
-from app.main import app, mask_phi
+from app.main import app, mask_phi, _download_hf_file
 from app.model import CheXpertPredictor
 
 
@@ -99,18 +101,25 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("Invalid label", response.json()["detail"])
 
-    def test_batch_predict_endpoint(self) -> None:
+    def test_batch_predict_endpoint_with_client_ids(self) -> None:
         buf1 = io.BytesIO()
         Image.new("RGB", (64, 64), color="gray").save(buf1, format="PNG")
         buf2 = io.BytesIO()
         Image.new("RGB", (64, 64), color="black").save(buf2, format="PNG")
 
+        custom_id_1 = "custom_client_uuid_001"
+        custom_id_2 = "custom_client_uuid_002"
+
         response = self.client.post(
             "/api/predict-batch",
             files=[
-                ("files", ("cxr_1.png", buf1.getvalue(), "image/png")),
-                ("files", ("cxr_2.png", buf2.getvalue(), "image/png")),
+                ("files", ("duplicate_cxr.png", buf1.getvalue(), "image/png")),
+                ("files", ("duplicate_cxr.png", buf2.getvalue(), "image/png")),
             ],
+            data=[
+                ("client_ids", custom_id_1),
+                ("client_ids", custom_id_2),
+            ]
         )
         self.assertEqual(response.status_code, 200)
         payload = response.json()
@@ -118,18 +127,64 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(payload["total"], 2)
         self.assertEqual(payload["processed"], 2)
         self.assertEqual(len(payload["results"]), 2)
-        self.assertEqual(payload["results"][0]["filename"], "cxr_1.png")
-        self.assertTrue(payload["results"][0]["client_id"].startswith("batch_cxr_1_"))
+        self.assertEqual(payload["results"][0]["client_id"], custom_id_1)
+        self.assertEqual(payload["results"][1]["client_id"], custom_id_2)
 
-    def test_phi_masking_utility(self) -> None:
+    def test_phi_masking_hmac(self) -> None:
         self.assertEqual(mask_phi(None), "ANONYMIZED")
         self.assertEqual(mask_phi("ANONYMIZED"), "ANONYMIZED")
         self.assertEqual(mask_phi("N/A"), "ANONYMIZED")
         
-        # Real patient name/ID should be masked with salted hash
-        masked = mask_phi("JOHN_DOE_12345")
+        # Real patient name/ID should be masked with HMAC-SHA256 fingerprint of at least 16 chars
+        masked = mask_phi("PATIENT_RECORD_98765")
         self.assertTrue(masked.startswith("ANONYMIZED_"))
-        self.assertNotEqual(masked, "JOHN_DOE_12345")
+        self.assertEqual(len(masked), len("ANONYMIZED_") + 16)
+        self.assertNotEqual(masked, "PATIENT_RECORD_98765")
+
+    def test_concurrent_predict_and_explain(self) -> None:
+        """
+        Verify thread safety when concurrent predict and explain requests are executed.
+        """
+        image_bytes = io.BytesIO()
+        Image.new("RGB", (128, 128), color=(120, 120, 120)).save(image_bytes, format="PNG")
+        raw_data = image_bytes.getvalue()
+
+        def do_predict():
+            return self.client.post(
+                "/api/predict",
+                files={"file": ("test.png", raw_data, "image/png")},
+            )
+
+        def do_explain():
+            return self.client.post(
+                "/api/explain",
+                files={"file": ("test.png", raw_data, "image/png")},
+                data={"label": "Edema"},
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            f1 = executor.submit(do_predict)
+            f2 = executor.submit(do_explain)
+            f3 = executor.submit(do_predict)
+            f4 = executor.submit(do_explain)
+
+            results = [f.result() for f in [f1, f2, f3, f4]]
+
+        for r in results:
+            self.assertEqual(r.status_code, 200)
+
+    def test_checksum_verification_rejection(self) -> None:
+        """
+        Verify that downloading with a mismatched SHA-256 hash gets rejected and cleaned up.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "test_model.pt"
+            # Attempt to verify against wrong checksum
+            fake_url = "https://raw.githubusercontent.com/qdat2644/chex/main/README.md"
+            wrong_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+            success = _download_hf_file(fake_url, target, expected_sha256=wrong_sha256)
+            self.assertFalse(success)
+            self.assertFalse(target.exists())
 
 
 if __name__ == "__main__":

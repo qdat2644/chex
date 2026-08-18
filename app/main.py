@@ -3,24 +3,32 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import hmac
 import json
 import os
+import tempfile
 import uuid
 from io import BytesIO
 from pathlib import Path
+from typing import BinaryIO
 
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, UnidentifiedImageError
 
-# Decompression bomb protection against malicious oversized image files
+# Decompression bomb protection against oversized images
 Image.MAX_IMAGE_PIXELS = 50_000_000
 
 # Security and ingestion limits
 MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB max per file
 MAX_BATCH_FILES = 50                    # 50 files max per batch request
+MAX_DICOM_PIXELS = 50_000_000           # 50 megapixels max per DICOM frame
+
+# PHI Protection Configuration
+PHI_HMAC_SECRET = os.getenv("PHI_HMAC_SECRET", "chexpert_default_medical_phi_secret_2026").encode("utf-8")
+EXPOSE_PHI = os.getenv("EXPOSE_PHI", "false").lower() == "true"
 
 try:
     import pydicom
@@ -55,20 +63,22 @@ app = FastAPI(title="CheXpert Web Reader - Medical AI Workstation")
 
 def mask_phi(val: str | None) -> str:
     """
-    Masks Protected Health Information (PHI) by default using salted SHA-256 fingerprinting.
+    Masks Protected Health Information (PHI) using HMAC-SHA256 with 16-character fingerprint.
     """
     if not val or str(val).strip().upper() in ("ANONYMIZED", "NONE", "N/A", "UNKNOWN"):
         return "ANONYMIZED"
-    raw_str = str(val).strip()
-    h = hashlib.sha256(raw_str.encode("utf-8")).hexdigest()[:6].upper()
+    if EXPOSE_PHI:
+        return str(val).strip()
+    raw_bytes = str(val).strip().encode("utf-8")
+    h = hmac.new(PHI_HMAC_SECRET, raw_bytes, hashlib.sha256).hexdigest()[:16].upper()
     return f"ANONYMIZED_{h}"
 
 
-def _download_hf_file(url: str, target: Path) -> bool:
+def _download_hf_file(url: str, target: Path, expected_sha256: str | None = None) -> bool:
     """
-    Downloads file from Hugging Face via temporary file and performs atomic rename on completion.
+    Downloads file from Hugging Face via temporary file, verifies integrity, and performs atomic rename.
     """
-    tmp_target = target.with_suffix(target.suffix + f".{uuid.uuid4().hex[:6]}.tmp")
+    tmp_target = target.with_suffix(target.suffix + f".{uuid.uuid4().hex[:8]}.tmp")
     try:
         import urllib.request
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -77,16 +87,27 @@ def _download_hf_file(url: str, target: Path) -> bool:
         if hf_token:
             headers["Authorization"] = f"Bearer {hf_token}"
         req = urllib.request.Request(url, headers=headers)
+        
+        hasher = hashlib.sha256()
         with urllib.request.urlopen(req) as resp, open(tmp_target, "wb") as f:
             while chunk := resp.read(1024 * 1024):
                 f.write(chunk)
+                hasher.update(chunk)
 
-        if tmp_target.exists() and tmp_target.stat().st_size > 1000:
-            os.replace(tmp_target, target)
-            return True
-        if tmp_target.exists():
-            tmp_target.unlink(missing_ok=True)
-        return False
+        if not tmp_target.exists() or tmp_target.stat().st_size < 1000:
+            if tmp_target.exists():
+                tmp_target.unlink(missing_ok=True)
+            return False
+
+        if expected_sha256:
+            calc_sha256 = hasher.hexdigest()
+            if calc_sha256.lower() != expected_sha256.lower():
+                print(f"Checksum mismatch for {target}: expected {expected_sha256}, got {calc_sha256}")
+                tmp_target.unlink(missing_ok=True)
+                return False
+
+        os.replace(tmp_target, target)
+        return True
     except Exception as e:
         if tmp_target.exists():
             tmp_target.unlink(missing_ok=True)
@@ -142,17 +163,59 @@ static_dir = PROJECT_ROOT / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
-def decode_image_or_dicom(content: bytes, filename: str) -> tuple[Image.Image, DicomMetadata]:
+async def stream_to_spooled_tempfile(file: UploadFile, max_bytes: int = MAX_FILE_SIZE_BYTES) -> tempfile.SpooledTemporaryFile:
     """
-    Decodes standard image files (PNG, JPG, WebP) or DICOM (.dcm) files with PHI anonymization.
+    Streams upload file in 1MB chunks into a SpooledTemporaryFile with early size-limit abort.
     """
-    is_dicom = filename.lower().endswith(".dcm") or (len(content) > 132 and content[128:132] == b"DICM")
-    
+    spool = tempfile.SpooledTemporaryFile(max_size=2 * 1024 * 1024)
+    total_read = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total_read += len(chunk)
+        if total_read > max_bytes:
+            spool.close()
+            raise HTTPException(
+                status_code=413,
+                detail=f"File exceeds maximum allowed size of {max_bytes // (1024 * 1024)}MB.",
+            )
+        spool.write(chunk)
+
+    if total_read == 0:
+        spool.close()
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    spool.seek(0)
+    return spool
+
+
+def decode_image_or_dicom(spool: BinaryIO, filename: str) -> tuple[Image.Image, DicomMetadata]:
+    """
+    Decodes standard image files or DICOM files with streaming, frame validation, and PHI masking.
+    """
+    header_bytes = spool.read(132)
+    spool.seek(0)
+
+    is_dicom = filename.lower().endswith(".dcm") or (len(header_bytes) >= 132 and header_bytes[128:132] == b"DICM")
+
     if is_dicom and HAS_PYDICOM:
         try:
-            dcm = pydicom.dcmread(BytesIO(content), force=True)
-            arr = dcm.pixel_array.astype(float)
+            dcm = pydicom.dcmread(spool, force=True)
             
+            # Frame and dimension guards against massive memory allocations
+            num_frames = int(getattr(dcm, "NumberOfFrames", 1))
+            rows = int(getattr(dcm, "Rows", 0))
+            cols = int(getattr(dcm, "Columns", 0))
+            if rows * cols > MAX_DICOM_PIXELS:
+                raise HTTPException(status_code=400, detail="DICOM resolution exceeds maximum supported dimensions.")
+
+            arr = dcm.pixel_array
+            if num_frames > 1 and len(arr.shape) > 2:
+                arr = arr[0]  # Take first frame for multi-frame studies
+
+            arr = arr.astype(float)
+
             # Apply VOI LUT (Windowing / Rescaling) if available
             try:
                 arr = apply_voi_lut(arr, dcm)
@@ -161,7 +224,7 @@ def decode_image_or_dicom(content: bytes, filename: str) -> tuple[Image.Image, D
                 intercept = float(getattr(dcm, "RescaleIntercept", 0.0))
                 arr = (arr * slope) + intercept
 
-            # Invert MONOCHROME1 (where 0 is white and max is black) to MONOCHROME2
+            # Invert MONOCHROME1 to MONOCHROME2
             photometric = str(getattr(dcm, "PhotometricInterpretation", "MONOCHROME2")).upper()
             if "MONOCHROME1" in photometric:
                 arr = np.amax(arr) - arr
@@ -175,30 +238,32 @@ def decode_image_or_dicom(content: bytes, filename: str) -> tuple[Image.Image, D
                 arr = np.zeros(arr.shape, dtype=np.uint8)
 
             image = Image.fromarray(arr).convert("RGB")
-            
+
             raw_patient_id = getattr(dcm, "PatientID", None)
             raw_patient_name = getattr(dcm, "PatientName", None)
+            raw_study_date = getattr(dcm, "StudyDate", "N/A")
 
             dicom_meta = DicomMetadata(
                 is_dicom=True,
                 patient_id=mask_phi(raw_patient_id),
-                patient_name=mask_phi(raw_patient_name),
-                study_date=str(getattr(dcm, "StudyDate", "N/A")),
+                patient_name=mask_phi(raw_patient_name) if EXPOSE_PHI else "REDACTED",
+                study_date=str(raw_study_date) if EXPOSE_PHI else "REDACTED",
                 modality=str(getattr(dcm, "Modality", "CR / DX")),
                 view_position=str(getattr(dcm, "ViewPosition", "PA (Posteroanterior)")),
                 body_part=str(getattr(dcm, "BodyPartExamined", "CHEST")),
                 photometric=photometric,
-                rows=int(getattr(dcm, "Rows", image.height)),
-                columns=int(getattr(dcm, "Columns", image.width)),
+                rows=rows or image.height,
+                columns=cols or image.width,
             )
             return image, dicom_meta
+        except HTTPException:
+            raise
         except Exception:
-            # Fallback to standard image reader if DICOM parse fails
-            pass
+            spool.seek(0)
 
-    # 2. Standard image reader (JPG, PNG, WebP, BMP)
+    # Standard image reader
     try:
-        image = Image.open(BytesIO(content))
+        image = Image.open(spool)
         image.load()
         image = image.convert("RGB")
         return image, DicomMetadata(is_dicom=False)
@@ -207,13 +272,9 @@ def decode_image_or_dicom(content: bytes, filename: str) -> tuple[Image.Image, D
 
 
 def assess_cxr_quality(image: Image.Image, dicom_meta: DicomMetadata) -> QualityReport:
-    """
-    Performs clinical validation checks to ensure the image is a valid Frontal Chest X-ray.
-    """
     warnings = []
     quality_score = 1.0
 
-    # DICOM check
     if dicom_meta.is_dicom:
         if dicom_meta.body_part and "CHEST" not in dicom_meta.body_part.upper():
             warnings.append(f"DICOM BodyPart is '{dicom_meta.body_part}', not CHEST.")
@@ -222,14 +283,12 @@ def assess_cxr_quality(image: Image.Image, dicom_meta: DicomMetadata) -> Quality
             warnings.append("DICOM View is LATERAL. This model is trained on FRONTAL (PA/AP) views only.")
             quality_score -= 0.4
 
-    # Aspect ratio check (Frontal CXR typically 1:1 to 4:5)
     w, h = image.size
     ratio = w / max(1, h)
     if ratio < 0.5 or ratio > 2.0:
         warnings.append(f"Unusual aspect ratio ({ratio:.2f}). Please ensure image is cropped to the thorax.")
         quality_score -= 0.2
 
-    # Color saturation check (X-rays are monochrome/grayscale)
     np_img = np.asarray(image, dtype=np.float32)
     std_channels = np.std(np_img, axis=-1)
     mean_std = float(np.mean(std_channels))
@@ -316,15 +375,13 @@ async def predict(
     file: UploadFile = File(...),
     include_heatmap: bool = Query(True),
 ) -> PredictionResponse:
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-
-    if len(content) > MAX_FILE_SIZE_BYTES:
-        raise HTTPException(status_code=413, detail=f"File exceeds maximum allowed size of {MAX_FILE_SIZE_BYTES // (1024*1024)}MB.")
-
     filename = file.filename or "uploaded_xray.png"
-    image, dicom_meta = decode_image_or_dicom(content, filename)
+    spool = await stream_to_spooled_tempfile(file, max_bytes=MAX_FILE_SIZE_BYTES)
+    try:
+        image, dicom_meta = decode_image_or_dicom(spool, filename)
+    finally:
+        spool.close()
+
     width, height = image.size
 
     if not predictor.is_loaded:
@@ -340,7 +397,7 @@ async def predict(
             message="No model checkpoint loaded. Place a .pt file in checkpoints/.",
         )
 
-    # Offload inference to worker thread to avoid blocking FastAPI event loop
+    # Offload inference and heatmap to worker thread with unified lock
     def _do_inference():
         quality = assess_cxr_quality(image, dicom_meta)
         predictions = predictor.predict(image)
@@ -387,9 +444,6 @@ async def explain_label(
     file: UploadFile = File(...),
     label: str = Form(...),
 ) -> HeatmapExplanation:
-    """
-    On-demand interactive Grad-CAM generation for ANY specific finding label.
-    """
     if not predictor.is_loaded:
         raise HTTPException(status_code=400, detail="Model is not loaded.")
 
@@ -399,15 +453,12 @@ async def explain_label(
             detail=f"Invalid label '{label}'. Valid labels are: {predictor.labels}",
         )
 
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Empty image data.")
-
-    if len(content) > MAX_FILE_SIZE_BYTES:
-        raise HTTPException(status_code=413, detail="File exceeds maximum allowed size.")
-
     filename = file.filename or "upload.png"
-    image, _ = decode_image_or_dicom(content, filename)
+    spool = await stream_to_spooled_tempfile(file, max_bytes=MAX_FILE_SIZE_BYTES)
+    try:
+        image, _ = decode_image_or_dicom(spool, filename)
+    finally:
+        spool.close()
 
     try:
         explanation = await asyncio.to_thread(predictor.explain_finding, image, label)
@@ -424,10 +475,8 @@ async def explain_label(
 @app.post("/api/predict-batch", response_model=BatchPredictionResponse)
 async def predict_batch_cxrs(
     files: list[UploadFile] = File(...),
+    client_ids: list[str] = Form(None),
 ) -> BatchPredictionResponse:
-    """
-    High-throughput batch diagnostic inference for multiple CXR/DICOM files.
-    """
     if not predictor.is_loaded:
         raise HTTPException(status_code=400, detail="Model is not loaded.")
     if not files:
@@ -443,18 +492,20 @@ async def predict_batch_cxrs(
     metadata_list: list[dict] = []
     errors: list[str] = []
 
-    for idx, f in enumerate(files):
-        try:
-            content = await f.read()
-            if not content:
-                errors.append(f"File {f.filename}: empty data.")
-                continue
-            if len(content) > MAX_FILE_SIZE_BYTES:
-                errors.append(f"File {f.filename}: exceeds 50MB limit.")
-                continue
+    client_id_list = client_ids or []
 
-            fname = f.filename or f"image_{idx}.png"
-            img, dcm_meta = decode_image_or_dicom(content, fname)
+    # Stream, decode, and generate previews in chunks of 8 to minimize RAM footprint
+    for idx, f in enumerate(files):
+        c_id = client_id_list[idx] if idx < len(client_id_list) else f"batch_cxr_{idx+1}_{uuid.uuid4().hex[:8]}"
+        fname = f.filename or f"image_{idx}.png"
+
+        try:
+            spool = await stream_to_spooled_tempfile(f, max_bytes=MAX_FILE_SIZE_BYTES)
+            try:
+                img, dcm_meta = decode_image_or_dicom(spool, fname)
+            finally:
+                spool.close()
+
             quality = assess_cxr_quality(img, dcm_meta)
 
             # Generate small thumbnail preview for batch table
@@ -467,15 +518,17 @@ async def predict_batch_cxrs(
             valid_images.append(img)
             metadata_list.append({
                 "index": idx + 1,
-                "client_id": f"batch_cxr_{idx+1}_{uuid.uuid4().hex[:6]}",
+                "client_id": c_id,
                 "filename": fname,
                 "is_dicom": dcm_meta.is_dicom,
                 "patient_id": dcm_meta.patient_id or "ANONYMIZED",
                 "quality": quality,
                 "preview_url": thumb_b64,
             })
+        except HTTPException as he:
+            errors.append(f"File {fname}: {he.detail}")
         except Exception as e:
-            errors.append(f"File {f.filename}: {e}")
+            errors.append(f"File {fname}: {e}")
 
     if not valid_images:
         return BatchPredictionResponse(
@@ -487,8 +540,8 @@ async def predict_batch_cxrs(
             errors=errors,
         )
 
-    # Chunked vectorized batch forward pass on threadpool to avoid event loop starvation
-    batch_predictions = await asyncio.to_thread(predictor.predict_batch, valid_images, chunk_size=16)
+    # Chunked batch forward pass on threadpool
+    batch_predictions = await asyncio.to_thread(predictor.predict_batch, valid_images, chunk_size=8)
 
     results: list[BatchItemResult] = []
     for meta, preds in zip(metadata_list, batch_predictions, strict=True):

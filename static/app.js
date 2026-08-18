@@ -931,12 +931,22 @@ function initBatchControls() {
   btnClearBatch.addEventListener("click", clearBatch);
 }
 
+const batchFileMap = new Map();
+
 function queueBatchFiles(files) {
-  queuedBatchFiles = files;
-  batchFileCount.textContent = `${files.length} files queued • Parallel vectorized GPU/CPU forward pass`;
+  batchFileMap.clear();
+  queuedBatchFiles = [];
+  Array.from(files).forEach((f) => {
+    const cid = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : `cid_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+    f._clientId = cid;
+    batchFileMap.set(cid, f);
+    queuedBatchFiles.push(f);
+  });
+
+  batchFileCount.textContent = `${queuedBatchFiles.length} files queued • Parallel vectorized GPU/CPU forward pass`;
   batchDropzone.classList.add("has-file");
   batchAnalyzeBtn.disabled = false;
-  batchStatsChip.textContent = `${files.length} Studies Queued`;
+  batchStatsChip.textContent = `${queuedBatchFiles.length} Studies Queued`;
 }
 
 async function runBatchInference() {
@@ -948,6 +958,7 @@ async function runBatchInference() {
   const formData = new FormData();
   for (const f of queuedBatchFiles) {
     formData.append("files", f);
+    formData.append("client_ids", f._clientId);
   }
 
   try {
@@ -1058,25 +1069,21 @@ function renderBatchTable(results) {
     btnOpen.textContent = `${t("Open")} ↗`;
     btnOpen.addEventListener("click", (e) => {
       e.stopPropagation();
-      openBatchItemInPacs(item.filename, idx);
+      openBatchItemInPacs(item.client_id);
     });
     tdAction.appendChild(btnOpen);
     tr.appendChild(tdAction);
 
     // Click anywhere on row to view in PACS
-    tr.addEventListener("click", () => openBatchItemInPacs(item.filename, idx));
+    tr.addEventListener("click", () => openBatchItemInPacs(item.client_id));
     fragment.appendChild(tr);
   });
 
   batchTableBody.replaceChildren(fragment);
 }
 
-function openBatchItemInPacs(filename, fallbackIdx) {
-  // Find file by exact filename or fallback index for guaranteed integrity
-  let file = queuedBatchFiles.find((f) => f.name === filename);
-  if (!file && fallbackIdx !== undefined) {
-    file = queuedBatchFiles[fallbackIdx];
-  }
+function openBatchItemInPacs(clientId) {
+  const file = batchFileMap.get(clientId);
   if (!file) return;
 
   // Switch to single workspace mode
@@ -1088,6 +1095,7 @@ function openBatchItemInPacs(filename, fallbackIdx) {
 }
 
 function clearBatch() {
+  batchFileMap.clear();
   queuedBatchFiles = [];
   batchResultsData = [];
   batchFilesInput.value = "";
