@@ -151,16 +151,20 @@ const DICTIONARY_VI = {
 // Current Language: Default is 'en'
 let currentLang = localStorage.getItem("chex_lang") || "en";
 
+// Sort keys by length descending so longer sentences are always matched and translated first!
+const SORTED_KEYS_VI = Object.keys(DICTIONARY_VI).sort((a, b) => b.length - a.length);
+
 // Universal translation filter function
 function t(text) {
   if (!text || typeof text !== "string") return text;
   if (currentLang === "en") return text;
-  if (DICTIONARY_VI[text]) return DICTIONARY_VI[text];
+  const trimmed = text.trim();
+  if (DICTIONARY_VI[trimmed]) return DICTIONARY_VI[trimmed];
 
   let translated = text;
-  for (const [enKey, viVal] of Object.entries(DICTIONARY_VI)) {
+  for (const enKey of SORTED_KEYS_VI) {
     if (translated.includes(enKey)) {
-      translated = translated.replaceAll(enKey, viVal);
+      translated = translated.replaceAll(enKey, DICTIONARY_VI[enKey]);
     }
   }
   return translated;
