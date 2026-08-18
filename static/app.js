@@ -131,6 +131,7 @@ const DICTIONARY_VI = {
   "No threshold": "Chưa có ngưỡng",
   "Threshold:": "Ngưỡng:",
   "Top Finding": "Tổn thương nổi bật",
+  "Visual explanation is intended for research interpretation and quality assurance.": "Hình ảnh giải thích phục vụ mục đích nghiên cứu và kiểm định chất lượng chẩn đoán.",
 
   // Print Layout
   "Chest Radiograph Automated Diagnostic & Pathology Report": "Phiếu Báo Cáo Kết Quả Xét Nghiệm & Chẩn Đoán X-quang Tự Động",
@@ -240,6 +241,7 @@ function applyLanguage(lang) {
   setText("i18n-heat-empty-sub", t("Grad-CAM activation overlays are generated during inference."));
   setText("i18n-orig-label", t("Original Radiograph"));
   setText("i18n-cam-label", t("Grad-CAM Overlay"));
+  setText("heatmap-caption", t("Visual explanation is intended for research interpretation and quality assurance."));
 
   // Printable Report elements
   setText("print-sub-header", t("Chest Radiograph Automated Diagnostic & Pathology Report"));
