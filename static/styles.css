@@ -522,15 +522,24 @@ input[type="file"] {
   box-shadow: 0 0 0 2px var(--primary-glow);
 }
 
-.finding-title {
+.finding-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.finding-left {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-bottom: 6px;
+  flex-wrap: wrap;
 }
 
-.finding-title strong {
-  font-size: 14px;
+.finding-name {
+  font-size: 14.5px;
+  font-weight: 700;
   color: #fff;
 }
 
@@ -549,10 +558,18 @@ input[type="file"] {
 .finding-card.moderate .suspicion-badge { background: var(--warning-bg); color: var(--warning); }
 .finding-card.low .suspicion-badge { background: var(--success-bg); color: var(--success); }
 
-.threshold-note {
-  font-size: 11px;
-  color: var(--text-dim);
+.finding-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
   margin-left: auto;
+}
+
+.threshold-note {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  font-family: ui-monospace, monospace;
+  white-space: nowrap;
 }
 
 .probability {
@@ -560,8 +577,9 @@ input[type="file"] {
   font-weight: 800;
   font-family: ui-monospace, monospace;
   color: #fff;
-  float: right;
-  margin-top: -24px;
+  min-width: 44px;
+  text-align: right;
+  white-space: nowrap;
 }
 
 .progress-track {

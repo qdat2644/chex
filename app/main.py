@@ -18,12 +18,38 @@ try:
 except ImportError:
     HAS_PYDICOM = False
 
-from app.config import DEFAULT_CHECKPOINT_PATH, DEFAULT_THRESHOLDS_PATH, MODEL_INFO, PROJECT_ROOT
+from app.config import (
+    DEFAULT_CHECKPOINT_PATH,
+    DEFAULT_THRESHOLDS_PATH,
+    HUGGINGFACE_CHECKPOINT_URL,
+    HUGGINGFACE_REPO,
+    HUGGINGFACE_THRESHOLDS_URL,
+    MODEL_INFO,
+    PROJECT_ROOT,
+)
 from app.model import CheXpertPredictor
 from app.schemas import DicomMetadata, FindingPrediction, HeatmapExplanation, PredictionResponse, QualityReport
 
 
 app = FastAPI(title="CheXpert Web Reader - Medical AI Workstation")
+
+
+def _download_hf_file(url: str, target: Path) -> bool:
+    try:
+        import urllib.request
+        target.parent.mkdir(parents=True, exist_ok=True)
+        headers = {"User-Agent": "Mozilla/5.0"}
+        hf_token = os.getenv("HF_TOKEN")
+        if hf_token:
+            headers["Authorization"] = f"Bearer {hf_token}"
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req) as resp, open(target, "wb") as f:
+            while chunk := resp.read(1024 * 1024):
+                f.write(chunk)
+        return True
+    except Exception as e:
+        print(f"Warning: Could not download {url}: {e}")
+        return False
 
 
 def resolve_checkpoint_path() -> Path | None:
@@ -33,18 +59,28 @@ def resolve_checkpoint_path() -> Path | None:
     ckpt_dir = PROJECT_ROOT / "checkpoints"
     for candidate in ["chexpert_convnext_small.pt", "chexpert_densenet121_v2.pt", "chexpert_model.pt"]:
         p = ckpt_dir / candidate
-        if p.exists():
+        if p.exists() and p.stat().st_size > 1000:
             return p
-    if DEFAULT_CHECKPOINT_PATH.exists():
+    if DEFAULT_CHECKPOINT_PATH.exists() and DEFAULT_CHECKPOINT_PATH.stat().st_size > 1000:
         return DEFAULT_CHECKPOINT_PATH
+
+    # If missing locally, auto-download from Hugging Face
+    target = ckpt_dir / "chexpert_convnext_small.pt"
+    print(f"Downloading model checkpoint from Hugging Face ({HUGGINGFACE_CHECKPOINT_URL})...")
+    if _download_hf_file(HUGGINGFACE_CHECKPOINT_URL, target):
+        print(f"Downloaded model to {target} (Size: {target.stat().st_size} bytes)")
+        return target
     return None
 
 
 def load_threshold_payload(path: Path = DEFAULT_THRESHOLDS_PATH) -> dict[str, object] | None:
     if not path.exists():
+        _download_hf_file(HUGGINGFACE_THRESHOLDS_URL, path)
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            return json.load(file)
+    except Exception:
         return None
-    with path.open("r", encoding="utf-8") as file:
-        return json.load(file)
 
 
 def load_thresholds() -> dict[str, float]:

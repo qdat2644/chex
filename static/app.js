@@ -471,26 +471,33 @@ function buildFindingCard(item) {
   const article = el("article", `finding-card ${suspCls}`);
   article.dataset.label = item.label;
 
-  const titleDiv = el("div", "finding-title");
-  const label = el("strong");
-  label.textContent = item.label || "Unlabeled";
+  const headerDiv = el("div", "finding-header");
 
+  const leftDiv = el("div", "finding-left");
+  const label = el("strong", "finding-name");
+  label.textContent = item.label || "Unlabeled";
   const badge = el("span", "suspicion-badge");
   badge.textContent = suspicion;
+  leftDiv.append(label, badge);
 
-  const thresholdText = el("span", "threshold-note");
-  thresholdText.textContent = threshold === null ? "No threshold" : `Threshold: ${pct(threshold)}`;
-
-  const probabilityDiv = el("div", "probability");
+  const rightDiv = el("div", "finding-right");
+  if (threshold !== null) {
+    const thresholdText = el("span", "threshold-note");
+    thresholdText.textContent = `Threshold: ${pct(threshold)}`;
+    rightDiv.append(thresholdText);
+  }
+  const probabilityDiv = el("span", "probability");
   probabilityDiv.textContent = pct(probability);
+  rightDiv.append(probabilityDiv);
+
+  headerDiv.append(leftDiv, rightDiv);
 
   const track = el("div", "progress-track");
   const fill = el("div", "progress-fill");
   fill.style.width = pct(probability);
   track.append(fill);
 
-  titleDiv.append(label, badge, thresholdText);
-  article.append(titleDiv, probabilityDiv, track);
+  article.append(headerDiv, track);
 
   // Click on finding card to view specific Grad-CAM!
   article.addEventListener("click", () => {

@@ -3,6 +3,11 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
+# Hugging Face Repository & Direct Download URLs
+HUGGINGFACE_REPO = "qdat264/chexpert-convnext-small"
+HUGGINGFACE_CHECKPOINT_URL = f"https://huggingface.co/{HUGGINGFACE_REPO}/resolve/main/chexpert_convnext_small.pt"
+HUGGINGFACE_THRESHOLDS_URL = f"https://huggingface.co/{HUGGINGFACE_REPO}/resolve/main/thresholds.json"
+
 # Prioritize newest trained checkpoints
 _convnext_path = PROJECT_ROOT / "checkpoints" / "chexpert_convnext_small.pt"
 _densenet_path = PROJECT_ROOT / "checkpoints" / "chexpert_densenet121_v2.pt"
@@ -23,6 +28,8 @@ MODEL_INFO = {
     "mean_auc_display": "0.8944",
     "valid_rows": 202,
     "checkpoint": "checkpoints/chexpert_convnext_small.pt",
+    "huggingface_repo": HUGGINGFACE_REPO,
+    "huggingface_url": f"https://huggingface.co/{HUGGINGFACE_REPO}",
     "validation_csv": "archive/valid.csv",
     "view": "frontal",
 }
