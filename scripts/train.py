@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import shutil
 import sys
 from pathlib import Path
 
@@ -81,6 +82,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--valid-split", type=float, default=0.1)
     parser.add_argument("--limit", type=int, help="Use a small subset for quick smoke tests.")
     parser.add_argument("--output", type=Path, default=Path("checkpoints/chexpert_model.pt"))
+    parser.add_argument("--resume", type=Path, help="Path to checkpoint .pt to resume training from.")
+    parser.add_argument("--backup-dir", type=Path, help="Directory to automatically backup checkpoints to (e.g. Google Drive).")
     parser.add_argument(
         "--arch",
         choices=SUPPORTED_ARCHITECTURES,
@@ -90,14 +93,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--loss",
         choices=["asl", "focal", "bce"],
-        default="bce",
+        default="asl",
         help="Loss function: asl (Asymmetric Loss), focal (Focal Loss), bce (Binary Cross Entropy)",
     )
     parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE, help="Input resolution (e.g. 224, 384)")
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--epochs", type=int, default=6)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument(
         "--uncertain-policy",
         choices=["u_ones_zeros", "smooth", "zero", "one", "ignore"],
@@ -159,7 +162,7 @@ def run_epoch(
     all_targets: list[list[float]] = []
     all_probs: list[list[float]] = []
 
-    progress = tqdm(loader, desc=desc, unit="batch", leave=False, dynamic_ncols=True, ascii=True)
+    progress = tqdm(loader, desc=desc, unit="batch", leave=True, dynamic_ncols=True)
     for images, targets in progress:
         images = images.to(device)
         targets = targets.to(device)
@@ -177,10 +180,11 @@ def run_epoch(
                     loss.backward()
                     optimizer.step()
 
-        total_loss += float(loss.detach().cpu()) * images.size(0)
+        batch_loss = float(loss.detach().cpu())
+        total_loss += batch_loss * images.size(0)
         all_targets.extend(targets.detach().cpu().tolist())
         all_probs.extend(torch.sigmoid(logits).detach().cpu().tolist())
-        progress.set_postfix(loss=f"{float(loss.detach().cpu()):.4f}")
+        progress.set_postfix(loss=f"{batch_loss:.4f}")
 
     return total_loss / max(1, len(loader.dataset)), all_targets, all_probs
 
@@ -246,6 +250,8 @@ def calculate_pos_weight(dataset: CheXpertDataset | Subset, labels: list[str]) -
 
 def checkpoint_payload(
     model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler | None,
     labels: list[str],
     args: argparse.Namespace,
     epoch: int,
@@ -254,6 +260,8 @@ def checkpoint_payload(
 ) -> dict[str, object]:
     return {
         "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict() if scaler else None,
         "labels": labels,
         "metadata": {
             "epoch": epoch,
@@ -285,6 +293,18 @@ def write_metrics(path: Path, history: list[dict[str, object]], config: dict[str
         "history": history,
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def backup_file(src_path: Path, backup_dir: Path | None) -> None:
+    if not backup_dir or not src_path.exists():
+        return
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        dst_path = backup_dir / src_path.name
+        shutil.copy2(src_path, dst_path)
+        print(f"Backed up {src_path.name} to {dst_path}")
+    except Exception as e:
+        print(f"Warning: Backup failed: {e}")
 
 
 def main() -> None:
@@ -367,6 +387,32 @@ def main() -> None:
     scaler = torch.amp.GradScaler(device.type, enabled=args.amp and device.type == "cuda")
     use_amp = args.amp and device.type == "cuda"
 
+    start_epoch = 1
+    best_auc = -1.0
+    metrics_history: list[dict[str, object]] = []
+
+    # Resume capability
+    if args.resume and args.resume.exists():
+        print(f"Resuming training from checkpoint: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(checkpoint.get("model_state_dict", checkpoint))
+        if "optimizer_state_dict" in checkpoint:
+            try:
+                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            except Exception as e:
+                print(f"Warning: Could not load optimizer state: {e}")
+        if "scaler_state_dict" in checkpoint and scaler and checkpoint["scaler_state_dict"]:
+            try:
+                scaler.load_state_dict(checkpoint["scaler_state_dict"])
+            except Exception as e:
+                print(f"Warning: Could not load scaler state: {e}")
+
+        meta = checkpoint.get("metadata", {})
+        start_epoch = meta.get("epoch", 0) + 1
+        best_auc = meta.get("best_metric", -1.0)
+        metrics_history = checkpoint.get("metrics", [])
+        print(f"Resumed successfully at Epoch {start_epoch} (Previous Best AUC: {best_auc:.4f})")
+
     if args.scheduler == "cosine":
         scheduler: torch.optim.lr_scheduler.LRScheduler | None = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=args.epochs, eta_min=args.lr * 1e-2
@@ -378,8 +424,6 @@ def main() -> None:
     else:
         scheduler = None
 
-    best_auc = -1.0
-    metrics_history: list[dict[str, object]] = []
     args.output.parent.mkdir(parents=True, exist_ok=True)
     last_output = args.output.with_name(f"{args.output.stem}_last{args.output.suffix}")
     metrics_output = args.output.with_suffix(".metrics.json")
@@ -405,10 +449,15 @@ def main() -> None:
         "scheduler": args.scheduler,
         "num_workers": args.num_workers,
         "device": str(device),
+        "backup_dir": str(args.backup_dir) if args.backup_dir else None,
     }
+    print("\n" + "="*60)
+    print("CheXpert Training Configuration:")
     print(json.dumps(config, indent=2))
+    print("="*60 + "\n")
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
+        print(f"\n>>> Epoch {epoch}/{args.epochs} Starting...")
         train_loss, _, _ = run_epoch(
             model,
             train_loader,
@@ -417,7 +466,7 @@ def main() -> None:
             optimizer,
             scaler,
             use_amp,
-            desc=f"epoch {epoch}/{args.epochs} train",
+            desc=f"Epoch {epoch}/{args.epochs} [Train]",
         )
         valid_loss, valid_targets, valid_probs = run_epoch(
             model,
@@ -425,16 +474,21 @@ def main() -> None:
             criterion,
             device,
             use_amp=use_amp,
-            desc=f"epoch {epoch}/{args.epochs} valid",
+            desc=f"Epoch {epoch}/{args.epochs} [Valid]",
         )
         auc_scores = label_aucs(valid_targets, valid_probs, labels)
         auc = mean_auc(auc_scores)
         auc_text = "n/a" if auc is None else f"{auc:.4f}"
         current_lr = optimizer.param_groups[0]["lr"]
-        print(
-            f"epoch={epoch} train_loss={train_loss:.4f} valid_loss={valid_loss:.4f} "
-            f"mean_auc={auc_text} lr={current_lr:.2e}"
-        )
+        
+        print("\n" + "-"*50)
+        print(f"📊 Summary Epoch {epoch}/{args.epochs}:")
+        print(f"   Train Loss: {train_loss:.4f} | Valid Loss: {valid_loss:.4f}")
+        print(f"   Mean AUC: {auc_text} | Learning Rate: {current_lr:.2e}")
+        for lbl, val in auc_scores.items():
+            val_str = f"{val:.4f}" if val is not None else "n/a"
+            print(f"   - {lbl}: AUC {val_str}")
+        print("-"*50)
 
         if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             scheduler.step(auc if auc is not None else -valid_loss)
@@ -452,18 +506,25 @@ def main() -> None:
             "score": score,
         }
         metrics_history.append(epoch_metrics)
+
+        # Save last checkpoint
         torch.save(
-            checkpoint_payload(model, labels, args, epoch, score, metrics_history),
+            checkpoint_payload(model, optimizer, scaler, labels, args, epoch, score, metrics_history),
             last_output,
         )
         write_metrics(metrics_output, metrics_history, config)
+        backup_file(last_output, args.backup_dir)
+        backup_file(metrics_output, args.backup_dir)
+
+        # Save best checkpoint
         if score > best_auc:
             best_auc = score
             torch.save(
-                checkpoint_payload(model, labels, args, epoch, score, metrics_history),
+                checkpoint_payload(model, optimizer, scaler, labels, args, epoch, score, metrics_history),
                 args.output,
             )
-            print(f"saved={args.output}")
+            print(f"🌟 New Best Model saved to {args.output} (AUC: {auc_text})")
+            backup_file(args.output, args.backup_dir)
 
 
 if __name__ == "__main__":
