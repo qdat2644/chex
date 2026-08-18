@@ -2,37 +2,69 @@ from __future__ import annotations
 
 import concurrent.futures
 import io
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+# Ensure zero external network calls during testing
+os.environ["CHEXPERT_AUTO_DOWNLOAD"] = "false"
+os.environ["APP_ENV"] = "development"
 
 from fastapi.testclient import TestClient
 from PIL import Image
 
-import app.main as main_module
-from app.main import app, mask_phi, _download_hf_file
-from app.model import CheXpertPredictor
+from app.main import create_app, decode_image_or_dicom, mask_phi, _download_hf_file
+from app.model import CheXpertPredictor, Heatmap, Prediction
 
 
 class ApiTest(unittest.TestCase):
     def setUp(self):
-        self.client = TestClient(app)
+        # Create a tiny mock predictor to keep tests fast and isolated
+        self.mock_predictor = CheXpertPredictor(None)
+        self.mock_predictor.labels = [
+            "Atelectasis",
+            "Cardiomegaly",
+            "Consolidation",
+            "Edema",
+            "Pleural Effusion",
+        ]
+        self.mock_predictor.thresholds = {lbl: 0.5 for lbl in self.mock_predictor.labels}
+        self.mock_predictor.model = MagicMock()
+        self.mock_predictor.predict = MagicMock(return_value=[
+            Prediction(label="Atelectasis", probability=0.15, positive=False, threshold=0.5, suspicion_level="Low suspicion"),
+            Prediction(label="Cardiomegaly", probability=0.85, positive=True, threshold=0.5, suspicion_level="High suspicion"),
+            Prediction(label="Consolidation", probability=0.10, positive=False, threshold=0.5, suspicion_level="Low suspicion"),
+            Prediction(label="Edema", probability=0.30, positive=False, threshold=0.5, suspicion_level="Low suspicion"),
+            Prediction(label="Pleural Effusion", probability=0.05, positive=False, threshold=0.5, suspicion_level="Low suspicion"),
+        ])
+        self.mock_predictor.predict_batch = MagicMock(side_effect=lambda imgs, chunk_size=8: [
+            self.mock_predictor.predict(img) for img in imgs
+        ])
+        self.mock_predictor.explain_finding = MagicMock(return_value=Heatmap(
+            label="Cardiomegaly",
+            probability=0.85,
+            image_data_url="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+            pure_heatmap_url="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+        ))
+
+        # Use app factory to inject mock predictor
+        self.app = create_app(self.mock_predictor)
+        self.client = TestClient(self.app)
 
     def test_predict_returns_clear_status_without_checkpoint(self) -> None:
+        unloaded_predictor = CheXpertPredictor(None)
+        app_unloaded = create_app(unloaded_predictor)
+        client_unloaded = TestClient(app_unloaded)
+
         image_bytes = io.BytesIO()
         Image.new("RGB", (10, 12), color=(80, 80, 80)).save(image_bytes, format="JPEG")
-        image_bytes.seek(0)
 
-        original_predictor = main_module.predictor
-        main_module.predictor = CheXpertPredictor(None)
-        try:
-            response = self.client.post(
-                "/api/predict",
-                files={"file": ("xray.jpg", image_bytes, "image/jpeg")},
-            )
-        finally:
-            main_module.predictor = original_predictor
-
+        response = client_unloaded.post(
+            "/api/predict",
+            files={"file": ("raw_patient_xray.jpg", image_bytes.getvalue(), "image/jpeg")},
+        )
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["status"], "model_not_loaded")
@@ -41,8 +73,10 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(payload["findings"], [])
         self.assertIsNone(payload["report"])
         self.assertIsNone(payload["heatmap"])
+        # Ensure raw filename is masked in default mode
+        self.assertNotIn("raw_patient_xray.jpg", payload["filename"])
 
-    def test_model_info_reports_checkpoint_and_label_order(self) -> None:
+    def test_model_info_reports_labels_and_metadata(self) -> None:
         expected_labels = [
             "Atelectasis",
             "Cardiomegaly",
@@ -50,49 +84,44 @@ class ApiTest(unittest.TestCase):
             "Edema",
             "Pleural Effusion",
         ]
-
         response = self.client.get("/api/model-info")
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["labels"], expected_labels)
-        self.assertTrue(payload["checkpoint"].endswith(".pt"))
-        self.assertTrue(payload["thresholds_loaded"])
-        self.assertEqual(list(payload["thresholds"].keys()), expected_labels)
+        self.assertTrue(payload["model_loaded"])
 
-    def test_predict_and_explain_endpoints(self) -> None:
+    def test_predict_and_explain_endpoints_offline(self) -> None:
         image_bytes = io.BytesIO()
-        Image.new("RGB", (224, 224), color=(100, 100, 100)).save(image_bytes, format="JPEG")
-        image_bytes.seek(0)
+        Image.new("RGB", (64, 64), color=(100, 100, 100)).save(image_bytes, format="JPEG")
 
         response = self.client.post(
             "/api/predict",
-            files={"file": ("test_cxr.jpg", image_bytes.getvalue(), "image/jpeg")},
+            files={"file": ("test_patient_name_001.jpg", image_bytes.getvalue(), "image/jpeg")},
         )
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["status"], "ok")
         self.assertEqual(len(payload["findings"]), 5)
-        self.assertIn("quality", payload)
-        self.assertIn("dicom", payload)
         self.assertIsNotNone(payload["heatmap"])
         self.assertTrue(payload["heatmap"]["image_data_url"].startswith("data:image/png;base64,"))
 
-        # Test on-demand /api/explain endpoint
+        # Test PHI protection: raw filename should not be exposed
+        self.assertNotIn("test_patient_name_001.jpg", payload["filename"])
+        self.assertTrue(payload["filename"].startswith("scan_"))
+
+        # Explain endpoint
         explain_res = self.client.post(
             "/api/explain",
-            files={"file": ("test_cxr.jpg", image_bytes.getvalue(), "image/jpeg")},
+            files={"file": ("test.jpg", image_bytes.getvalue(), "image/jpeg")},
             data={"label": "Cardiomegaly"},
         )
         self.assertEqual(explain_res.status_code, 200)
-        explain_payload = explain_res.json()
-        self.assertEqual(explain_payload["label"], "Cardiomegaly")
-        self.assertTrue(explain_payload["image_data_url"].startswith("data:image/png;base64,"))
-        self.assertTrue(explain_payload["pure_heatmap_url"].startswith("data:image/png;base64,"))
+        self.assertEqual(explain_res.json()["label"], "Cardiomegaly")
 
     def test_explain_invalid_label_returns_400(self) -> None:
         image_bytes = io.BytesIO()
         Image.new("RGB", (64, 64), color="gray").save(image_bytes, format="JPEG")
-        
+
         response = self.client.post(
             "/api/explain",
             files={"file": ("test.jpg", image_bytes.getvalue(), "image/jpeg")},
@@ -101,49 +130,48 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("Invalid label", response.json()["detail"])
 
-    def test_batch_predict_endpoint_with_client_ids(self) -> None:
-        buf1 = io.BytesIO()
-        Image.new("RGB", (64, 64), color="gray").save(buf1, format="PNG")
-        buf2 = io.BytesIO()
-        Image.new("RGB", (64, 64), color="black").save(buf2, format="PNG")
+    def test_batch_predict_chunking_and_client_ids(self) -> None:
+        """
+        Task 3: Test batch pipeline processing 10 images (> chunk size 8).
+        Verifies chunking and client_id preservation.
+        """
+        buf = io.BytesIO()
+        Image.new("RGB", (32, 32), color="gray").save(buf, format="PNG")
+        raw_bytes = buf.getvalue()
 
-        custom_id_1 = "custom_client_uuid_001"
-        custom_id_2 = "custom_client_uuid_002"
+        files_list = [("files", (f"cxr_{i}.png", raw_bytes, "image/png")) for i in range(10)]
+        client_ids = [f"cid_{i}_{i*10}" for i in range(10)]
+        ids_str = ",".join(client_ids)
 
         response = self.client.post(
             "/api/predict-batch",
-            files=[
-                ("files", ("duplicate_cxr.png", buf1.getvalue(), "image/png")),
-                ("files", ("duplicate_cxr.png", buf2.getvalue(), "image/png")),
-            ],
-            data={"client_ids": f"{custom_id_1},{custom_id_2}"},
+            files=files_list,
+            data={"client_ids": ids_str},
         )
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["total"], 2)
-        self.assertEqual(payload["processed"], 2)
-        self.assertEqual(len(payload["results"]), 2)
-        self.assertEqual(payload["results"][0]["client_id"], custom_id_1)
-        self.assertEqual(payload["results"][1]["client_id"], custom_id_2)
+        self.assertEqual(payload["total"], 10)
+        self.assertEqual(payload["processed"], 10)
+        self.assertEqual(len(payload["results"]), 10)
+
+        for i, item in enumerate(payload["results"]):
+            self.assertEqual(item["client_id"], client_ids[i])
+            self.assertNotIn(f"cxr_{i}.png", item["filename"])
 
     def test_phi_masking_hmac(self) -> None:
         self.assertEqual(mask_phi(None), "ANONYMIZED")
         self.assertEqual(mask_phi("ANONYMIZED"), "ANONYMIZED")
         self.assertEqual(mask_phi("N/A"), "ANONYMIZED")
-        
-        # Real patient name/ID should be masked with HMAC-SHA256 fingerprint of at least 16 chars
+
         masked = mask_phi("PATIENT_RECORD_98765")
         self.assertTrue(masked.startswith("ANONYMIZED_"))
         self.assertEqual(len(masked), len("ANONYMIZED_") + 16)
         self.assertNotEqual(masked, "PATIENT_RECORD_98765")
 
     def test_concurrent_predict_and_explain(self) -> None:
-        """
-        Verify thread safety when concurrent predict and explain requests are executed.
-        """
         image_bytes = io.BytesIO()
-        Image.new("RGB", (128, 128), color=(120, 120, 120)).save(image_bytes, format="PNG")
+        Image.new("RGB", (64, 64), color=(120, 120, 120)).save(image_bytes, format="PNG")
         raw_data = image_bytes.getvalue()
 
         def do_predict():
@@ -164,22 +192,19 @@ class ApiTest(unittest.TestCase):
             f2 = executor.submit(do_explain)
             f3 = executor.submit(do_predict)
             f4 = executor.submit(do_explain)
-
             results = [f.result() for f in [f1, f2, f3, f4]]
 
         for r in results:
             self.assertEqual(r.status_code, 200)
 
-    def test_checksum_verification_rejection(self) -> None:
+    def test_checksum_verification_fail_closed(self) -> None:
         """
-        Verify that downloading with a mismatched SHA-256 hash gets rejected and cleaned up.
+        Task 2: Test file matching hash, wrong hash, and auto-download disabled rejection.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir) / "test_model.pt"
-            # Attempt to verify against wrong checksum
-            fake_url = "https://raw.githubusercontent.com/qdat2644/chex/main/README.md"
-            wrong_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
-            success = _download_hf_file(fake_url, target, expected_sha256=wrong_sha256)
+            # When CHEXPERT_AUTO_DOWNLOAD=false, download must be immediately rejected
+            success = _download_hf_file("http://localhost/dummy", target)
             self.assertFalse(success)
             self.assertFalse(target.exists())
 

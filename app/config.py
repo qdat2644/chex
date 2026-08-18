@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import os
 from pathlib import Path
 
 
@@ -7,6 +10,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 HUGGINGFACE_REPO = "qdat264/chexpert-convnext-small"
 HUGGINGFACE_CHECKPOINT_URL = f"https://huggingface.co/{HUGGINGFACE_REPO}/resolve/main/chexpert_convnext_small.pt"
 HUGGINGFACE_THRESHOLDS_URL = f"https://huggingface.co/{HUGGINGFACE_REPO}/resolve/main/thresholds.json"
+
+# Checksum & Governance Policies
+EXPECTED_CHECKPOINT_SHA256 = os.getenv("CHEXPERT_CHECKPOINT_SHA256", "f2c1a2f57f9d95067e898bc975a944aeb61976de1a9fbdc92b34a5d9d6acc4c4")
+EXPECTED_THRESHOLDS_SHA256 = os.getenv("CHEXPERT_THRESHOLDS_SHA256", "")
+AUTO_DOWNLOAD_ENABLED = os.getenv("CHEXPERT_AUTO_DOWNLOAD", "true").lower() == "true"
 
 # Prioritize newest trained checkpoints
 _convnext_path = PROJECT_ROOT / "checkpoints" / "chexpert_convnext_small.pt"

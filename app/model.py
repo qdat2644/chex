@@ -130,10 +130,15 @@ class CheXpertPredictor:
         if not path.exists():
             return
 
-        try:
+        if path.suffix.lower() == ".safetensors":
+            try:
+                from safetensors.torch import load_file
+                state_dict = load_file(path, device=str(self.device))
+                checkpoint = {"model_state_dict": state_dict}
+            except ImportError:
+                raise RuntimeError("safetensors package is required to load .safetensors checkpoints.")
+        else:
             checkpoint = torch.load(path, map_location=self.device, weights_only=True)
-        except (TypeError, pickle.UnpicklingError):
-            checkpoint = torch.load(path, map_location=self.device)
 
         labels = checkpoint.get("labels") if isinstance(checkpoint, dict) else None
         if labels:

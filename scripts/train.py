@@ -36,7 +36,7 @@ class AsymmetricLoss(torch.nn.Module):
         self.clip = clip
         self.eps = eps
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         xs_pos = torch.sigmoid(x)
         xs_neg = 1.0 - xs_pos
 
@@ -270,14 +270,14 @@ def target_frame(dataset: CheXpertDataset | Subset) -> tuple[CheXpertDataset, li
 def calculate_pos_weight(dataset: CheXpertDataset | Subset, labels: list[str]) -> torch.Tensor:
     base, indices = target_frame(dataset)
     frame = base.frame.iloc[indices] if indices is not None else base.frame
-    targets = []
+    weights = []
     for label in labels:
-        values = frame[label].apply(lambda v: base._normalize_label_and_mask(v, label)[0])
-        targets.append(values.astype(float).to_numpy())
-    target_array = np.stack(targets, axis=1)
-    positives = target_array.sum(axis=0)
-    negatives = target_array.shape[0] - positives
-    weights = negatives / np.clip(positives, 1.0, None)
+        pairs = [base._normalize_label_and_mask(v, label) for v in frame[label]]
+        valid_targets = [t for t, m in pairs if m > 0.5]
+        positives = sum(1 for t in valid_targets if t >= 0.5)
+        negatives = len(valid_targets) - positives
+        weight = negatives / max(1.0, float(positives))
+        weights.append(weight)
     return torch.tensor(weights, dtype=torch.float32)
 
 
@@ -297,6 +297,12 @@ def checkpoint_payload(
         "optimizer_state_dict": optimizer.state_dict(),
         "scaler_state_dict": scaler.state_dict() if scaler else None,
         "scheduler_state_dict": scheduler.state_dict() if (scheduler and hasattr(scheduler, "state_dict")) else None,
+        "rng_state": {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        },
         "labels": labels,
         "metadata": {
             "epoch": epoch,
@@ -335,16 +341,14 @@ def backup_file(src_path: Path, backup_dir: Path | None) -> None:
         return
     try:
         backup_dir.mkdir(parents=True, exist_ok=True)
-        dst_path = backup_dir / src_path.name
-        shutil.copy2(src_path, dst_path)
-        print(f"Backed up {src_path.name} to {dst_path}")
+        shutil.copy2(src_path, backup_dir / src_path.name)
     except Exception as e:
-        print(f"Warning: Backup failed: {e}")
+        print(f"Warning: Failed to backup {src_path} to {backup_dir}: {e}")
 
 
 def main() -> None:
     args = parse_args()
-    set_seed(args.seed)
+    set_seed(args.seed, deterministic=True)
     labels = resolve_label_preset(args.label_preset)
     train_csv = args.train_csv or args.data_root / "train.csv"
     valid_csv = args.valid_csv or args.data_root / "valid.csv"
@@ -385,7 +389,7 @@ def main() -> None:
         train_size = row_count - valid_size
         if train_size < 1:
             raise ValueError("Not enough rows to create a train/validation split.")
-        indices = torch.randperm(row_count, generator=torch.Generator().manual_seed(42)).tolist()
+        indices = torch.randperm(row_count, generator=torch.Generator().manual_seed(args.seed)).tolist()
         train_dataset = Subset(train_dataset, indices[:train_size])
         valid_dataset = Subset(valid_source, indices[train_size:])
 
@@ -418,18 +422,18 @@ def main() -> None:
         pos_weight = calculate_pos_weight(train_dataset, labels).to(device) if args.pos_weight else None
         criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
-    scaler = torch.amp.GradScaler(device.type, enabled=args.amp and device.type == "cuda")
-    use_amp = args.amp and device.type == "cuda"
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    use_amp = bool(args.amp and device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if device.type == "cuda" else None
 
     start_epoch = 1
     best_auc = -1.0
     metrics_history: list[dict[str, object]] = []
 
-    # Resume capability
+    resumed_scheduler_state = None
     if args.resume and args.resume.exists():
         print(f"Resuming training from checkpoint: {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=device)
+        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint.get("model_state_dict", checkpoint))
         if "optimizer_state_dict" in checkpoint:
             try:
@@ -441,6 +445,18 @@ def main() -> None:
                 scaler.load_state_dict(checkpoint["scaler_state_dict"])
             except Exception as e:
                 print(f"Warning: Could not load scaler state: {e}")
+        if "scheduler_state_dict" in checkpoint:
+            resumed_scheduler_state = checkpoint["scheduler_state_dict"]
+        if "rng_state" in checkpoint:
+            try:
+                rng = checkpoint["rng_state"]
+                if "python" in rng: random.setstate(rng["python"])
+                if "numpy" in rng: np.random.set_state(rng["numpy"])
+                if "torch" in rng: torch.set_rng_state(rng["torch"])
+                if "torch_cuda" in rng and rng["torch_cuda"] and torch.cuda.is_available():
+                    torch.cuda.set_rng_state_all(rng["torch_cuda"])
+            except Exception as e:
+                print(f"Warning: Could not load RNG state: {e}")
 
         meta = checkpoint.get("metadata", {})
         start_epoch = meta.get("epoch", 0) + 1
@@ -458,6 +474,12 @@ def main() -> None:
         )
     else:
         scheduler = None
+
+    if scheduler and resumed_scheduler_state:
+        try:
+            scheduler.load_state_dict(resumed_scheduler_state)
+        except Exception as e:
+            print(f"Warning: Could not load scheduler state: {e}")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     last_output = args.output.with_name(f"{args.output.stem}_last{args.output.suffix}")
