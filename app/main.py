@@ -22,6 +22,11 @@ def resolve_checkpoint_path() -> Path | None:
     configured = os.getenv("CHEXPERT_CHECKPOINT")
     if configured:
         return Path(configured)
+    ckpt_dir = PROJECT_ROOT / "checkpoints"
+    for candidate in ["chexpert_convnext_small.pt", "chexpert_densenet121_v2.pt", "chexpert_model.pt"]:
+        p = ckpt_dir / candidate
+        if p.exists():
+            return p
     if DEFAULT_CHECKPOINT_PATH.exists():
         return DEFAULT_CHECKPOINT_PATH
     return None
@@ -51,6 +56,18 @@ static_dir = PROJECT_ROOT / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
+def get_current_model_info() -> dict[str, object]:
+    info = dict(MODEL_INFO)
+    if predictor.is_loaded:
+        info["architecture"] = predictor.architecture
+        if threshold_payload and "mean_auc" in threshold_payload:
+            auc = threshold_payload["mean_auc"]
+            info["mean_auc"] = auc
+            info["mean_auc_display"] = f"{auc:.4f}"
+            info["checkpoint"] = str(checkpoint_path) if checkpoint_path else info["checkpoint"]
+    return info
+
+
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(static_dir / "index.html")
@@ -64,7 +81,7 @@ def health() -> dict[str, object]:
         "labels": predictor.labels,
         "checkpoint": str(checkpoint_path) if checkpoint_path else None,
         "thresholds_loaded": bool(predictor.thresholds),
-        "model_info": MODEL_INFO,
+        "model_info": get_current_model_info(),
     }
 
 
@@ -77,7 +94,7 @@ def model_info() -> dict[str, object]:
         "thresholds_loaded": bool(predictor.thresholds),
         "thresholds": predictor.thresholds,
         "threshold_report": threshold_payload,
-        "model_info": MODEL_INFO,
+        "model_info": get_current_model_info(),
         "disclaimer": "Research prototype only. Do not use these results for medical decisions.",
     }
 

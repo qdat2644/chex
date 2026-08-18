@@ -2,7 +2,11 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CHECKPOINT_PATH = PROJECT_ROOT / "checkpoints" / "chexpert_densenet121_v2.pt"
+
+# Prioritize newest trained checkpoints
+_convnext_path = PROJECT_ROOT / "checkpoints" / "chexpert_convnext_small.pt"
+_densenet_path = PROJECT_ROOT / "checkpoints" / "chexpert_densenet121_v2.pt"
+DEFAULT_CHECKPOINT_PATH = _convnext_path if _convnext_path.exists() else _densenet_path
 DEFAULT_THRESHOLDS_PATH = PROJECT_ROOT / "outputs" / "evaluation" / "thresholds.json"
 
 SUPPORTED_ARCHITECTURES = [
@@ -13,12 +17,12 @@ SUPPORTED_ARCHITECTURES = [
 ]
 
 MODEL_INFO = {
-    "architecture": "DenseNet121",
+    "architecture": "ConvNeXt-Small",
     "label_count": 5,
-    "mean_auc": 0.8763721175369092,
-    "mean_auc_display": "0.8764",
+    "mean_auc": 0.8944,
+    "mean_auc_display": "0.8944",
     "valid_rows": 202,
-    "checkpoint": "checkpoints/chexpert_densenet121_v2.pt",
+    "checkpoint": "checkpoints/chexpert_convnext_small.pt",
     "validation_csv": "archive/valid.csv",
     "view": "frontal",
 }
