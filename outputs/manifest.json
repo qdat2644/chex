@@ -1,0 +1,24 @@
+{
+  "name": "CheXpert AI Workstation - ConvNeXt-Small Radiograph Classifier",
+  "version": "1.0.0",
+  "model_architecture": "ConvNeXt-Small",
+  "huggingface_repo": "qdat264/chexpert-convnext-small",
+  "huggingface_revision": "d9b23e7f4c0b6b25ea958d0421295b9c0587b1c3",
+  "checkpoint_file": "checkpoints/chexpert_convnext_small.pt",
+  "checkpoint_sha256": "b8b1884a911f6ff9408de141c48034a39f4515e2c8deaadd25312e07601c9bc0",
+  "thresholds_file": "outputs/evaluation/thresholds.json",
+  "thresholds_sha256": "7ad370d14f7941fae476d0f2ba2038fcfeedbbf70dcfd1e45cb083baa28965ea",
+  "target_labels": [
+    "Atelectasis",
+    "Cardiomegaly",
+    "Consolidation",
+    "Edema",
+    "Pleural Effusion"
+  ],
+  "validation_metrics": {
+    "cohort": "Stanford CheXpert Official Validation Cohort (N=202 Frontal Studies)",
+    "mean_auc": 0.8944,
+    "confidence_interval_95": "0.861–0.925"
+  },
+  "created_at": "2026-08-18T17:35:00Z"
+}
