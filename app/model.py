@@ -231,10 +231,10 @@ class CheXpertPredictor:
         gradients = gradients_list[0].detach()[0]
         weights = gradients.mean(dim=(1, 2))
         cam = torch.relu((weights[:, None, None] * activations).sum(dim=0))
-        cam_norm = self._normalize_cam(cam)
+        cam_norm = self._normalize_cam(cam, confidence=label_prob)
 
         overlay = self._render_overlay(original, cam_norm)
-        pure_heat = self._render_pure_heatmap_rgba(original.size, cam_norm)
+        pure_heat = self._render_pure_heatmap_rgba(original.size, cam_norm, confidence=label_prob)
 
         return Heatmap(
             label=label_name,
@@ -250,17 +250,26 @@ class CheXpertPredictor:
         return results
 
     @staticmethod
-    def _normalize_cam(cam: torch.Tensor) -> np.ndarray:
+    def _normalize_cam(cam: torch.Tensor, confidence: float = 1.0) -> np.ndarray:
         cam = cam.detach().cpu()
         cam_min = float(cam.min())
         cam_max = float(cam.max())
         if cam_max <= cam_min:
             return np.zeros(tuple(cam.shape), dtype=np.float32)
-        return ((cam - cam_min) / (cam_max - cam_min)).numpy().astype(np.float32)
+        norm = ((cam - cam_min) / (cam_max - cam_min)).numpy().astype(np.float32)
+
+        # Suppress ambient background noise (< 15% activation)
+        noise_floor = 0.15
+        norm = np.maximum(0.0, norm - noise_floor) / (1.0 - noise_floor)
+
+        # Scale intensity by prediction probability / confidence
+        # High prob (>0.6) -> Full vivid heat (1.0); Low prob (<0.4) -> Soft subdued heat
+        intensity_scale = float(np.clip(confidence * 1.5, 0.25, 1.0))
+        return norm * intensity_scale
 
     @staticmethod
     def _render_overlay(image: Image.Image, cam: np.ndarray) -> Image.Image:
-        heatmap = Image.fromarray(np.uint8(cam * 255), mode="L").resize(
+        heatmap = Image.fromarray(np.uint8(np.clip(cam * 255, 0, 255)), mode="L").resize(
             image.size,
             resample=Image.Resampling.BILINEAR,
         )
@@ -277,8 +286,8 @@ class CheXpertPredictor:
         return Image.fromarray(overlay, mode="RGB")
 
     @staticmethod
-    def _render_pure_heatmap_rgba(size: tuple[int, int], cam: np.ndarray) -> Image.Image:
-        heatmap = Image.fromarray(np.uint8(cam * 255), mode="L").resize(
+    def _render_pure_heatmap_rgba(size: tuple[int, int], cam: np.ndarray, confidence: float = 1.0) -> Image.Image:
+        heatmap = Image.fromarray(np.uint8(np.clip(cam * 255, 0, 255)), mode="L").resize(
             size,
             resample=Image.Resampling.BILINEAR,
         )
@@ -290,7 +299,10 @@ class CheXpertPredictor:
         rgba[..., 0] = np.clip(255.0 * np.sin(heat * np.pi / 2), 0, 255).astype(np.uint8)
         rgba[..., 1] = np.clip(255.0 * np.sin(heat * np.pi), 0, 255).astype(np.uint8)
         rgba[..., 2] = np.clip(255.0 * np.cos(heat * np.pi / 2), 0, 255).astype(np.uint8)
-        rgba[..., 3] = np.clip(255.0 * (heat ** 1.3), 0, 255).astype(np.uint8)
+
+        # Adaptive Alpha based on heat and prediction confidence
+        alpha_scale = float(np.clip(confidence * 1.4, 0.25, 1.0))
+        rgba[..., 3] = np.clip(255.0 * (heat ** 1.4) * alpha_scale, 0, 255).astype(np.uint8)
 
         return Image.fromarray(rgba, mode="RGBA")
 
