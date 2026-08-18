@@ -11,5 +11,13 @@ services:
       - ./outputs:/app/outputs
     environment:
       - TORCH_HOME=/app/.torch
+      - APP_ENV=production
+      - PHI_HMAC_SECRET=chexpert_production_secret_key_salt_32bytes_required
       - CHEXPERT_CHECKPOINT=/app/checkpoints/chexpert_convnext_small.pt
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health | grep '\"model_loaded\":true' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped

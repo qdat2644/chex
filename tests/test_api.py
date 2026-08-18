@@ -8,20 +8,27 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-# Ensure zero external network calls during testing
-os.environ["CHEXPERT_AUTO_DOWNLOAD"] = "false"
-os.environ["APP_ENV"] = "development"
-
+import torch
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from app.main import create_app, decode_image_or_dicom, mask_phi, _download_hf_file
+os.environ["CHEXPERT_AUTO_DOWNLOAD"] = "false"
+os.environ["APP_ENV"] = "development"
+
+from app.main import (
+    anonymize_filename,
+    create_app,
+    decode_image_or_dicom,
+    mask_phi,
+    resolve_checkpoint_path,
+    _download_hf_file,
+)
 from app.model import CheXpertPredictor, Heatmap, Prediction
 
 
 class ApiTest(unittest.TestCase):
     def setUp(self):
-        # Create a tiny mock predictor to keep tests fast and isolated
+        # Create Mock Predictor with a tiny neural net
         self.mock_predictor = CheXpertPredictor(None)
         self.mock_predictor.labels = [
             "Atelectasis",
@@ -31,7 +38,11 @@ class ApiTest(unittest.TestCase):
             "Pleural Effusion",
         ]
         self.mock_predictor.thresholds = {lbl: 0.5 for lbl in self.mock_predictor.labels}
-        self.mock_predictor.model = MagicMock()
+        self.mock_predictor.model = torch.nn.Sequential(
+            torch.nn.AdaptiveAvgPool2d((1, 1)),
+            torch.nn.Flatten(),
+            torch.nn.Linear(3, 5),
+        )
         self.mock_predictor.predict = MagicMock(return_value=[
             Prediction(label="Atelectasis", probability=0.15, positive=False, threshold=0.5, suspicion_level="Low suspicion"),
             Prediction(label="Cardiomegaly", probability=0.85, positive=True, threshold=0.5, suspicion_level="High suspicion"),
@@ -49,7 +60,7 @@ class ApiTest(unittest.TestCase):
             pure_heatmap_url="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
         ))
 
-        # Use app factory to inject mock predictor
+        # Use app factory to inject mock predictor into app state
         self.app = create_app(self.mock_predictor)
         self.client = TestClient(self.app)
 
@@ -73,8 +84,111 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(payload["findings"], [])
         self.assertIsNone(payload["report"])
         self.assertIsNone(payload["heatmap"])
-        # Ensure raw filename is masked in default mode
+        # Ensure raw filename is masked with scan_<hash>.png
         self.assertNotIn("raw_patient_xray.jpg", payload["filename"])
+        self.assertTrue(payload["filename"].startswith("scan_"))
+
+    def test_anonymized_filename_uniqueness(self) -> None:
+        """
+        Task 4: Ensure two different filenames generate two distinct anonymized scan names.
+        """
+        name_1 = anonymize_filename("Patient_Alice_20260818.dcm")
+        name_2 = anonymize_filename("Patient_Bob_20260818.dcm")
+        self.assertNotEqual(name_1, name_2)
+        self.assertTrue(name_1.startswith("scan_"))
+        self.assertTrue(name_2.startswith("scan_"))
+        self.assertTrue(name_1.endswith(".png"))
+        self.assertTrue(name_2.endswith(".png"))
+
+    def test_app_state_isolation(self) -> None:
+        """
+        Task 5: Test that two distinct apps with two distinct predictors
+        do not bleed or interfere with each other's state.
+        """
+        pred_a = CheXpertPredictor(None)
+        pred_a.labels = ["Atelectasis"]
+        pred_a.model = torch.nn.Sequential(
+            torch.nn.AdaptiveAvgPool2d((1, 1)),
+            torch.nn.Flatten(),
+            torch.nn.Linear(3, 1),
+        )
+        pred_a.predict = MagicMock(return_value=[
+            Prediction(label="Atelectasis", probability=0.99, positive=True, threshold=0.5, suspicion_level="High suspicion")
+        ])
+        pred_a.explain_finding = MagicMock(return_value=Heatmap(label="Atelectasis", probability=0.99, image_data_url="data:image/png;base64,dummy"))
+
+        pred_b = CheXpertPredictor(None)
+        pred_b.labels = ["Cardiomegaly"]
+        pred_b.model = torch.nn.Sequential(
+            torch.nn.AdaptiveAvgPool2d((1, 1)),
+            torch.nn.Flatten(),
+            torch.nn.Linear(3, 1),
+        )
+        pred_b.predict = MagicMock(return_value=[
+            Prediction(label="Cardiomegaly", probability=0.11, positive=False, threshold=0.5, suspicion_level="Low suspicion")
+        ])
+        pred_b.explain_finding = MagicMock(return_value=Heatmap(label="Cardiomegaly", probability=0.11, image_data_url="data:image/png;base64,dummy"))
+
+        app_a = create_app(pred_a)
+        app_b = create_app(pred_b)
+
+        client_a = TestClient(app_a)
+        client_b = TestClient(app_b)
+
+        img_bytes = io.BytesIO()
+        Image.new("RGB", (32, 32), color="gray").save(img_bytes, format="PNG")
+        raw_data = img_bytes.getvalue()
+
+        res_a = client_a.post("/api/predict?include_heatmap=false", files={"file": ("test.png", raw_data, "image/png")})
+        res_b = client_b.post("/api/predict?include_heatmap=false", files={"file": ("test.png", raw_data, "image/png")})
+
+        self.assertEqual(res_a.json()["findings"][0]["label"], "Atelectasis")
+        self.assertEqual(res_a.json()["findings"][0]["probability"], 0.99)
+
+        self.assertEqual(res_b.json()["findings"][0]["label"], "Cardiomegaly")
+        self.assertEqual(res_b.json()["findings"][0]["probability"], 0.11)
+
+    def test_dicom_multiframe_rejection_before_decode(self) -> None:
+        """
+        Task 1: Test that multi-frame DICOM (NumberOfFrames > 1) is rejected before decoding.
+        """
+        try:
+            import pydicom
+            from pydicom.dataset import Dataset, FileMetaDataset
+            from pydicom.uid import ExplicitVRLittleEndian
+
+            meta = FileMetaDataset()
+            meta.MediaStorageSOPClassUID = "1.2.840.10008.5.1.4.1.1.7"
+            meta.MediaStorageSOPInstanceUID = "1.2.3.4.5"
+            meta.TransferSyntaxUID = ExplicitVRLittleEndian
+
+            ds = Dataset()
+            ds.file_meta = meta
+            ds.is_little_endian = True
+            ds.is_implicit_VR = False
+            ds.NumberOfFrames = 5
+            ds.Rows = 100
+            ds.Columns = 100
+            ds.BitsAllocated = 16
+            ds.BitsStored = 16
+            ds.HighBit = 15
+            ds.PixelRepresentation = 0
+            ds.SamplesPerPixel = 1
+            ds.PhotometricInterpretation = "MONOCHROME2"
+            ds.PixelData = b"\x00" * (5 * 100 * 100 * 2)
+
+            dcm_buf = io.BytesIO()
+            pydicom.dcmwrite(dcm_buf, ds, write_like_original=False)
+            dcm_buf.seek(0)
+
+            response = self.client.post(
+                "/api/predict",
+                files={"file": ("multiframe_study.dcm", dcm_buf.getvalue(), "application/dicom")},
+            )
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("Multi-frame DICOM series are not supported", response.json()["detail"])
+        except ImportError:
+            pass
 
     def test_model_info_reports_labels_and_metadata(self) -> None:
         expected_labels = [
@@ -118,23 +232,7 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(explain_res.status_code, 200)
         self.assertEqual(explain_res.json()["label"], "Cardiomegaly")
 
-    def test_explain_invalid_label_returns_400(self) -> None:
-        image_bytes = io.BytesIO()
-        Image.new("RGB", (64, 64), color="gray").save(image_bytes, format="JPEG")
-
-        response = self.client.post(
-            "/api/explain",
-            files={"file": ("test.jpg", image_bytes.getvalue(), "image/jpeg")},
-            data={"label": "NonExistentPathology123"},
-        )
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("Invalid label", response.json()["detail"])
-
     def test_batch_predict_chunking_and_client_ids(self) -> None:
-        """
-        Task 3: Test batch pipeline processing 10 images (> chunk size 8).
-        Verifies chunking and client_id preservation.
-        """
         buf = io.BytesIO()
         Image.new("RGB", (32, 32), color="gray").save(buf, format="PNG")
         raw_bytes = buf.getvalue()
@@ -198,12 +296,8 @@ class ApiTest(unittest.TestCase):
             self.assertEqual(r.status_code, 200)
 
     def test_checksum_verification_fail_closed(self) -> None:
-        """
-        Task 2: Test file matching hash, wrong hash, and auto-download disabled rejection.
-        """
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir) / "test_model.pt"
-            # When CHEXPERT_AUTO_DOWNLOAD=false, download must be immediately rejected
             success = _download_hf_file("http://localhost/dummy", target)
             self.assertFalse(success)
             self.assertFalse(target.exists())

@@ -8,12 +8,13 @@ import json
 import os
 import tempfile
 import uuid
+from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
 from typing import BinaryIO
 
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, UnidentifiedImageError
@@ -64,6 +65,18 @@ from app.schemas import (
     QualityReport,
 )
 
+static_dir = PROJECT_ROOT / "static"
+
+
+def compute_file_sha256(filepath: Path) -> str:
+    if not filepath.exists():
+        return ""
+    h = hashlib.sha256()
+    with filepath.open("rb") as f:
+        while chunk := f.read(65536):
+            h.update(chunk)
+    return h.hexdigest()
+
 
 def mask_phi(val: str | None) -> str:
     """
@@ -76,6 +89,17 @@ def mask_phi(val: str | None) -> str:
     raw_bytes = str(val).strip().encode("utf-8")
     h = hmac.new(PHI_HMAC_SECRET, raw_bytes, hashlib.sha256).hexdigest()[:16].upper()
     return f"ANONYMIZED_{h}"
+
+
+def anonymize_filename(filename: str) -> str:
+    """
+    Generates deterministic anonymized scan filename: scan_<8_hex_hash>.png
+    """
+    if EXPOSE_PHI or not filename:
+        return filename or "scan.png"
+    raw_bytes = filename.strip().encode("utf-8")
+    h = hmac.new(PHI_HMAC_SECRET, raw_bytes, hashlib.sha256).hexdigest()[:8].lower()
+    return f"scan_{h}.png"
 
 
 def _download_hf_file(url: str, target: Path, expected_sha256: str | None = None) -> bool:
@@ -124,19 +148,25 @@ def _download_hf_file(url: str, target: Path, expected_sha256: str | None = None
 
 def resolve_checkpoint_path() -> Path | None:
     configured = os.getenv("CHEXPERT_CHECKPOINT")
-    if configured:
-        return Path(configured)
-    ckpt_dir = PROJECT_ROOT / "checkpoints"
-    for candidate in ["chexpert_convnext_small.pt", "chexpert_densenet121_v2.pt", "chexpert_model.pt"]:
-        p = ckpt_dir / candidate
+    candidates = [Path(configured)] if configured else [
+        PROJECT_ROOT / "checkpoints" / "chexpert_convnext_small.pt",
+        DEFAULT_CHECKPOINT_PATH,
+    ]
+
+    for p in candidates:
         if p.exists() and p.stat().st_size > 1000:
+            if EXPECTED_CHECKPOINT_SHA256:
+                actual_hash = compute_file_sha256(p)
+                if actual_hash.lower() != EXPECTED_CHECKPOINT_SHA256.lower():
+                    raise RuntimeError(
+                        f"Integrity check failed: Checkpoint {p} SHA-256 mismatch.\n"
+                        f"Expected: {EXPECTED_CHECKPOINT_SHA256}\nActual:   {actual_hash}"
+                    )
             return p
-    if DEFAULT_CHECKPOINT_PATH.exists() and DEFAULT_CHECKPOINT_PATH.stat().st_size > 1000:
-        return DEFAULT_CHECKPOINT_PATH
 
     # If missing locally and auto-download allowed, download with SHA-256 validation
     if AUTO_DOWNLOAD_ENABLED:
-        target = ckpt_dir / "chexpert_convnext_small.pt"
+        target = PROJECT_ROOT / "checkpoints" / "chexpert_convnext_small.pt"
         print(f"Downloading model checkpoint from Hugging Face ({HUGGINGFACE_CHECKPOINT_URL})...")
         if _download_hf_file(HUGGINGFACE_CHECKPOINT_URL, target, expected_sha256=EXPECTED_CHECKPOINT_SHA256):
             print(f"Downloaded model to {target} (Size: {target.stat().st_size} bytes)")
@@ -147,35 +177,51 @@ def resolve_checkpoint_path() -> Path | None:
 def load_threshold_payload(path: Path = DEFAULT_THRESHOLDS_PATH) -> dict[str, object] | None:
     if not path.exists() and AUTO_DOWNLOAD_ENABLED:
         _download_hf_file(HUGGINGFACE_THRESHOLDS_URL, path, expected_sha256=EXPECTED_THRESHOLDS_SHA256 or None)
-    try:
-        with path.open("r", encoding="utf-8") as file:
-            return json.load(file)
-    except Exception:
-        return None
+
+    if path.exists():
+        if EXPECTED_THRESHOLDS_SHA256:
+            actual_hash = compute_file_sha256(path)
+            if actual_hash.lower() != EXPECTED_THRESHOLDS_SHA256.lower():
+                raise RuntimeError(
+                    f"Integrity check failed: Thresholds {path} SHA-256 mismatch.\n"
+                    f"Expected: {EXPECTED_THRESHOLDS_SHA256}\nActual:   {actual_hash}"
+                )
+        try:
+            with path.open("r", encoding="utf-8") as file:
+                return json.load(file)
+        except Exception:
+            return None
+    return None
 
 
-def load_thresholds() -> dict[str, float]:
-    payload = load_threshold_payload()
+def load_thresholds(payload: dict[str, object] | None) -> dict[str, float]:
     thresholds = payload.get("thresholds", {}) if payload else {}
     if not isinstance(thresholds, dict):
         return {}
     return {str(label): float(value) for label, value in thresholds.items()}
 
 
-checkpoint_path = resolve_checkpoint_path()
-threshold_payload = load_threshold_payload()
-thresholds = load_thresholds()
-predictor = CheXpertPredictor(checkpoint_path, thresholds=thresholds)
+@asynccontextmanager
+async def lifespan(app_obj: FastAPI):
+    # If predictor is not already injected (e.g. In isolated unit tests), load real models
+    if getattr(app_obj.state, "predictor", None) is None:
+        ckpt_path = resolve_checkpoint_path()
+        threshold_pl = load_threshold_payload()
+        thresholds_dict = load_thresholds(threshold_pl)
+        app_obj.state.predictor = CheXpertPredictor(ckpt_path, thresholds=thresholds_dict)
+        app_obj.state.threshold_payload = threshold_pl
+        app_obj.state.checkpoint_path = ckpt_path
+    yield
 
-static_dir = PROJECT_ROOT / "static"
 
-
-def create_app(predictor_instance: CheXpertPredictor | None = None) -> FastAPI:
-    global predictor
-    if predictor_instance is not None:
-        predictor = predictor_instance
-
-    app_instance = FastAPI(title="CheXpert Web Reader - Medical AI Workstation")
+def create_app(
+    predictor_instance: CheXpertPredictor | None = None,
+    threshold_payload_instance: dict[str, object] | None = None,
+) -> FastAPI:
+    app_instance = FastAPI(title="CheXpert Web Reader - Medical AI Workstation", lifespan=lifespan)
+    app_instance.state.predictor = predictor_instance
+    app_instance.state.threshold_payload = threshold_payload_instance
+    app_instance.state.checkpoint_path = getattr(predictor_instance, "checkpoint_path", None) if predictor_instance else None
     app_instance.mount("/static", StaticFiles(directory=static_dir), name="static")
 
     @app_instance.get("/")
@@ -183,47 +229,56 @@ def create_app(predictor_instance: CheXpertPredictor | None = None) -> FastAPI:
         return FileResponse(static_dir / "index.html")
 
     @app_instance.get("/health")
-    def health() -> dict[str, object]:
+    def health(request: Request) -> dict[str, object]:
+        pred = request.app.state.predictor
+        ckpt_path = getattr(request.app.state, "checkpoint_path", None)
         return {
             "status": "ok",
-            "model_loaded": predictor.is_loaded,
-            "labels": predictor.labels,
-            "checkpoint": str(checkpoint_path) if checkpoint_path else None,
-            "thresholds_loaded": bool(predictor.thresholds),
-            "model_info": get_current_model_info(),
+            "model_loaded": pred.is_loaded if pred else False,
+            "labels": pred.labels if pred else [],
+            "checkpoint": str(ckpt_path) if ckpt_path else None,
+            "thresholds_loaded": bool(pred.thresholds) if pred else False,
+            "model_info": get_current_model_info(pred, getattr(request.app.state, "threshold_payload", None), ckpt_path),
         }
 
     @app_instance.get("/api/model-info")
-    def model_info() -> dict[str, object]:
+    def model_info(request: Request) -> dict[str, object]:
+        pred = request.app.state.predictor
+        ckpt_path = getattr(request.app.state, "checkpoint_path", None)
+        pl = getattr(request.app.state, "threshold_payload", None)
         return {
-            "model_loaded": predictor.is_loaded,
-            "labels": predictor.labels,
-            "checkpoint": str(checkpoint_path) if checkpoint_path else None,
-            "thresholds_loaded": bool(predictor.thresholds),
-            "thresholds": predictor.thresholds,
-            "threshold_report": threshold_payload,
-            "model_info": get_current_model_info(),
+            "model_loaded": pred.is_loaded if pred else False,
+            "labels": pred.labels if pred else [],
+            "checkpoint": str(ckpt_path) if ckpt_path else None,
+            "thresholds_loaded": bool(pred.thresholds) if pred else False,
+            "thresholds": pred.thresholds if pred else {},
+            "threshold_report": pl,
+            "model_info": get_current_model_info(pred, pl, ckpt_path),
             "disclaimer": "Research prototype only. Do not use these results for medical decisions.",
         }
 
     @app_instance.post("/api/predict", response_model=PredictionResponse)
     async def predict(
+        request: Request,
         file: UploadFile = File(...),
         include_heatmap: bool = Query(True),
     ) -> PredictionResponse:
-        filename = file.filename or "uploaded_xray.png"
+        pred: CheXpertPredictor = request.app.state.predictor
+        raw_filename = file.filename or "uploaded_xray.png"
+        safe_filename = anonymize_filename(raw_filename)
+
         spool = await stream_to_spooled_tempfile(file, max_bytes=MAX_FILE_SIZE_BYTES)
         try:
-            image, dicom_meta = decode_image_or_dicom(spool, filename)
+            image, dicom_meta = decode_image_or_dicom(spool, raw_filename)
         finally:
             spool.close()
 
         width, height = image.size
 
-        if not predictor.is_loaded:
+        if pred is None or not pred.is_loaded:
             return PredictionResponse(
                 status="model_not_loaded",
-                filename=filename if EXPOSE_PHI else f"scan_{mask_phi(filename)[:8]}.png",
+                filename=safe_filename,
                 width=width,
                 height=height,
                 mode=image.mode,
@@ -233,13 +288,12 @@ def create_app(predictor_instance: CheXpertPredictor | None = None) -> FastAPI:
                 message="No model checkpoint loaded. Place a .pt file in checkpoints/.",
             )
 
-        # Offload inference and heatmap to worker thread with unified lock
         def _do_inference():
             quality = assess_cxr_quality(image, dicom_meta)
-            predictions = predictor.predict(image)
+            predictions = pred.predict(image)
             heatmap = None
             if include_heatmap:
-                explanation = predictor.explain_finding(image, target_label=None)
+                explanation = pred.explain_finding(image, target_label=None)
                 heatmap = HeatmapExplanation(
                     label=explanation.label,
                     probability=explanation.probability,
@@ -263,7 +317,7 @@ def create_app(predictor_instance: CheXpertPredictor | None = None) -> FastAPI:
 
         return PredictionResponse(
             status="ok",
-            filename=filename if EXPOSE_PHI else f"scan_{mask_phi(filename)[:8]}.png",
+            filename=safe_filename,
             width=width,
             height=height,
             mode=image.mode,
@@ -276,27 +330,29 @@ def create_app(predictor_instance: CheXpertPredictor | None = None) -> FastAPI:
 
     @app_instance.post("/api/explain", response_model=HeatmapExplanation)
     async def explain_label(
+        request: Request,
         file: UploadFile = File(...),
         label: str = Form(...),
     ) -> HeatmapExplanation:
-        if not predictor.is_loaded:
+        pred: CheXpertPredictor = request.app.state.predictor
+        if pred is None or not pred.is_loaded:
             raise HTTPException(status_code=400, detail="Model is not loaded.")
 
-        if label not in predictor.labels:
+        if label not in pred.labels:
             raise HTTPException(
                 status_code=400,
-                detail=f"Invalid label '{label}'. Valid labels are: {predictor.labels}",
+                detail=f"Invalid label '{label}'. Valid labels are: {pred.labels}",
             )
 
-        filename = file.filename or "upload.png"
+        raw_filename = file.filename or "upload.png"
         spool = await stream_to_spooled_tempfile(file, max_bytes=MAX_FILE_SIZE_BYTES)
         try:
-            image, _ = decode_image_or_dicom(spool, filename)
+            image, _ = decode_image_or_dicom(spool, raw_filename)
         finally:
             spool.close()
 
         try:
-            explanation = await asyncio.to_thread(predictor.explain_finding, image, label)
+            explanation = await asyncio.to_thread(pred.explain_finding, image, label)
             return HeatmapExplanation(
                 label=explanation.label,
                 probability=explanation.probability,
@@ -308,10 +364,12 @@ def create_app(predictor_instance: CheXpertPredictor | None = None) -> FastAPI:
 
     @app_instance.post("/api/predict-batch", response_model=BatchPredictionResponse)
     async def predict_batch_cxrs(
+        request: Request,
         files: list[UploadFile] = File(...),
         client_ids: list[str] = Form(default=[]),
     ) -> BatchPredictionResponse:
-        if not predictor.is_loaded:
+        pred: CheXpertPredictor = request.app.state.predictor
+        if pred is None or not pred.is_loaded:
             raise HTTPException(status_code=400, detail="Model is not loaded.")
         if not files:
             raise HTTPException(status_code=400, detail="No files provided.")
@@ -345,6 +403,7 @@ def create_app(predictor_instance: CheXpertPredictor | None = None) -> FastAPI:
             for j, f in enumerate(chunk_files):
                 c_id = chunk_cids[j] if j < len(chunk_cids) else f"batch_cxr_{i+j+1}_{uuid.uuid4().hex[:8]}"
                 fname = f.filename or f"image_{i+j+1}.png"
+                safe_fname = anonymize_filename(fname)
 
                 try:
                     spool = await stream_to_spooled_tempfile(f, max_bytes=MAX_FILE_SIZE_BYTES)
@@ -355,7 +414,6 @@ def create_app(predictor_instance: CheXpertPredictor | None = None) -> FastAPI:
 
                     quality = assess_cxr_quality(img, dcm_meta)
 
-                    # Thumbnail preview
                     thumb = img.copy()
                     thumb.thumbnail((120, 120))
                     thumb_buf = BytesIO()
@@ -366,7 +424,7 @@ def create_app(predictor_instance: CheXpertPredictor | None = None) -> FastAPI:
                     chunk_meta.append({
                         "index": i + j + 1,
                         "client_id": c_id,
-                        "filename": fname if EXPOSE_PHI else f"scan_{mask_phi(fname)[:8]}.png",
+                        "filename": safe_fname,
                         "is_dicom": dcm_meta.is_dicom,
                         "patient_id": dcm_meta.patient_id or "ANONYMIZED",
                         "quality": quality,
@@ -378,7 +436,7 @@ def create_app(predictor_instance: CheXpertPredictor | None = None) -> FastAPI:
                     errors.append(f"File index {i+j+1}: processing error")
 
             if chunk_images:
-                chunk_preds = await asyncio.to_thread(predictor.predict_batch, chunk_images, chunk_size=CHUNK_SIZE)
+                chunk_preds = await asyncio.to_thread(pred.predict_batch, chunk_images, chunk_size=CHUNK_SIZE)
                 for meta, preds in zip(chunk_meta, chunk_preds, strict=True):
                     findings = [
                         FindingPrediction(
@@ -412,7 +470,6 @@ def create_app(predictor_instance: CheXpertPredictor | None = None) -> FastAPI:
                         )
                     )
 
-                # Explicit cleanup of chunk memory
                 del chunk_images
                 del chunk_meta
 
@@ -456,6 +513,9 @@ async def stream_to_spooled_tempfile(file: UploadFile, max_bytes: int = MAX_FILE
 
 
 def decode_image_or_dicom(spool: BinaryIO, filename: str) -> tuple[Image.Image, DicomMetadata]:
+    """
+    Decodes standard image files or DICOM files with pre-decode multi-frame/size inspection.
+    """
     header_bytes = spool.read(132)
     spool.seek(0)
 
@@ -463,17 +523,35 @@ def decode_image_or_dicom(spool: BinaryIO, filename: str) -> tuple[Image.Image, 
 
     if is_dicom and HAS_PYDICOM:
         try:
+            # 1. Stop before pixels to inspect metadata header first (Task 1)
+            dcm_header = pydicom.dcmread(spool, stop_before_pixels=True, force=True)
+            num_frames = int(getattr(dcm_header, "NumberOfFrames", 1))
+            rows = int(getattr(dcm_header, "Rows", 0))
+            cols = int(getattr(dcm_header, "Columns", 0))
+
+            if num_frames > 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Multi-frame DICOM series are not supported. Only single-frame CXR studies are permitted.",
+                )
+
+            total_pixels = num_frames * rows * cols if num_frames > 0 else rows * cols
+            if total_pixels > MAX_DICOM_PIXELS or rows <= 0 or cols <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"DICOM dimensions ({rows}x{cols}) exceed maximum safety limits.",
+                )
+
+            spool.seek(0)
             dcm = pydicom.dcmread(spool, force=True)
 
-            num_frames = int(getattr(dcm, "NumberOfFrames", 1))
-            rows = int(getattr(dcm, "Rows", 0))
-            cols = int(getattr(dcm, "Columns", 0))
-            if rows * cols > MAX_DICOM_PIXELS:
-                raise HTTPException(status_code=400, detail="DICOM resolution exceeds maximum supported dimensions.")
-
-            arr = dcm.pixel_array
-            if num_frames > 1 and len(arr.shape) > 2:
-                arr = arr[0]
+            try:
+                arr = dcm.pixel_array
+            except (NotImplementedError, Exception) as pe:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported DICOM compression or transfer syntax: {pe}",
+                )
 
             arr = arr.astype(float)
 
@@ -521,7 +599,6 @@ def decode_image_or_dicom(spool: BinaryIO, filename: str) -> tuple[Image.Image, 
 
     try:
         image = Image.open(spool)
-        # Check image dimensions before allocating full uncompressed array
         if image.width * image.height > Image.MAX_IMAGE_PIXELS:
             raise HTTPException(status_code=400, detail="Image pixel dimensions exceed safety limits.")
         image.load()
@@ -587,13 +664,17 @@ def build_report(findings: list[FindingPrediction], quality: QualityReport) -> s
     return text
 
 
-def get_current_model_info() -> dict[str, object]:
+def get_current_model_info(
+    pred: CheXpertPredictor | None,
+    threshold_pl: dict[str, object] | None,
+    ckpt_path: Path | None,
+) -> dict[str, object]:
     info = dict(MODEL_INFO)
-    if predictor.is_loaded:
-        info["architecture"] = predictor.architecture
-        if threshold_payload and "mean_auc" in threshold_payload:
-            auc = threshold_payload["mean_auc"]
+    if pred and pred.is_loaded:
+        info["architecture"] = pred.architecture
+        if threshold_pl and "mean_auc" in threshold_pl:
+            auc = threshold_pl["mean_auc"]
             info["mean_auc"] = auc
             info["mean_auc_display"] = f"{auc:.4f}"
-            info["checkpoint"] = str(checkpoint_path) if checkpoint_path else info["checkpoint"]
+            info["checkpoint"] = str(ckpt_path) if ckpt_path else info["checkpoint"]
     return info

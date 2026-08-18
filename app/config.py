@@ -11,9 +11,15 @@ HUGGINGFACE_REPO = "qdat264/chexpert-convnext-small"
 HUGGINGFACE_CHECKPOINT_URL = f"https://huggingface.co/{HUGGINGFACE_REPO}/resolve/main/chexpert_convnext_small.pt"
 HUGGINGFACE_THRESHOLDS_URL = f"https://huggingface.co/{HUGGINGFACE_REPO}/resolve/main/thresholds.json"
 
-# Checksum & Governance Policies
-EXPECTED_CHECKPOINT_SHA256 = os.getenv("CHEXPERT_CHECKPOINT_SHA256", "f2c1a2f57f9d95067e898bc975a944aeb61976de1a9fbdc92b34a5d9d6acc4c4")
-EXPECTED_THRESHOLDS_SHA256 = os.getenv("CHEXPERT_THRESHOLDS_SHA256", "")
+# Checksum & Governance Policies (SHA-256)
+EXPECTED_CHECKPOINT_SHA256 = os.getenv(
+    "CHEXPERT_CHECKPOINT_SHA256",
+    "b8b1884a911f6ff9408de141c48034a39f4515e2c8deaadd25312e07601c9bc0",
+)
+EXPECTED_THRESHOLDS_SHA256 = os.getenv(
+    "CHEXPERT_THRESHOLDS_SHA256",
+    "7ad370d14f7941fae476d0f2ba2038fcfeedbbf70dcfd1e45cb083baa28965ea",
+)
 AUTO_DOWNLOAD_ENABLED = os.getenv("CHEXPERT_AUTO_DOWNLOAD", "true").lower() == "true"
 
 # Prioritize newest trained checkpoints
