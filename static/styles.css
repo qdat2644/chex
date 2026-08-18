@@ -142,6 +142,28 @@ figure { margin: 0; }
   justify-content: flex-end;
 }
 
+.lang-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--surface-2);
+  color: var(--primary-light);
+  font-size: 12.5px;
+  font-weight: 700;
+  padding: 0 14px;
+  height: 38px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-bright);
+  transition: all var(--transition);
+}
+
+.lang-btn:hover {
+  background: var(--primary-subtle);
+  border-color: var(--primary-light);
+  box-shadow: 0 0 12px var(--primary-glow);
+  transform: translateY(-1px);
+}
+
 .pdf-btn {
   display: inline-flex;
   align-items: center;

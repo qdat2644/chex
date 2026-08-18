@@ -48,6 +48,8 @@ const resultsEl = document.getElementById("results");
 const button = document.getElementById("analyze-button");
 const buttonLabel = document.getElementById("button-label");
 const exportPdfBtn = document.getElementById("export-pdf-btn");
+const langToggleBtn = document.getElementById("lang-toggle-btn");
+const langLabel = document.getElementById("lang-label");
 
 // DICOM banner elements
 const dicomBanner = document.getElementById("dicom-banner");
@@ -56,6 +58,143 @@ const dicomModality = document.getElementById("dicom-modality");
 const dicomView = document.getElementById("dicom-view");
 const dicomDate = document.getElementById("dicom-date");
 const dicomMatrix = document.getElementById("dicom-matrix");
+
+// -----------------------------------------
+// i18n Dictionary
+// -----------------------------------------
+const I18N = {
+  en: {
+    langBtn: "VI",
+    eyebrow: "Clinical Decision Support System",
+    subtitle: "Deep Learning Chest Radiograph Multi-Label Analysis",
+    exportReport: "Export Report (PDF)",
+    researchProtocol: "Research Protocol",
+    modelLoading: "Loading Model...",
+    modelActive: "Active",
+    noModel: "No Checkpoint",
+    domainWarning: "This model expects frontal chest radiographs (PA/AP view). Results are for clinical research and decision support only.",
+    importTitle: "Import Radiograph",
+    uploadStateDefault: "DICOM (.dcm), PNG, JPG, WebP supported • Press Ctrl+V to paste",
+    uploadStateLoaded: "Radiograph loaded & ready to analyze.",
+    uploadStateRunning: "Running neural network inference...",
+    uploadStateDone: "Analysis complete.",
+    dropzoneTitle: "Choose image or Paste (Ctrl+V)",
+    noFileSelected: "No file selected • Press Ctrl+V anywhere",
+    analyze: "Analyze",
+    analyzing: "Analyzing...",
+    pacsLabel: "PACS Radiograph Viewer",
+    inputImage: "Input Image",
+    brightness: "Brightness",
+    contrast: "Contrast",
+    fit: "Fit",
+    invert: "Invert",
+    noImgTitle: "No radiograph loaded",
+    noImgSub: "Select, drop, or press Ctrl+V to import an X-ray.",
+    predLabel: "Pathology Predictions",
+    findingsHeading: "Clinical Findings",
+    findingsHint: "💡 Click on any disease card below to view its specific Grad-CAM heatmap:",
+    emptyFindTitle: "Upload an image to see findings",
+    emptyFindSub: "Predictions with calibrated thresholds will appear here.",
+    xaiLabel: "Explainable AI (XAI)",
+    xaiHeading: "Attention Heatmap (Grad-CAM)",
+    xaiDesc: "Visual activation map highlighting anatomical regions driving model prediction",
+    heatBlend: "Heatmap Blend",
+    heatEmptyTitle: "Heatmap will appear after analysis",
+    heatEmptySub: "Grad-CAM activation overlays are generated during inference.",
+    origRadiograph: "Original Radiograph",
+    camOverlay: "Grad-CAM Overlay",
+    disclaimer: "Research prototype only. Do not use these automated results for definitive medical diagnosis or treatment decisions without board-certified radiologist validation. Model calibrated on CheXpert frontal CXR.",
+    statusWaiting: "Waiting",
+    statusReady: "Ready",
+    statusAnalyzing: "Analyzing",
+    statusComplete: "Complete",
+    statusError: "Error",
+    heatNotGen: "Not generated",
+    noThreshold: "No threshold",
+    thresholdPrefix: "Threshold:",
+    topFinding: "Top Finding",
+    diseaseNames: {
+      "Atelectasis": "Atelectasis",
+      "Cardiomegaly": "Cardiomegaly",
+      "Consolidation": "Consolidation",
+      "Edema": "Edema",
+      "Pleural Effusion": "Pleural Effusion"
+    },
+    suspicionLevels: {
+      "High suspicion": "High suspicion",
+      "Moderate suspicion": "Moderate suspicion",
+      "Low suspicion": "Low suspicion",
+      "Probability only": "Probability only"
+    }
+  },
+  vi: {
+    langBtn: "EN",
+    eyebrow: "Hệ thống hỗ trợ chẩn đoán hình ảnh",
+    subtitle: "Phân tích đa bệnh lý X-quang ngực bằng Deep Learning",
+    exportReport: "Xuất báo cáo (PDF)",
+    researchProtocol: "Nghiên cứu lâm sàng",
+    modelLoading: "Đang tải mô hình...",
+    modelActive: "Sẵn sàng",
+    noModel: "Chưa nạp model",
+    domainWarning: "Mô hình chỉ áp dụng cho phim X-quang ngực thẳng (PA/AP). Kết quả phục vụ nghiên cứu và hỗ trợ quyết định lâm sàng.",
+    importTitle: "Tải lên phim X-quang",
+    uploadStateDefault: "Hỗ trợ DICOM (.dcm), PNG, JPG, WebP • Nhấn Ctrl+V để dán ảnh",
+    uploadStateLoaded: "Đã nạp phim • Sẵn sàng phân tích.",
+    uploadStateRunning: "Đang chạy mạng nơ-ron chẩn đoán...",
+    uploadStateDone: "Phân tích hoàn tất.",
+    dropzoneTitle: "Chọn ảnh hoặc Dán (Ctrl+V)",
+    noFileSelected: "Chưa chọn file • Bấm Ctrl+V ở bất kỳ đâu",
+    analyze: "Phân tích",
+    analyzing: "Đang phân tích...",
+    pacsLabel: "Trình đọc phim PACS",
+    inputImage: "Ảnh X-quang đầu vào",
+    brightness: "Độ sáng",
+    contrast: "Độ tương phản",
+    fit: "Vừa khung",
+    invert: "Đảo âm bản",
+    noImgTitle: "Chưa tải phim X-quang",
+    noImgSub: "Chọn, kéo thả hoặc nhấn Ctrl+V để nạp phim.",
+    predLabel: "Dự đoán bệnh lý",
+    findingsHeading: "Kết quả bệnh lý",
+    findingsHint: "💡 Nhấp vào thẻ bệnh lý bất kỳ để xem bản đồ nhiệt Grad-CAM tương ứng:",
+    emptyFindTitle: "Tải ảnh lên để xem kết quả",
+    emptyFindSub: "Dự đoán kèm ngưỡng tối ưu sẽ hiển thị tại đây.",
+    xaiLabel: "Giải thích AI (XAI)",
+    xaiHeading: "Bản đồ tập trung (Grad-CAM)",
+    xaiDesc: "Vùng kích hoạt làm nổi bật các tổn thương chi phối quyết định của AI",
+    heatBlend: "Độ mờ nhiệt",
+    heatEmptyTitle: "Bản đồ nhiệt sẽ xuất hiện sau khi phân tích",
+    heatEmptySub: "Vùng kích hoạt Grad-CAM được tạo tự động khi chạy suy luận.",
+    origRadiograph: "Phim X-quang gốc",
+    camOverlay: "Bản đồ nhiệt Grad-CAM",
+    disclaimer: "Phiên bản nghiên cứu thử nghiệm. Không dùng kết quả tự động này để đưa ra chẩn đoán hay quyết định điều trị y tế mà không có sự xác nhận của bác sĩ chẩn đoán hình ảnh. Mô hình được hiệu chuẩn trên bộ dữ liệu X-quang ngực thẳng CheXpert.",
+    statusWaiting: "Chờ ảnh",
+    statusReady: "Sẵn sàng",
+    statusAnalyzing: "Đang xử lý",
+    statusComplete: "Hoàn tất",
+    statusError: "Lỗi",
+    heatNotGen: "Chưa tạo",
+    noThreshold: "Chưa có ngưỡng",
+    thresholdPrefix: "Ngưỡng:",
+    topFinding: "Tổn thương nổi bật",
+    diseaseNames: {
+      "Atelectasis": "Atelectasis (Xẹp phổi)",
+      "Cardiomegaly": "Cardiomegaly (Bóng tim to)",
+      "Consolidation": "Consolidation (Đông đặc)",
+      "Edema": "Edema (Phù phổi)",
+      "Pleural Effusion": "Pleural Effusion (Tràn dịch)"
+    },
+    suspicionLevels: {
+      "High suspicion": "Nghi ngờ cao",
+      "Moderate suspicion": "Nghi ngờ vừa",
+      "Low suspicion": "Nguy cơ thấp",
+      "Probability only": "Chỉ số xác suất"
+    }
+  }
+};
+
+// Current Language: Default is 'en'
+let currentLang = localStorage.getItem("chex_lang") || "en";
 
 // State
 let thresholdsLoaded = false;
@@ -76,8 +215,77 @@ let brightnessVal = 100;
 let contrastVal = 100;
 
 setInitialState();
+applyLanguage(currentLang);
 refreshModelInfo();
 initPacsControls();
+
+// -----------------------------------------
+// Language Switcher Logic
+// -----------------------------------------
+langToggleBtn.addEventListener("click", () => {
+  currentLang = currentLang === "en" ? "vi" : "en";
+  localStorage.setItem("chex_lang", currentLang);
+  applyLanguage(currentLang);
+});
+
+function applyLanguage(lang) {
+  const dict = I18N[lang] || I18N.en;
+  langLabel.textContent = dict.langBtn;
+
+  // Header & Upload
+  setText("i18n-eyebrow", dict.eyebrow);
+  setText("i18n-subtitle", dict.subtitle);
+  setText("i18n-export-report", dict.exportReport);
+  setText("i18n-research-protocol", dict.researchProtocol);
+  setText("quality-alert", dict.domainWarning);
+  setText("upload-title", dict.importTitle);
+  setText("i18n-dropzone-title", dict.dropzoneTitle);
+
+  // PACS
+  setText("i18n-pacs-label", dict.pacsLabel);
+  setText("image-heading", dict.inputImage);
+  setText("i18n-brightness-lbl", dict.brightness);
+  setText("i18n-contrast-lbl", dict.contrast);
+  setText("btn-zoom-fit", dict.fit);
+  setText("btn-invert", dict.invert);
+  setText("i18n-no-img-title", dict.noImgTitle);
+  setText("i18n-no-img-sub", dict.noImgSub);
+
+  // Findings
+  setText("i18n-pred-label", dict.predLabel);
+  setText("findings-heading", dict.findingsHeading);
+  setText("i18n-findings-hint", dict.findingsHint);
+  setText("i18n-empty-find-title", dict.emptyFindTitle);
+  setText("i18n-empty-find-sub", dict.emptyFindSub);
+
+  // XAI Heatmap
+  setText("i18n-xai-label", dict.xaiLabel);
+  setText("heatmap-heading", dict.xaiHeading);
+  setText("i18n-xai-desc", dict.xaiDesc);
+  setText("i18n-blend-lbl", dict.heatBlend);
+  setText("i18n-heat-empty-title", dict.heatEmptyTitle);
+  setText("i18n-heat-empty-sub", dict.heatEmptySub);
+  setText("i18n-orig-label", dict.origRadiograph);
+  setText("i18n-cam-label", dict.camOverlay);
+
+  // Disclaimer
+  setText("i18n-disclaimer-text", dict.disclaimer);
+
+  // Button state
+  if (!button.disabled) {
+    buttonLabel.textContent = dict.analyze;
+  }
+
+  // Re-render findings cards if data already present
+  if (currentPredictionData && currentPredictionData.findings) {
+    renderResponse(currentPredictionData);
+  }
+}
+
+function setText(id, text) {
+  const elNode = document.getElementById(id);
+  if (elNode) elNode.textContent = text;
+}
 
 // -----------------------------------------
 // PACS Image Viewer Controls
@@ -194,14 +402,15 @@ function applySelectedFile(file) {
     fileInput.files = dt.files;
   } catch {}
 
+  const dict = I18N[currentLang] || I18N.en;
   fileName.textContent = file.name || "radiograph.dcm";
   fileDropzone.classList.add("has-file");
-  uploadState.textContent = "Radiograph loaded & ready to analyze.";
+  uploadState.textContent = dict.uploadStateLoaded;
   button.disabled = false;
   button.classList.remove("is-loading");
-  buttonLabel.textContent = "Analyze";
+  buttonLabel.textContent = dict.analyze;
 
-  setChip(statusChip, "Ready", "");
+  setChip(statusChip, dict.statusReady, "");
   resetPanZoom();
 
   // Create preview
@@ -219,7 +428,7 @@ function applySelectedFile(file) {
   hideHeatmap();
   hideAlerts();
   dicomBanner.hidden = true;
-  renderEmpty("Click Analyze to start diagnostic inference", "Multi-label predictions & Grad-CAM will generate.");
+  renderEmpty(dict.emptyFindTitle, dict.emptyFindSub);
 }
 
 fileInput.addEventListener("change", () => {
@@ -231,7 +440,7 @@ fileInput.addEventListener("change", () => {
   applySelectedFile(file);
 });
 
-// Comprehensive Clipboard Paste (Ctrl+V)
+// Clipboard Paste (Ctrl+V)
 async function handlePasteEvent(event) {
   const clipboardData = event.clipboardData || window.clipboardData;
   if (!clipboardData) return;
@@ -327,28 +536,31 @@ form.addEventListener("submit", async (event) => {
     currentPredictionData = data;
     renderResponse(data);
   } catch (error) {
-    setChip(statusChip, "Error", "chip-err");
+    const dict = I18N[currentLang] || I18N.en;
+    setChip(statusChip, dict.statusError, "chip-err");
     uploadState.textContent = "Analysis failed. Please try again.";
     showAlert(messageEl, error.message || "Diagnostic inference failed.");
     renderEmpty("Analysis Interrupted", "Could not complete model inference.");
   } finally {
+    const dict = I18N[currentLang] || I18N.en;
     button.disabled = false;
     button.classList.remove("is-loading");
-    buttonLabel.textContent = "Analyze";
+    buttonLabel.textContent = dict.analyze;
   }
 });
 
 function setInitialState() {
+  const dict = I18N[currentLang] || I18N.en;
   selectedFile = null;
   currentPredictionData = null;
   currentActiveFinding = null;
-  fileName.textContent = "No file selected • Press Ctrl+V to paste";
+  fileName.textContent = dict.noFileSelected;
   fileDropzone.classList.remove("has-file");
-  uploadState.textContent = "DICOM (.dcm), PNG, JPG supported &bull; Press Ctrl+V";
+  uploadState.textContent = dict.uploadStateDefault;
   button.disabled = true;
   button.classList.remove("is-loading");
-  buttonLabel.textContent = "Analyze";
-  setChip(statusChip, "Waiting", "");
+  buttonLabel.textContent = dict.analyze;
+  setChip(statusChip, dict.statusWaiting, "");
 
   if (preview.src && preview.src.startsWith("blob:")) {
     URL.revokeObjectURL(preview.src);
@@ -360,15 +572,16 @@ function setInitialState() {
 
   hideHeatmap();
   hideAlerts();
-  renderEmpty("Upload an image to see findings", "Predictions with calibrated thresholds will appear here.");
+  renderEmpty(dict.emptyFindTitle, dict.emptyFindSub);
 }
 
 function setLoadingState() {
+  const dict = I18N[currentLang] || I18N.en;
   button.disabled = true;
   button.classList.add("is-loading");
-  buttonLabel.textContent = "Analyzing...";
-  setChip(statusChip, "Analyzing", "chip-busy");
-  uploadState.textContent = "Running neural network inference...";
+  buttonLabel.textContent = dict.analyzing;
+  setChip(statusChip, dict.statusAnalyzing, "chip-busy");
+  uploadState.textContent = dict.uploadStateRunning;
   hideAlerts();
   hideHeatmap();
   renderEmpty("Model Inference in Progress", "Computing multi-label probabilities & Grad-CAM...");
@@ -378,6 +591,7 @@ function setLoadingState() {
 // Refresh Model Info
 // -----------------------------------------
 async function refreshModelInfo() {
+  const dict = I18N[currentLang] || I18N.en;
   try {
     const response = await fetch("/api/model-info");
     if (!response.ok) throw new Error("Model info unavailable.");
@@ -391,7 +605,7 @@ async function refreshModelInfo() {
     const labelCount = info.label_count || (Array.isArray(data.labels) ? data.labels.length : 5);
     const auc = info.mean_auc_display || "0.8944";
     
-    modelStatus.textContent = loaded ? `${architecture} Active` : "No Checkpoint";
+    modelStatus.textContent = loaded ? `${architecture} ${dict.modelActive}` : dict.noModel;
     modelStatus.className = `badge ${loaded ? "badge-loaded" : "badge-waiting"}`;
     modelInfo.textContent = `${architecture} / ${labelCount} labels / mean AUC ${auc} / Stanford U-Ones Calibrated`;
   } catch {
@@ -404,13 +618,14 @@ async function refreshModelInfo() {
 // Render Prediction Results
 // -----------------------------------------
 function renderResponse(data) {
+  const dict = I18N[currentLang] || I18N.en;
   const findings = Array.isArray(data.findings) ? data.findings : [];
   const ok = data.status === "ok";
 
-  setChip(statusChip, ok ? "Complete" : "No model", ok ? "chip-ok" : "chip-err");
-  uploadState.textContent = ok ? "Analysis complete." : "Model checkpoint not loaded.";
+  setChip(statusChip, ok ? dict.statusComplete : dict.noModel, ok ? "chip-ok" : "chip-err");
+  uploadState.textContent = ok ? dict.uploadStateDone : "Model checkpoint not loaded.";
 
-  // Handle DICOM metadata banner
+  // DICOM metadata banner
   if (data.dicom?.is_dicom) {
     dicomPatient.textContent = data.dicom.patient_id || "ANONYMIZED";
     dicomModality.textContent = data.dicom.modality || "CR/DX";
@@ -427,7 +642,7 @@ function renderResponse(data) {
     qualityAlert.textContent = `⚠️ Clinical Quality Advisory: ${data.quality.warnings.join(" | ")}`;
     qualityAlert.style.display = "block";
   } else {
-    qualityAlert.textContent = "This model expects frontal chest radiographs (PA/AP view). Results are for clinical research and decision support only.";
+    qualityAlert.textContent = dict.domainWarning;
   }
 
   if (data.message) showAlert(messageEl, data.message);
@@ -458,6 +673,7 @@ function renderResponse(data) {
 // Build Interactive Finding Card
 // -----------------------------------------
 function buildFindingCard(item) {
+  const dict = I18N[currentLang] || I18N.en;
   const probability = clamp(item.probability);
   const threshold = Number.isFinite(Number(item.threshold))
     ? Number(item.threshold)
@@ -465,8 +681,11 @@ function buildFindingCard(item) {
       ? Number(thresholds[item.label])
       : null;
   
-  const suspicion = item.suspicion_level || suspicionLevel(probability, threshold).label;
-  const suspCls = suspicion.toLowerCase().includes("high") ? "high" : (suspicion.toLowerCase().includes("moderate") ? "moderate" : "low");
+  const rawSuspicion = item.suspicion_level || suspicionLevel(probability, threshold).label;
+  const translatedSuspicion = dict.suspicionLevels[rawSuspicion] || rawSuspicion;
+  const suspCls = rawSuspicion.toLowerCase().includes("high") ? "high" : (rawSuspicion.toLowerCase().includes("moderate") ? "moderate" : "low");
+
+  const displayName = dict.diseaseNames[item.label] || item.label || "Unlabeled";
 
   const article = el("article", `finding-card ${suspCls}`);
   article.dataset.label = item.label;
@@ -475,15 +694,15 @@ function buildFindingCard(item) {
 
   const leftDiv = el("div", "finding-left");
   const label = el("strong", "finding-name");
-  label.textContent = item.label || "Unlabeled";
+  label.textContent = displayName;
   const badge = el("span", "suspicion-badge");
-  badge.textContent = suspicion;
+  badge.textContent = translatedSuspicion;
   leftDiv.append(label, badge);
 
   const rightDiv = el("div", "finding-right");
   if (threshold !== null) {
     const thresholdText = el("span", "threshold-note");
-    thresholdText.textContent = `Threshold: ${pct(threshold)}`;
+    thresholdText.textContent = `${dict.thresholdPrefix} ${pct(threshold)}`;
     rightDiv.append(thresholdText);
   }
   const probabilityDiv = el("span", "probability");
@@ -541,12 +760,14 @@ async function selectFindingHeatmap(label) {
 }
 
 function renderFindingTabs(findings, activeLabel) {
+  const dict = I18N[currentLang] || I18N.en;
   findingTabs.replaceChildren();
   findings.forEach((f) => {
     const chip = el("button", `tab-chip ${f.label === activeLabel ? "active" : ""}`);
     chip.type = "button";
     chip.dataset.label = f.label;
-    chip.textContent = `${f.label} (${pct(f.probability)})`;
+    const name = dict.diseaseNames[f.label] || f.label;
+    chip.textContent = `${name} (${pct(f.probability)})`;
     chip.addEventListener("click", () => selectFindingHeatmap(f.label));
     findingTabs.append(chip);
   });
@@ -554,11 +775,13 @@ function renderFindingTabs(findings, activeLabel) {
 }
 
 function renderHeatmap(heatmapData) {
+  const dict = I18N[currentLang] || I18N.en;
   const prob = clamp(heatmapData.probability);
-  const label = heatmapData.label || "Top Finding";
+  const rawLabel = heatmapData.label || "Top Finding";
+  const displayName = dict.diseaseNames[rawLabel] || rawLabel;
 
-  boxLabelFinding.textContent = `${label} (${pct(prob)})`;
-  setChip(heatmapLabel, `${label} ${pct(prob)}`, "chip-ok");
+  boxLabelFinding.textContent = `${displayName} (${pct(prob)})`;
+  setChip(heatmapLabel, `${displayName} ${pct(prob)}`, "chip-ok");
 
   // Synchronize base radiograph preview
   if (preview.src) {
@@ -583,10 +806,11 @@ function renderHeatmap(heatmapData) {
 }
 
 function hideHeatmap() {
+  const dict = I18N[currentLang] || I18N.en;
   heatmapEmpty.hidden = false;
   heatmapFigure.hidden = true;
   heatmapControlsBar.hidden = true;
-  setChip(heatmapLabel, "Not generated", "");
+  setChip(heatmapLabel, dict.heatNotGen, "");
 }
 
 // -----------------------------------------
@@ -598,6 +822,7 @@ exportPdfBtn.addEventListener("click", () => {
     return;
   }
 
+  const dict = I18N[currentLang] || I18N.en;
   const data = currentPredictionData;
   const dateStr = new Date().toLocaleString();
 
@@ -609,7 +834,9 @@ exportPdfBtn.addEventListener("click", () => {
 
   document.getElementById("print-img-original").src = preview.src || "";
   document.getElementById("print-img-heatmap").src = heatmapPure.src || heatmapFallback.src || "";
-  document.getElementById("print-active-finding").textContent = currentActiveFinding || data.heatmap?.label || "Top Finding";
+  
+  const activeLabel = currentActiveFinding || data.heatmap?.label || "Top Finding";
+  document.getElementById("print-active-finding").textContent = dict.diseaseNames[activeLabel] || activeLabel;
 
   // Populate findings table
   const tbody = document.getElementById("print-table-body");
@@ -620,13 +847,15 @@ exportPdfBtn.addEventListener("click", () => {
     const threshold = item.threshold !== null ? pct(item.threshold) : "N/A";
     const statusText = item.positive ? "POSITIVE" : "NEGATIVE";
     const statusColor = item.positive ? "#dc2626" : "#16a34a";
+    const name = dict.diseaseNames[item.label] || item.label;
+    const susp = dict.suspicionLevels[item.suspicion_level] || item.suspicion_level || "Standard";
 
     tr.innerHTML = `
-      <td><strong>${item.label}</strong></td>
+      <td><strong>${name}</strong></td>
       <td>${pct(item.probability)}</td>
       <td>${threshold}</td>
       <td style="color: ${statusColor}; font-weight: bold;">${statusText}</td>
-      <td>${item.suspicion_level || "Standard"}</td>
+      <td>${susp}</td>
     `;
     tbody.appendChild(tr);
   });
