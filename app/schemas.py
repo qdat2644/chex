@@ -55,6 +55,7 @@ class PredictionResponse(BaseModel):
 
 class BatchItemResult(BaseModel):
     index: int
+    client_id: str | None = None
     filename: str
     is_dicom: bool = False
     patient_id: str | None = None

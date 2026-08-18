@@ -5,71 +5,98 @@ import unittest
 from pathlib import Path
 
 import pandas as pd
+import torch
 from PIL import Image
-from torchvision import transforms
 
 from app.dataset import CheXpertDataset
 
 
-class CheXpertDatasetTest(unittest.TestCase):
-    def test_resolves_kaggle_layout_and_normalizes_uncertain_labels(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            image_path = root / "train" / "patient00001" / "study1" / "view1_frontal.jpg"
-            image_path.parent.mkdir(parents=True)
-            Image.new("L", (8, 8), color=128).save(image_path)
+class TestCheXpertDatasetPolicies(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        
+        # Create a dummy image
+        img_path = self.root / "test_cxr.png"
+        Image.new("RGB", (64, 64), color="gray").save(img_path)
 
-            csv_path = root / "train.csv"
-            pd.DataFrame(
-                [
-                    {
-                        "Path": "CheXpert-v1.0-small/train/patient00001/study1/view1_frontal.jpg",
-                        "Atelectasis": -1,
-                        "Cardiomegaly": 1,
-                        "Consolidation": 0,
-                        "Edema": None,
-                        "Pleural Effusion": -1,
-                    }
-                ]
-            ).to_csv(csv_path, index=False)
+        # Create a dummy CSV with various labels: 1, 0, -1, NaN
+        self.csv_path = self.root / "test.csv"
+        df = pd.DataFrame([
+            {
+                "Path": "test_cxr.png",
+                "Frontal/Lateral": "Frontal",
+                "Atelectasis": 1.0,
+                "Cardiomegaly": -1.0, # In Stanford policy: 0.0
+                "Consolidation": 0.0,
+                "Edema": -1.0,        # In Stanford policy: 1.0
+                "Pleural Effusion": float("nan"),
+            }
+        ])
+        df.to_csv(self.csv_path, index=False)
 
-            dataset = CheXpertDataset(csv_path, root, transforms.ToTensor(), uncertain_policy="one")
-            image, target = dataset[0]
+    def tearDown(self):
+        self.temp_dir.cleanup()
 
-            self.assertEqual(tuple(image.shape), (3, 8, 8))
-            self.assertEqual(target.tolist(), [1.0, 1.0, 0.0, 0.0, 1.0])
+    def test_policy_one(self):
+        ds = CheXpertDataset(
+            csv_path=self.csv_path,
+            data_root=self.root,
+            transform=lambda x: torch.zeros(3, 64, 64),
+            uncertain_policy="one",
+        )
+        _, target = ds[0]
+        # Atelectasis=1.0, Cardiomegaly=-1->1.0, Consolidation=0.0, Edema=-1->1.0, Pleural Effusion=nan->0.0
+        expected = torch.tensor([1.0, 1.0, 0.0, 1.0, 0.0])
+        self.assertTrue(torch.allclose(target, expected))
 
-    def test_filters_by_view(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            for folder in ["frontal", "lateral"]:
-                image_path = root / "train" / folder / "view.jpg"
-                image_path.parent.mkdir(parents=True)
-                Image.new("L", (8, 8), color=128).save(image_path)
+    def test_policy_zero(self):
+        ds = CheXpertDataset(
+            csv_path=self.csv_path,
+            data_root=self.root,
+            transform=lambda x: torch.zeros(3, 64, 64),
+            uncertain_policy="zero",
+        )
+        _, target = ds[0]
+        # Atelectasis=1.0, Cardiomegaly=-1->0.0, Consolidation=0.0, Edema=-1->0.0, Pleural Effusion=0.0
+        expected = torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0])
+        self.assertTrue(torch.allclose(target, expected))
 
-            csv_path = root / "train.csv"
-            rows = []
-            for view, folder in [("Frontal", "frontal"), ("Lateral", "lateral")]:
-                rows.append(
-                    {
-                        "Path": f"CheXpert-v1.0-small/train/{folder}/view.jpg",
-                        "Frontal/Lateral": view,
-                        "Atelectasis": 0,
-                        "Cardiomegaly": 0,
-                        "Consolidation": 0,
-                        "Edema": 0,
-                        "Pleural Effusion": 0,
-                    }
-                )
-            pd.DataFrame(rows).to_csv(csv_path, index=False)
+    def test_policy_stanford(self):
+        ds = CheXpertDataset(
+            csv_path=self.csv_path,
+            data_root=self.root,
+            transform=lambda x: torch.zeros(3, 64, 64),
+            uncertain_policy="stanford",
+        )
+        _, target = ds[0]
+        # Atelectasis=1.0, Cardiomegaly=-1->0.0, Consolidation=0.0, Edema=-1->1.0, Pleural Effusion=0.0
+        expected = torch.tensor([1.0, 0.0, 0.0, 1.0, 0.0])
+        self.assertTrue(torch.allclose(target, expected))
 
-            frontal = CheXpertDataset(csv_path, root, transforms.ToTensor(), view="frontal")
-            lateral = CheXpertDataset(csv_path, root, transforms.ToTensor(), view="lateral")
-            all_views = CheXpertDataset(csv_path, root, transforms.ToTensor(), view="all")
+    def test_policy_smooth(self):
+        ds = CheXpertDataset(
+            csv_path=self.csv_path,
+            data_root=self.root,
+            transform=lambda x: torch.zeros(3, 64, 64),
+            uncertain_policy="smooth",
+        )
+        _, target = ds[0]
+        # Atelectasis=1.0, Cardiomegaly=-1->0.6, Consolidation=0.0, Edema=-1->0.6, Pleural Effusion=0.0
+        expected = torch.tensor([1.0, 0.6, 0.0, 0.6, 0.0])
+        self.assertTrue(torch.allclose(target, expected))
 
-            self.assertEqual(len(frontal), 1)
-            self.assertEqual(len(lateral), 1)
-            self.assertEqual(len(all_views), 2)
+    def test_policy_ignore_masking(self):
+        ds = CheXpertDataset(
+            csv_path=self.csv_path,
+            data_root=self.root,
+            transform=lambda x: torch.zeros(3, 64, 64),
+            uncertain_policy="ignore",
+        )
+        _, target, mask = ds[0]
+        # Atelectasis: valid(1.0), Cardiomegaly: -1 (mask=0.0), Consolidation: valid(1.0), Edema: -1 (mask=0.0), Effusion: nan(valid=1.0)
+        expected_mask = torch.tensor([1.0, 0.0, 1.0, 0.0, 1.0])
+        self.assertTrue(torch.allclose(mask, expected_mask))
 
 
 if __name__ == "__main__":

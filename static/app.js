@@ -970,14 +970,18 @@ async function runBatchInference() {
 
 function renderBatchTable(results) {
   if (!results.length) {
-    batchTableBody.innerHTML = `
-      <tr class="empty-table-row">
-        <td colspan="7" class="empty-table-cell">
-          <strong>${t("No batch studies loaded")}</strong>
-          <span>${t("Import multiple chest radiographs or DICOM files to begin parallel batch analysis.")}</span>
-        </td>
-      </tr>
-    `;
+    const tr = document.createElement("tr");
+    tr.className = "empty-table-row";
+    const td = document.createElement("td");
+    td.colSpan = 7;
+    td.className = "empty-table-cell";
+    const strong = document.createElement("strong");
+    strong.textContent = t("No batch studies loaded");
+    const span = document.createElement("span");
+    span.textContent = t("Import multiple chest radiographs or DICOM files to begin parallel batch analysis.");
+    td.append(strong, span);
+    tr.appendChild(td);
+    batchTableBody.replaceChildren(tr);
     return;
   }
 
@@ -988,45 +992,91 @@ function renderBatchTable(results) {
     const statusText = hasPos ? t("POSITIVE") : t("CLEAR");
     const statusColor = hasPos ? "#ef4444" : "#10b981";
 
-    const posTagsHtml = item.positive_labels?.length
-      ? item.positive_labels.map((l) => `<span class="batch-tag-positive">${t(l)}</span>`).join(" ")
-      : `<span class="batch-tag-clear">${t("CLEAR")}</span>`;
+    // 1. Index
+    const tdIdx = document.createElement("td");
+    tdIdx.textContent = `${idx + 1}`;
+    tr.appendChild(tdIdx);
 
-    tr.innerHTML = `
-      <td>${idx + 1}</td>
-      <td>
-        <img class="batch-thumb-img" src="${item.preview_url || ''}" alt="Thumb" />
-      </td>
-      <td>
-        <strong>${item.patient_id || 'ANONYMIZED'}</strong><br/>
-        <small style="color: var(--text-muted);">${item.filename}</small>
-      </td>
-      <td>
-        <strong>${t(item.top_finding)}</strong> (${pct(item.top_probability)})
-      </td>
-      <td>${posTagsHtml}</td>
-      <td style="color: ${statusColor}; font-weight: bold;">${statusText}</td>
-      <td>
-        <button class="btn-open-pacs" type="button" data-idx="${idx}">${t("Open")} ↗</button>
-      </td>
-    `;
+    // 2. Thumbnail preview
+    const tdThumb = document.createElement("td");
+    const imgThumb = document.createElement("img");
+    imgThumb.className = "batch-thumb-img";
+    imgThumb.src = item.preview_url || "";
+    imgThumb.alt = "Thumbnail";
+    tdThumb.appendChild(imgThumb);
+    tr.appendChild(tdThumb);
 
-    // Click row or open button to switch to Single Mode & inspect in PACS
-    const openBtn = tr.querySelector(".btn-open-pacs");
-    openBtn.addEventListener("click", (e) => {
+    // 3. Patient ID & filename
+    const tdPatient = document.createElement("td");
+    const strongPat = document.createElement("strong");
+    strongPat.textContent = item.patient_id || "ANONYMIZED";
+    const br = document.createElement("br");
+    const smallFile = document.createElement("small");
+    smallFile.style.color = "var(--text-muted)";
+    smallFile.textContent = item.filename;
+    tdPatient.append(strongPat, br, smallFile);
+    tr.appendChild(tdPatient);
+
+    // 4. Top Finding
+    const tdTop = document.createElement("td");
+    const strongTop = document.createElement("strong");
+    strongTop.textContent = t(item.top_finding);
+    const spanProb = document.createElement("span");
+    spanProb.textContent = ` (${pct(item.top_probability)})`;
+    tdTop.append(strongTop, spanProb);
+    tr.appendChild(tdTop);
+
+    // 5. Positive tags
+    const tdPos = document.createElement("td");
+    if (item.positive_labels && item.positive_labels.length > 0) {
+      item.positive_labels.forEach((lbl) => {
+        const tag = document.createElement("span");
+        tag.className = "batch-tag-positive";
+        tag.textContent = t(lbl);
+        tdPos.appendChild(tag);
+      });
+    } else {
+      const clearTag = document.createElement("span");
+      clearTag.className = "batch-tag-clear";
+      clearTag.textContent = t("CLEAR");
+      tdPos.appendChild(clearTag);
+    }
+    tr.appendChild(tdPos);
+
+    // 6. Status badge
+    const tdStatus = document.createElement("td");
+    tdStatus.style.color = statusColor;
+    tdStatus.style.fontWeight = "bold";
+    tdStatus.textContent = statusText;
+    tr.appendChild(tdStatus);
+
+    // 7. Interactive action button
+    const tdAction = document.createElement("td");
+    const btnOpen = document.createElement("button");
+    btnOpen.className = "btn-open-pacs";
+    btnOpen.type = "button";
+    btnOpen.textContent = `${t("Open")} ↗`;
+    btnOpen.addEventListener("click", (e) => {
       e.stopPropagation();
-      openBatchItemInPacs(idx);
+      openBatchItemInPacs(item.filename, idx);
     });
+    tdAction.appendChild(btnOpen);
+    tr.appendChild(tdAction);
 
-    tr.addEventListener("click", () => openBatchItemInPacs(idx));
+    // Click anywhere on row to view in PACS
+    tr.addEventListener("click", () => openBatchItemInPacs(item.filename, idx));
     fragment.appendChild(tr);
   });
 
   batchTableBody.replaceChildren(fragment);
 }
 
-function openBatchItemInPacs(idx) {
-  const file = queuedBatchFiles[idx];
+function openBatchItemInPacs(filename, fallbackIdx) {
+  // Find file by exact filename or fallback index for guaranteed integrity
+  let file = queuedBatchFiles.find((f) => f.name === filename);
+  if (!file && fallbackIdx !== undefined) {
+    file = queuedBatchFiles[fallbackIdx];
+  }
   if (!file) return;
 
   // Switch to single workspace mode
@@ -1047,6 +1097,16 @@ function clearBatch() {
   btnExportCsv.disabled = true;
   batchStatsChip.textContent = "0 Patients Scanned";
   renderBatchTable([]);
+}
+
+function escapeCsvCell(val) {
+  if (val === null || val === undefined) return '""';
+  let s = String(val);
+  // CSV Formula Injection defense: prepend single-quote if string starts with risky chars (=, +, -, @)
+  if (/^[=+\-@\t\r]/.test(s)) {
+    s = "'" + s;
+  }
+  return `"${s.replace(/"/g, '""')}"`;
 }
 
 function exportBatchCsv() {
@@ -1074,22 +1134,22 @@ function exportBatchCsv() {
     });
 
     return [
-      i + 1,
-      `"${r.filename}"`,
-      `"${r.patient_id || 'ANONYMIZED'}"`,
-      r.is_dicom ? "YES" : "NO",
-      probMap["Atelectasis"] || "N/A",
-      probMap["Cardiomegaly"] || "N/A",
-      probMap["Consolidation"] || "N/A",
-      probMap["Edema"] || "N/A",
-      probMap["Pleural Effusion"] || "N/A",
-      r.positive_count,
-      `"${(r.positive_labels || []).join('; ')}"`,
-      `"${(r.report || '').replace(/"/g, '""')}"`,
+      escapeCsvCell(i + 1),
+      escapeCsvCell(r.filename),
+      escapeCsvCell(r.patient_id || 'ANONYMIZED'),
+      escapeCsvCell(r.is_dicom ? "YES" : "NO"),
+      escapeCsvCell(probMap["Atelectasis"] || "N/A"),
+      escapeCsvCell(probMap["Cardiomegaly"] || "N/A"),
+      escapeCsvCell(probMap["Consolidation"] || "N/A"),
+      escapeCsvCell(probMap["Edema"] || "N/A"),
+      escapeCsvCell(probMap["Pleural Effusion"] || "N/A"),
+      escapeCsvCell(r.positive_count),
+      escapeCsvCell((r.positive_labels || []).join('; ')),
+      escapeCsvCell(r.report || ''),
     ].join(",");
   });
 
-  const csvContent = "data:text/csv;charset=utf-8,\uFEFF" + [headers.join(","), ...rows].join("\n");
+  const csvContent = "data:text/csv;charset=utf-8,\uFEFF" + [headers.map(escapeCsvCell).join(","), ...rows].join("\n");
   const encodedUri = encodeURI(csvContent);
   const link = document.createElement("a");
   link.setAttribute("href", encodedUri);
@@ -1123,7 +1183,7 @@ exportPdfBtn.addEventListener("click", () => {
   const activeLabel = currentActiveFinding || data.heatmap?.label || "Top Finding";
   document.getElementById("print-active-finding").textContent = t(activeLabel);
 
-  // Populate findings table
+  // Populate findings table using safe DOM construction
   const tbody = document.getElementById("print-table-body");
   tbody.replaceChildren();
 
@@ -1135,13 +1195,26 @@ exportPdfBtn.addEventListener("click", () => {
     const name = t(item.label);
     const susp = t(item.suspicion_level || "Standard");
 
-    tr.innerHTML = `
-      <td><strong>${name}</strong></td>
-      <td>${pct(item.probability)}</td>
-      <td>${threshold}</td>
-      <td style="color: ${statusColor}; font-weight: bold;">${statusText}</td>
-      <td>${susp}</td>
-    `;
+    const tdName = document.createElement("td");
+    const strongName = document.createElement("strong");
+    strongName.textContent = name;
+    tdName.appendChild(strongName);
+
+    const tdProb = document.createElement("td");
+    tdProb.textContent = pct(item.probability);
+
+    const tdThresh = document.createElement("td");
+    tdThresh.textContent = threshold;
+
+    const tdStatus = document.createElement("td");
+    tdStatus.style.color = statusColor;
+    tdStatus.style.fontWeight = "bold";
+    tdStatus.textContent = statusText;
+
+    const tdSusp = document.createElement("td");
+    tdSusp.textContent = susp;
+
+    tr.append(tdName, tdProb, tdThresh, tdStatus, tdSusp);
     tbody.appendChild(tr);
   });
 

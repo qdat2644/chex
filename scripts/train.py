@@ -211,12 +211,17 @@ def mean_auc(scores: dict[str, float | None]) -> float | None:
     return float(sum(aucs) / len(aucs))
 
 
-def set_seed(seed: int) -> None:
+def set_seed(seed: int, deterministic: bool = True) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = True
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        if deterministic:
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+        else:
+            torch.backends.cudnn.benchmark = True
 
 
 def subset_dataset(dataset: CheXpertDataset, limit: int | None) -> CheXpertDataset | Subset:
@@ -239,7 +244,7 @@ def calculate_pos_weight(dataset: CheXpertDataset | Subset, labels: list[str]) -
     frame = base.frame.iloc[indices] if indices is not None else base.frame
     targets = []
     for label in labels:
-        values = frame[label].apply(lambda v: base._normalize_label(v, label))
+        values = frame[label].apply(lambda v: base._normalize_label_and_mask(v, label)[0])
         targets.append(values.astype(float).to_numpy())
     target_array = np.stack(targets, axis=1)
     positives = target_array.sum(axis=0)
@@ -257,11 +262,13 @@ def checkpoint_payload(
     epoch: int,
     metric: float,
     metrics_history: list[dict[str, object]],
+    scheduler: object | None = None,
 ) -> dict[str, object]:
     return {
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scaler_state_dict": scaler.state_dict() if scaler else None,
+        "scheduler_state_dict": scheduler.state_dict() if (scheduler and hasattr(scheduler, "state_dict")) else None,
         "labels": labels,
         "metadata": {
             "epoch": epoch,
@@ -509,7 +516,7 @@ def main() -> None:
 
         # Save last checkpoint
         torch.save(
-            checkpoint_payload(model, optimizer, scaler, labels, args, epoch, score, metrics_history),
+            checkpoint_payload(model, optimizer, scaler, labels, args, epoch, score, metrics_history, scheduler=scheduler),
             last_output,
         )
         write_metrics(metrics_output, metrics_history, config)
@@ -520,7 +527,7 @@ def main() -> None:
         if score > best_auc:
             best_auc = score
             torch.save(
-                checkpoint_payload(model, optimizer, scaler, labels, args, epoch, score, metrics_history),
+                checkpoint_payload(model, optimizer, scaler, labels, args, epoch, score, metrics_history, scheduler=scheduler),
                 args.output,
             )
             print(f"🌟 New Best Model saved to {args.output} (AUC: {auc_text})")

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import os
 import pickle
+import threading
 import urllib.request
 from dataclasses import dataclass
 from io import BytesIO
@@ -14,6 +16,8 @@ from PIL import Image
 from torchvision import models, transforms
 
 from app.config import DEFAULT_IMAGE_SIZE, DEFAULT_LABELS, DEFAULT_THRESHOLD, PROJECT_ROOT
+
+GRADCAM_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -161,7 +165,7 @@ class CheXpertPredictor:
         results: list[Prediction] = []
         for label, probability in zip(self.labels, probabilities, strict=True):
             prob = float(probability)
-            threshold = self.thresholds.get(label)
+            threshold = self.thresholds.get(label, self.threshold)
             is_positive = bool(threshold is not None and prob >= threshold)
 
             # Determine clinical suspicion level
@@ -187,102 +191,111 @@ class CheXpertPredictor:
         return results
 
     @torch.inference_mode()
-    def predict_batch(self, images: list[Image.Image]) -> list[list[Prediction]]:
+    def predict_batch(self, images: list[Image.Image], chunk_size: int = 16) -> list[list[Prediction]]:
         if self.model is None:
             raise RuntimeError("Model checkpoint is not loaded.")
         if not images:
             return []
 
-        tensors = torch.stack([self.transform(img.convert("RGB")) for img in images]).to(self.device)
-        logits = self.model(tensors)
-        batch_probs = torch.sigmoid(logits).detach().cpu().numpy()
+        all_results: list[list[Prediction]] = []
+        # Chunked batch processing to prevent GPU/CPU memory overflow (OOM)
+        for i in range(0, len(images), chunk_size):
+            chunk = images[i : i + chunk_size]
+            tensors = torch.stack([self.transform(img.convert("RGB")) for img in chunk]).to(self.device)
+            logits = self.model(tensors)
+            batch_probs = torch.sigmoid(logits).detach().cpu().numpy()
 
-        batch_results: list[list[Prediction]] = []
-        for probs in batch_probs:
-            img_results: list[Prediction] = []
-            for label, prob_val in zip(self.labels, probs, strict=True):
-                prob = float(prob_val)
-                threshold = self.thresholds.get(label)
-                is_positive = bool(threshold is not None and prob >= threshold)
+            for probs in batch_probs:
+                img_results: list[Prediction] = []
+                for label, prob_val in zip(self.labels, probs, strict=True):
+                    prob = float(prob_val)
+                    threshold = self.thresholds.get(label, self.threshold)
+                    is_positive = bool(threshold is not None and prob >= threshold)
 
-                if threshold is not None:
-                    if prob >= min(1.0, threshold + 0.15):
-                        suspicion = "High suspicion"
-                    elif prob >= threshold:
-                        suspicion = "Moderate suspicion"
+                    if threshold is not None:
+                        if prob >= min(1.0, threshold + 0.15):
+                            suspicion = "High suspicion"
+                        elif prob >= threshold:
+                            suspicion = "Moderate suspicion"
+                        else:
+                            suspicion = "Low suspicion"
                     else:
-                        suspicion = "Low suspicion"
-                else:
-                    suspicion = "Probability only"
+                        suspicion = "Probability only"
 
-                img_results.append(
-                    Prediction(
-                        label=label,
-                        probability=prob,
-                        positive=is_positive,
-                        threshold=threshold,
-                        suspicion_level=suspicion,
+                    img_results.append(
+                        Prediction(
+                            label=label,
+                            probability=prob,
+                            positive=is_positive,
+                            threshold=threshold,
+                            suspicion_level=suspicion,
+                        )
                     )
-                )
-            batch_results.append(img_results)
-        return batch_results
+                all_results.append(img_results)
+        return all_results
 
     def explain_finding(self, image: Image.Image, target_label: str | None = None) -> Heatmap:
         if self.model is None:
             raise RuntimeError("Model checkpoint is not loaded.")
 
-        original = image.convert("RGB")
-        tensor = self.transform(original).unsqueeze(0).to(self.device)
+        if target_label is not None and target_label not in self.labels:
+            raise ValueError(f"Invalid target label '{target_label}'. Valid labels are: {self.labels}")
 
-        target_layer = get_target_layer_for_gradcam(self.model, self.architecture)
-        activations_list = []
-        gradients_list = []
+        with GRADCAM_LOCK:
+            original = image.convert("RGB")
+            tensor = self.transform(original).unsqueeze(0).to(self.device)
 
-        def forward_hook(module, inp, output):
-            activations_list.append(output)
+            target_layer = get_target_layer_for_gradcam(self.model, self.architecture)
+            activations_list = []
+            gradients_list = []
 
-        def backward_hook(module, grad_in, grad_out):
-            gradients_list.append(grad_out[0])
+            def forward_hook(module, inp, output):
+                activations_list.append(output)
 
-        h_fwd = target_layer.register_forward_hook(forward_hook)
-        h_bwd = target_layer.register_full_backward_hook(backward_hook)
+            def backward_hook(module, grad_in, grad_out):
+                gradients_list.append(grad_out[0])
 
-        self.model.zero_grad(set_to_none=True)
-        logits = self.model(tensor)
-        probabilities = torch.sigmoid(logits).squeeze(0)
+            h_fwd = target_layer.register_forward_hook(forward_hook)
+            h_bwd = target_layer.register_full_backward_hook(backward_hook)
 
-        # Select target label index
-        if target_label and target_label in self.labels:
-            label_index = self.labels.index(target_label)
-        else:
-            label_index = int(torch.argmax(probabilities).detach().cpu())
+            try:
+                self.model.zero_grad(set_to_none=True)
+                logits = self.model(tensor)
+                probabilities = torch.sigmoid(logits).squeeze(0)
 
-        label_name = self.labels[label_index]
-        label_prob = float(probabilities[label_index].detach().cpu())
+                # Select target label index
+                if target_label and target_label in self.labels:
+                    label_index = self.labels.index(target_label)
+                else:
+                    label_index = int(torch.argmax(probabilities).detach().cpu())
 
-        logits[0, label_index].backward()
+                label_name = self.labels[label_index]
+                label_prob = float(probabilities[label_index].detach().cpu())
 
-        h_fwd.remove()
-        h_bwd.remove()
+                logits[0, label_index].backward()
 
-        if not activations_list or not gradients_list:
-            raise RuntimeError("Failed to capture Grad-CAM activations/gradients.")
+                if not activations_list or not gradients_list:
+                    raise RuntimeError("Failed to capture Grad-CAM activations/gradients.")
 
-        activations = activations_list[0].detach()[0]
-        gradients = gradients_list[0].detach()[0]
-        weights = gradients.mean(dim=(1, 2))
-        cam = torch.relu((weights[:, None, None] * activations).sum(dim=0))
-        cam_norm = self._normalize_cam(cam, confidence=label_prob)
+                activations = activations_list[0].detach()[0]
+                gradients = gradients_list[0].detach()[0]
+                weights = gradients.mean(dim=(1, 2))
+                cam = torch.relu((weights[:, None, None] * activations).sum(dim=0))
+                cam_norm = self._normalize_cam(cam, confidence=label_prob)
 
-        overlay = self._render_overlay(original, cam_norm)
-        pure_heat = self._render_pure_heatmap_rgba(original.size, cam_norm, confidence=label_prob)
+                overlay = self._render_overlay(original, cam_norm)
+                pure_heat = self._render_pure_heatmap_rgba(original.size, cam_norm, confidence=label_prob)
 
-        return Heatmap(
-            label=label_name,
-            probability=label_prob,
-            image_data_url=self._encode_png_data_url(overlay),
-            pure_heatmap_url=self._encode_png_data_url(pure_heat),
-        )
+                return Heatmap(
+                    label=label_name,
+                    probability=label_prob,
+                    image_data_url=self._encode_png_data_url(overlay),
+                    pure_heatmap_url=self._encode_png_data_url(pure_heat),
+                )
+            finally:
+                h_fwd.remove()
+                h_bwd.remove()
+                self.model.zero_grad(set_to_none=True)
 
     def explain_all_findings(self, image: Image.Image) -> dict[str, Heatmap]:
         results = {}

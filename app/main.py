@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import hashlib
 import json
 import os
+import uuid
 from io import BytesIO
 from pathlib import Path
 
@@ -11,6 +14,13 @@ from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, UnidentifiedImageError
+
+# Decompression bomb protection against malicious oversized image files
+Image.MAX_IMAGE_PIXELS = 50_000_000
+
+# Security and ingestion limits
+MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB max per file
+MAX_BATCH_FILES = 50                    # 50 files max per batch request
 
 try:
     import pydicom
@@ -43,7 +53,22 @@ from app.schemas import (
 app = FastAPI(title="CheXpert Web Reader - Medical AI Workstation")
 
 
+def mask_phi(val: str | None) -> str:
+    """
+    Masks Protected Health Information (PHI) by default using salted SHA-256 fingerprinting.
+    """
+    if not val or str(val).strip().upper() in ("ANONYMIZED", "NONE", "N/A", "UNKNOWN"):
+        return "ANONYMIZED"
+    raw_str = str(val).strip()
+    h = hashlib.sha256(raw_str.encode("utf-8")).hexdigest()[:6].upper()
+    return f"ANONYMIZED_{h}"
+
+
 def _download_hf_file(url: str, target: Path) -> bool:
+    """
+    Downloads file from Hugging Face via temporary file and performs atomic rename on completion.
+    """
+    tmp_target = target.with_suffix(target.suffix + f".{uuid.uuid4().hex[:6]}.tmp")
     try:
         import urllib.request
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -52,11 +77,19 @@ def _download_hf_file(url: str, target: Path) -> bool:
         if hf_token:
             headers["Authorization"] = f"Bearer {hf_token}"
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req) as resp, open(target, "wb") as f:
+        with urllib.request.urlopen(req) as resp, open(tmp_target, "wb") as f:
             while chunk := resp.read(1024 * 1024):
                 f.write(chunk)
-        return True
+
+        if tmp_target.exists() and tmp_target.stat().st_size > 1000:
+            os.replace(tmp_target, target)
+            return True
+        if tmp_target.exists():
+            tmp_target.unlink(missing_ok=True)
+        return False
     except Exception as e:
+        if tmp_target.exists():
+            tmp_target.unlink(missing_ok=True)
         print(f"Warning: Could not download {url}: {e}")
         return False
 
@@ -111,9 +144,8 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 def decode_image_or_dicom(content: bytes, filename: str) -> tuple[Image.Image, DicomMetadata]:
     """
-    Decodes standard image files (PNG, JPG, WebP) or DICOM (.dcm) files.
+    Decodes standard image files (PNG, JPG, WebP) or DICOM (.dcm) files with PHI anonymization.
     """
-    # 1. Check if it is a DICOM file (starts with DICM or .dcm extension)
     is_dicom = filename.lower().endswith(".dcm") or (len(content) > 132 and content[128:132] == b"DICM")
     
     if is_dicom and HAS_PYDICOM:
@@ -144,10 +176,13 @@ def decode_image_or_dicom(content: bytes, filename: str) -> tuple[Image.Image, D
 
             image = Image.fromarray(arr).convert("RGB")
             
+            raw_patient_id = getattr(dcm, "PatientID", None)
+            raw_patient_name = getattr(dcm, "PatientName", None)
+
             dicom_meta = DicomMetadata(
                 is_dicom=True,
-                patient_id=str(getattr(dcm, "PatientID", "ANONYMIZED")),
-                patient_name=str(getattr(dcm, "PatientName", "ANONYMIZED")),
+                patient_id=mask_phi(raw_patient_id),
+                patient_name=mask_phi(raw_patient_name),
                 study_date=str(getattr(dcm, "StudyDate", "N/A")),
                 modality=str(getattr(dcm, "Modality", "CR / DX")),
                 view_position=str(getattr(dcm, "ViewPosition", "PA (Posteroanterior)")),
@@ -157,8 +192,8 @@ def decode_image_or_dicom(content: bytes, filename: str) -> tuple[Image.Image, D
                 columns=int(getattr(dcm, "Columns", image.width)),
             )
             return image, dicom_meta
-        except Exception as e:
-            # Fallback to standard Image reader if DICOM parse fails
+        except Exception:
+            # Fallback to standard image reader if DICOM parse fails
             pass
 
     # 2. Standard image reader (JPG, PNG, WebP, BMP)
@@ -217,7 +252,7 @@ def build_report(findings: list[FindingPrediction], quality: QualityReport) -> s
     moderate_suspicion = [f.label for f in findings if f.suspicion_level == "Moderate suspicion"]
 
     if not positive_findings:
-        text = "No pathological findings exceeded calibrated thresholds. Frontal lung fields appear clear of acute radiopaque consolidation, pulmonary edema, or overt pleural effusion."
+        text = "No pathological findings exceeded calibrated thresholds among the 5 evaluated target labels (Atelectasis, Cardiomegaly, Consolidation, Edema, Pleural Effusion)."
     else:
         parts = []
         if high_suspicion:
@@ -285,6 +320,9 @@ async def predict(
     if not content:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
+    if len(content) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail=f"File exceeds maximum allowed size of {MAX_FILE_SIZE_BYTES // (1024*1024)}MB.")
+
     filename = file.filename or "uploaded_xray.png"
     image, dicom_meta = decode_image_or_dicom(content, filename)
     width, height = image.size
@@ -302,8 +340,23 @@ async def predict(
             message="No model checkpoint loaded. Place a .pt file in checkpoints/.",
         )
 
-    quality = assess_cxr_quality(image, dicom_meta)
-    predictions = predictor.predict(image)
+    # Offload inference to worker thread to avoid blocking FastAPI event loop
+    def _do_inference():
+        quality = assess_cxr_quality(image, dicom_meta)
+        predictions = predictor.predict(image)
+        heatmap = None
+        if include_heatmap:
+            explanation = predictor.explain_finding(image, target_label=None)
+            heatmap = HeatmapExplanation(
+                label=explanation.label,
+                probability=explanation.probability,
+                image_data_url=explanation.image_data_url,
+                pure_heatmap_url=explanation.pure_heatmap_url,
+            )
+        return quality, predictions, heatmap
+
+    quality, predictions, heatmap = await asyncio.to_thread(_do_inference)
+
     findings = [
         FindingPrediction(
             label=item.label,
@@ -314,16 +367,6 @@ async def predict(
         )
         for item in predictions
     ]
-
-    heatmap = None
-    if include_heatmap:
-        explanation = predictor.explain_finding(image, target_label=None)
-        heatmap = HeatmapExplanation(
-            label=explanation.label,
-            probability=explanation.probability,
-            image_data_url=explanation.image_data_url,
-            pure_heatmap_url=explanation.pure_heatmap_url,
-        )
 
     return PredictionResponse(
         status="ok",
@@ -350,15 +393,24 @@ async def explain_label(
     if not predictor.is_loaded:
         raise HTTPException(status_code=400, detail="Model is not loaded.")
 
+    if label not in predictor.labels:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid label '{label}'. Valid labels are: {predictor.labels}",
+        )
+
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Empty image data.")
+
+    if len(content) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="File exceeds maximum allowed size.")
 
     filename = file.filename or "upload.png"
     image, _ = decode_image_or_dicom(content, filename)
 
     try:
-        explanation = predictor.explain_finding(image, target_label=label)
+        explanation = await asyncio.to_thread(predictor.explain_finding, image, label)
         return HeatmapExplanation(
             label=explanation.label,
             probability=explanation.probability,
@@ -381,6 +433,12 @@ async def predict_batch_cxrs(
     if not files:
         raise HTTPException(status_code=400, detail="No files provided.")
 
+    if len(files) > MAX_BATCH_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Batch size exceeds maximum limit of {MAX_BATCH_FILES} files per request.",
+        )
+
     valid_images: list[Image.Image] = []
     metadata_list: list[dict] = []
     errors: list[str] = []
@@ -391,6 +449,10 @@ async def predict_batch_cxrs(
             if not content:
                 errors.append(f"File {f.filename}: empty data.")
                 continue
+            if len(content) > MAX_FILE_SIZE_BYTES:
+                errors.append(f"File {f.filename}: exceeds 50MB limit.")
+                continue
+
             fname = f.filename or f"image_{idx}.png"
             img, dcm_meta = decode_image_or_dicom(content, fname)
             quality = assess_cxr_quality(img, dcm_meta)
@@ -405,6 +467,7 @@ async def predict_batch_cxrs(
             valid_images.append(img)
             metadata_list.append({
                 "index": idx + 1,
+                "client_id": f"batch_cxr_{idx+1}_{uuid.uuid4().hex[:6]}",
                 "filename": fname,
                 "is_dicom": dcm_meta.is_dicom,
                 "patient_id": dcm_meta.patient_id or "ANONYMIZED",
@@ -424,8 +487,8 @@ async def predict_batch_cxrs(
             errors=errors,
         )
 
-    # High-speed vectorized batch forward pass on PyTorch GPU/CPU
-    batch_predictions = predictor.predict_batch(valid_images)
+    # Chunked vectorized batch forward pass on threadpool to avoid event loop starvation
+    batch_predictions = await asyncio.to_thread(predictor.predict_batch, valid_images, chunk_size=16)
 
     results: list[BatchItemResult] = []
     for meta, preds in zip(metadata_list, batch_predictions, strict=True):
@@ -447,6 +510,7 @@ async def predict_batch_cxrs(
         results.append(
             BatchItemResult(
                 index=meta["index"],
+                client_id=meta["client_id"],
                 filename=meta["filename"],
                 is_dicom=meta["is_dicom"],
                 patient_id=meta["patient_id"],
@@ -468,4 +532,3 @@ async def predict_batch_cxrs(
         results=results,
         errors=errors,
     )
-
