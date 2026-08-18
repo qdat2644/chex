@@ -1,0 +1,15 @@
+version: "3.8"
+
+services:
+  chexpert-ai:
+    build: .
+    container_name: chexpert_web_workstation
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./checkpoints:/app/checkpoints
+      - ./outputs:/app/outputs
+    environment:
+      - TORCH_HOME=/app/.torch
+      - CHEXPERT_CHECKPOINT=/app/checkpoints/chexpert_convnext_small.pt
+    restart: unless-stopped

@@ -1,21 +1,29 @@
 from __future__ import annotations
 
-import os
 import json
+import os
 from io import BytesIO
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
+import numpy as np
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, UnidentifiedImageError
 
+try:
+    import pydicom
+    from pydicom.pixel_data_handlers.util import apply_voi_lut
+    HAS_PYDICOM = True
+except ImportError:
+    HAS_PYDICOM = False
+
 from app.config import DEFAULT_CHECKPOINT_PATH, DEFAULT_THRESHOLDS_PATH, MODEL_INFO, PROJECT_ROOT
 from app.model import CheXpertPredictor
-from app.schemas import FindingPrediction, HeatmapExplanation, PredictionResponse
+from app.schemas import DicomMetadata, FindingPrediction, HeatmapExplanation, PredictionResponse, QualityReport
 
 
-app = FastAPI(title="CheXpert Web Reader")
+app = FastAPI(title="CheXpert Web Reader - Medical AI Workstation")
 
 
 def resolve_checkpoint_path() -> Path | None:
@@ -54,6 +62,130 @@ predictor = CheXpertPredictor(checkpoint_path, thresholds=thresholds)
 
 static_dir = PROJECT_ROOT / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+
+def decode_image_or_dicom(content: bytes, filename: str) -> tuple[Image.Image, DicomMetadata]:
+    """
+    Decodes standard image files (PNG, JPG, WebP) or DICOM (.dcm) files.
+    """
+    # 1. Check if it is a DICOM file (starts with DICM or .dcm extension)
+    is_dicom = filename.lower().endswith(".dcm") or (len(content) > 132 and content[128:132] == b"DICM")
+    
+    if is_dicom and HAS_PYDICOM:
+        try:
+            dcm = pydicom.dcmread(BytesIO(content), force=True)
+            arr = dcm.pixel_array.astype(float)
+            
+            # Apply VOI LUT (Windowing / Rescaling) if available
+            try:
+                arr = apply_voi_lut(arr, dcm)
+            except Exception:
+                slope = float(getattr(dcm, "RescaleSlope", 1.0))
+                intercept = float(getattr(dcm, "RescaleIntercept", 0.0))
+                arr = (arr * slope) + intercept
+
+            # Invert MONOCHROME1 (where 0 is white and max is black) to MONOCHROME2
+            photometric = str(getattr(dcm, "PhotometricInterpretation", "MONOCHROME2")).upper()
+            if "MONOCHROME1" in photometric:
+                arr = np.amax(arr) - arr
+
+            # Normalize to 0-255 uint8
+            arr_min = float(np.min(arr))
+            arr_max = float(np.max(arr))
+            if arr_max > arr_min:
+                arr = ((arr - arr_min) / (arr_max - arr_min) * 255.0).astype(np.uint8)
+            else:
+                arr = np.zeros(arr.shape, dtype=np.uint8)
+
+            image = Image.fromarray(arr).convert("RGB")
+            
+            dicom_meta = DicomMetadata(
+                is_dicom=True,
+                patient_id=str(getattr(dcm, "PatientID", "ANONYMIZED")),
+                patient_name=str(getattr(dcm, "PatientName", "ANONYMIZED")),
+                study_date=str(getattr(dcm, "StudyDate", "N/A")),
+                modality=str(getattr(dcm, "Modality", "CR / DX")),
+                view_position=str(getattr(dcm, "ViewPosition", "PA (Posteroanterior)")),
+                body_part=str(getattr(dcm, "BodyPartExamined", "CHEST")),
+                photometric=photometric,
+                rows=int(getattr(dcm, "Rows", image.height)),
+                columns=int(getattr(dcm, "Columns", image.width)),
+            )
+            return image, dicom_meta
+        except Exception as e:
+            # Fallback to standard Image reader if DICOM parse fails
+            pass
+
+    # 2. Standard image reader (JPG, PNG, WebP, BMP)
+    try:
+        image = Image.open(BytesIO(content))
+        image.load()
+        image = image.convert("RGB")
+        return image, DicomMetadata(is_dicom=False)
+    except UnidentifiedImageError as exc:
+        raise HTTPException(status_code=400, detail="Unsupported or invalid medical image format.") from exc
+
+
+def assess_cxr_quality(image: Image.Image, dicom_meta: DicomMetadata) -> QualityReport:
+    """
+    Performs clinical validation checks to ensure the image is a valid Frontal Chest X-ray.
+    """
+    warnings = []
+    quality_score = 1.0
+
+    # DICOM check
+    if dicom_meta.is_dicom:
+        if dicom_meta.body_part and "CHEST" not in dicom_meta.body_part.upper():
+            warnings.append(f"DICOM BodyPart is '{dicom_meta.body_part}', not CHEST.")
+            quality_score -= 0.3
+        if dicom_meta.view_position and "LATERAL" in dicom_meta.view_position.upper():
+            warnings.append("DICOM View is LATERAL. This model is trained on FRONTAL (PA/AP) views only.")
+            quality_score -= 0.4
+
+    # Aspect ratio check (Frontal CXR typically 1:1 to 4:5)
+    w, h = image.size
+    ratio = w / max(1, h)
+    if ratio < 0.5 or ratio > 2.0:
+        warnings.append(f"Unusual aspect ratio ({ratio:.2f}). Please ensure image is cropped to the thorax.")
+        quality_score -= 0.2
+
+    # Color saturation check (X-rays are monochrome/grayscale)
+    np_img = np.asarray(image, dtype=np.float32)
+    std_channels = np.std(np_img, axis=-1)
+    mean_std = float(np.mean(std_channels))
+    if mean_std > 18.0:
+        warnings.append("Image has noticeable color tint/saturation. Ensure this is a raw chest radiograph.")
+        quality_score -= 0.25
+
+    is_likely_frontal = quality_score >= 0.5
+    return QualityReport(
+        is_likely_frontal_cxr=is_likely_frontal,
+        quality_score=float(np.clip(quality_score, 0.0, 1.0)),
+        suggested_view="Frontal (PA/AP)" if is_likely_frontal else "Non-Frontal / Advisory Warning",
+        warnings=warnings,
+    )
+
+
+def build_report(findings: list[FindingPrediction], quality: QualityReport) -> str:
+    positive_findings = [f for f in findings if f.positive]
+    high_suspicion = [f.label for f in findings if f.suspicion_level == "High suspicion"]
+    moderate_suspicion = [f.label for f in findings if f.suspicion_level == "Moderate suspicion"]
+
+    if not positive_findings:
+        text = "No pathological findings exceeded calibrated thresholds. Frontal lung fields appear clear of acute radiopaque consolidation, pulmonary edema, or overt pleural effusion."
+    else:
+        parts = []
+        if high_suspicion:
+            parts.append(f"High suspicion of {', '.join(high_suspicion)}")
+        if moderate_suspicion:
+            parts.append(f"moderate suspicion of {', '.join(moderate_suspicion)}")
+        findings_summary = " and ".join(parts)
+        text = f"Automated analysis indicates {findings_summary}. Clinical correlation and specialist radiologist overread are recommended."
+
+    if quality.warnings:
+        text += f" (Note: {'; '.join(quality.warnings)})"
+
+    return text
 
 
 def get_current_model_info() -> dict[str, object]:
@@ -108,26 +240,24 @@ async def predict(
     if not content:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
-    try:
-        image = Image.open(BytesIO(content))
-        image.load()
-    except UnidentifiedImageError as exc:
-        raise HTTPException(status_code=400, detail="Upload a valid image file.") from exc
-
-    image = image.convert("RGB")
+    filename = file.filename or "uploaded_xray.png"
+    image, dicom_meta = decode_image_or_dicom(content, filename)
     width, height = image.size
 
     if not predictor.is_loaded:
         return PredictionResponse(
             status="model_not_loaded",
-            filename=file.filename or "upload",
+            filename=filename,
             width=width,
             height=height,
             mode=image.mode,
             findings=[],
-            message="Set CHEXPERT_CHECKPOINT to a trained checkpoint before clinical-style inference.",
+            quality=QualityReport(),
+            dicom=dicom_meta,
+            message="No model checkpoint loaded. Place a .pt file in checkpoints/.",
         )
 
+    quality = assess_cxr_quality(image, dicom_meta)
     predictions = predictor.predict(image)
     findings = [
         FindingPrediction(
@@ -135,41 +265,60 @@ async def predict(
             probability=item.probability,
             positive=item.positive,
             threshold=item.threshold,
+            suspicion_level=item.suspicion_level,
         )
         for item in predictions
     ]
+
     heatmap = None
     if include_heatmap:
-        explanation = predictor.explain_top_finding(image)
+        explanation = predictor.explain_finding(image, target_label=None)
         heatmap = HeatmapExplanation(
             label=explanation.label,
             probability=explanation.probability,
             image_data_url=explanation.image_data_url,
+            pure_heatmap_url=explanation.pure_heatmap_url,
         )
 
     return PredictionResponse(
         status="ok",
-        filename=file.filename or "upload",
+        filename=filename,
         width=width,
         height=height,
         mode=image.mode,
         findings=findings,
-        report=build_report(findings),
+        report=build_report(findings, quality),
         heatmap=heatmap,
+        quality=quality,
+        dicom=dicom_meta,
     )
 
 
-def build_report(findings: list[FindingPrediction]) -> str:
-    if not findings:
-        return "No model findings were generated."
+@app.post("/api/explain", response_model=HeatmapExplanation)
+async def explain_label(
+    file: UploadFile = File(...),
+    label: str = Form(...),
+) -> HeatmapExplanation:
+    """
+    On-demand interactive Grad-CAM generation for ANY specific finding label.
+    """
+    if not predictor.is_loaded:
+        raise HTTPException(status_code=400, detail="Model is not loaded.")
 
-    sorted_findings = sorted(findings, key=lambda item: item.probability, reverse=True)
-    if not any(item.threshold is not None for item in sorted_findings):
-        top = sorted_findings[0]
-        return f"Threshold report is not loaded. Highest probability: {top.label} ({top.probability:.0%})."
-    positives = [item for item in sorted_findings if item.positive]
-    top = sorted_findings[0]
-    if positives:
-        labels = ", ".join(f"{item.label} ({item.probability:.0%})" for item in positives[:3])
-        return f"Model flagged: {labels}. Highest probability: {top.label} ({top.probability:.0%})."
-    return f"No findings crossed the threshold. Highest probability: {top.label} ({top.probability:.0%})."
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty image data.")
+
+    filename = file.filename or "upload.png"
+    image, _ = decode_image_or_dicom(content, filename)
+
+    try:
+        explanation = predictor.explain_finding(image, target_label=label)
+        return HeatmapExplanation(
+            label=explanation.label,
+            probability=explanation.probability,
+            image_data_url=explanation.image_data_url,
+            pure_heatmap_url=explanation.pure_heatmap_url,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Grad-CAM generation failed: {e}")

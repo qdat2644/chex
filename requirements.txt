@@ -9,3 +9,4 @@ torch>=2.5
 torchvision>=0.20
 httpx>=0.28
 tqdm>=4.66
+pydicom>=2.4.0

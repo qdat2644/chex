@@ -1,0 +1,12 @@
+.git
+.venv
+tools/
+.torch/
+.uv_cache/
+archive/
+data/
+*.bat
+*.log
+__pycache__/
+*.pyc
+.pytest_cache/

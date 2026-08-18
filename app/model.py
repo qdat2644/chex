@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import pickle
+import urllib.request
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -12,7 +13,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision import models, transforms
 
-from app.config import DEFAULT_IMAGE_SIZE, DEFAULT_LABELS, DEFAULT_THRESHOLD
+from app.config import DEFAULT_IMAGE_SIZE, DEFAULT_LABELS, DEFAULT_THRESHOLD, PROJECT_ROOT
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,7 @@ class Prediction:
     probability: float
     positive: bool
     threshold: float | None = None
+    suspicion_level: str = "Low suspicion"
 
 
 @dataclass(frozen=True)
@@ -28,6 +30,7 @@ class Heatmap:
     label: str
     probability: float
     image_data_url: str
+    pure_heatmap_url: str | None = None
 
 
 def build_model(arch: str, num_labels: int, pretrained: bool = False) -> torch.nn.Module:
@@ -53,7 +56,6 @@ def build_model(arch: str, num_labels: int, pretrained: bool = False) -> torch.n
         in_features = model.fc.in_features
         model.fc = torch.nn.Linear(in_features, num_labels)
     else:
-        # Default fallback to DenseNet121
         weights = models.DenseNet121_Weights.IMAGENET1K_V1 if pretrained else None
         model = models.densenet121(weights=weights)
         in_features = model.classifier.in_features
@@ -92,7 +94,7 @@ class CheXpertPredictor:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model: torch.nn.Module | None = None
         self.metadata: dict[str, object] = {}
-        self.architecture = "DenseNet121"
+        self.architecture = "ConvNeXt-Small"
         self._update_transforms(image_size)
 
         if checkpoint_path:
@@ -120,10 +122,14 @@ class CheXpertPredictor:
         return self.model is not None
 
     def load(self, checkpoint_path: str | Path) -> None:
+        path = Path(checkpoint_path)
+        if not path.exists():
+            return
+
         try:
-            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+            checkpoint = torch.load(path, map_location=self.device, weights_only=True)
         except (TypeError, pickle.UnpicklingError):
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            checkpoint = torch.load(path, map_location=self.device)
 
         labels = checkpoint.get("labels") if isinstance(checkpoint, dict) else None
         if labels:
@@ -131,7 +137,7 @@ class CheXpertPredictor:
         metadata = checkpoint.get("metadata") if isinstance(checkpoint, dict) else None
         if isinstance(metadata, dict):
             self.metadata = metadata
-            self.architecture = str(metadata.get("architecture", "DenseNet121"))
+            self.architecture = str(metadata.get("architecture", "ConvNeXt-Small"))
             ckpt_size = metadata.get("image_size")
             if ckpt_size and isinstance(ckpt_size, int):
                 self._update_transforms(ckpt_size)
@@ -154,31 +160,44 @@ class CheXpertPredictor:
 
         results: list[Prediction] = []
         for label, probability in zip(self.labels, probabilities, strict=True):
+            prob = float(probability)
             threshold = self.thresholds.get(label)
-            is_positive = bool(threshold is not None and float(probability) >= threshold)
+            is_positive = bool(threshold is not None and prob >= threshold)
+
+            # Determine clinical suspicion level
+            if threshold is not None:
+                if prob >= min(1.0, threshold + 0.15):
+                    suspicion = "High suspicion"
+                elif prob >= threshold:
+                    suspicion = "Moderate suspicion"
+                else:
+                    suspicion = "Low suspicion"
+            else:
+                suspicion = "Probability only"
+
             results.append(
                 Prediction(
                     label=label,
-                    probability=float(probability),
+                    probability=prob,
                     positive=is_positive,
                     threshold=threshold,
+                    suspicion_level=suspicion,
                 )
             )
         return results
 
-    def explain_top_finding(self, image: Image.Image) -> Heatmap:
+    def explain_finding(self, image: Image.Image, target_label: str | None = None) -> Heatmap:
         if self.model is None:
             raise RuntimeError("Model checkpoint is not loaded.")
 
         original = image.convert("RGB")
         tensor = self.transform(original).unsqueeze(0).to(self.device)
 
-        # Hook-based Grad-CAM works across any architecture
         target_layer = get_target_layer_for_gradcam(self.model, self.architecture)
         activations_list = []
         gradients_list = []
 
-        def forward_hook(module, input, output):
+        def forward_hook(module, inp, output):
             activations_list.append(output)
 
         def backward_hook(module, grad_in, grad_out):
@@ -190,7 +209,15 @@ class CheXpertPredictor:
         self.model.zero_grad(set_to_none=True)
         logits = self.model(tensor)
         probabilities = torch.sigmoid(logits).squeeze(0)
-        label_index = int(torch.argmax(probabilities).detach().cpu())
+
+        # Select target label index
+        if target_label and target_label in self.labels:
+            label_index = self.labels.index(target_label)
+        else:
+            label_index = int(torch.argmax(probabilities).detach().cpu())
+
+        label_name = self.labels[label_index]
+        label_prob = float(probabilities[label_index].detach().cpu())
 
         logits[0, label_index].backward()
 
@@ -204,14 +231,23 @@ class CheXpertPredictor:
         gradients = gradients_list[0].detach()[0]
         weights = gradients.mean(dim=(1, 2))
         cam = torch.relu((weights[:, None, None] * activations).sum(dim=0))
-        cam = self._normalize_cam(cam)
-        overlay = self._render_overlay(original, cam)
+        cam_norm = self._normalize_cam(cam)
+
+        overlay = self._render_overlay(original, cam_norm)
+        pure_heat = self._render_pure_heatmap_rgba(original.size, cam_norm)
 
         return Heatmap(
-            label=self.labels[label_index],
-            probability=float(probabilities[label_index].detach().cpu()),
+            label=label_name,
+            probability=label_prob,
             image_data_url=self._encode_png_data_url(overlay),
+            pure_heatmap_url=self._encode_png_data_url(pure_heat),
         )
+
+    def explain_all_findings(self, image: Image.Image) -> dict[str, Heatmap]:
+        results = {}
+        for label in self.labels:
+            results[label] = self.explain_finding(image, target_label=label)
+        return results
 
     @staticmethod
     def _normalize_cam(cam: torch.Tensor) -> np.ndarray:
@@ -231,12 +267,32 @@ class CheXpertPredictor:
         heat = np.asarray(heatmap, dtype=np.float32) / 255.0
         base = np.asarray(image.convert("RGB"), dtype=np.float32)
 
+        # Standard red-yellow clinical thermal gradient
         color = np.zeros_like(base)
         color[..., 0] = 255.0
-        color[..., 1] = 190.0 * heat
-        alpha = (0.42 * heat)[..., None]
+        color[..., 1] = 200.0 * heat
+        color[..., 2] = 20.0 * (1.0 - heat)
+        alpha = (0.45 * heat)[..., None]
         overlay = np.clip((base * (1.0 - alpha)) + (color * alpha), 0, 255).astype(np.uint8)
         return Image.fromarray(overlay, mode="RGB")
+
+    @staticmethod
+    def _render_pure_heatmap_rgba(size: tuple[int, int], cam: np.ndarray) -> Image.Image:
+        heatmap = Image.fromarray(np.uint8(cam * 255), mode="L").resize(
+            size,
+            resample=Image.Resampling.BILINEAR,
+        )
+        heat = np.asarray(heatmap, dtype=np.float32) / 255.0
+        h, w = heat.shape
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+
+        # Vibrant thermal colormap: Blue -> Cyan -> Yellow -> Red
+        rgba[..., 0] = np.clip(255.0 * np.sin(heat * np.pi / 2), 0, 255).astype(np.uint8)
+        rgba[..., 1] = np.clip(255.0 * np.sin(heat * np.pi), 0, 255).astype(np.uint8)
+        rgba[..., 2] = np.clip(255.0 * np.cos(heat * np.pi / 2), 0, 255).astype(np.uint8)
+        rgba[..., 3] = np.clip(255.0 * (heat ** 1.3), 0, 255).astype(np.uint8)
+
+        return Image.fromarray(rgba, mode="RGBA")
 
     @staticmethod
     def _encode_png_data_url(image: Image.Image) -> str:

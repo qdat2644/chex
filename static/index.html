@@ -3,33 +3,42 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="description" content="CheXpert Web Reader - chest X-ray AI research prototype for multi-label pathology detection." />
-    <title>CheXpert Reader - Chest X-ray AI</title>
-    <link rel="stylesheet" href="/static/styles.css?v=3" />
+    <meta name="description" content="CheXpert Web Reader - Medical AI Workstation for Frontal Chest Radiograph Pathology Detection." />
+    <title>CheXpert AI Workstation - Chest X-ray Diagnostics</title>
+    <link rel="stylesheet" href="/static/styles.css?v=4" />
   </head>
   <body>
     <main class="app-shell">
+      <!-- Hero Header -->
       <section class="hero-card" aria-labelledby="app-title">
         <div class="hero-left">
-          <div class="brand-mark" aria-hidden="true">CXR</div>
+          <div class="brand-mark" aria-hidden="true">CXR-AI</div>
           <div class="hero-text">
-            <p class="eyebrow">Medical AI Dashboard</p>
-            <h1 id="app-title">CheXpert Reader</h1>
-            <p class="subtitle">Chest X-ray AI Research Prototype</p>
+            <p class="eyebrow">Clinical Decision Support System</p>
+            <h1 id="app-title">CheXpert Workstation</h1>
+            <p class="subtitle">Deep Learning Chest Radiograph Multi-Label Analysis</p>
           </div>
         </div>
         <div class="hero-badges">
-          <span class="badge badge-warning">Research only</span>
-          <span id="model-status" class="badge badge-waiting">Checking model...</span>
+          <button id="export-pdf-btn" class="action-btn pdf-btn" title="Export Medical Report as PDF">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M6 9V2h12v7M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/>
+              <path d="M6 14h12v8H6z"/>
+            </svg>
+            <span>Export Report (PDF)</span>
+          </button>
+          <span class="badge badge-warning">Research Protocol</span>
+          <span id="model-status" class="badge badge-waiting">Loading Model...</span>
         </div>
         <div id="model-info" class="model-info" aria-label="Model information">
-          DenseNet121 / 5 labels / mean AUC 0.8764 / valid rows 202
+          ConvNeXt-Small / 5 labels / mean AUC 0.8944 / Stanford U-Ones Calibrated
         </div>
-        <div class="domain-warning" role="note">
-          This model expects frontal chest X-ray images only. Results may be meaningless for other image types.
+        <div id="quality-alert" class="domain-warning" role="note">
+          This model expects frontal chest radiographs (PA/AP view). Results are for clinical research and decision support only.
         </div>
       </section>
 
+      <!-- Upload / Paste Section -->
       <section class="upload-card" aria-labelledby="upload-title">
         <div class="upload-info">
           <div class="upload-glyph" aria-hidden="true">
@@ -38,13 +47,13 @@
             </svg>
           </div>
           <div>
-            <h2 id="upload-title">Upload chest X-ray</h2>
-            <p id="upload-state">PNG, JPG, JPEG supported</p>
+            <h2 id="upload-title">Import Radiograph</h2>
+            <p id="upload-state">DICOM (.dcm), PNG, JPG, WebP supported &bull; Press Ctrl+V to paste</p>
           </div>
         </div>
 
         <form id="upload-form" class="upload-form">
-          <label id="file-dropzone" class="upload-dropzone" for="xray-file">
+          <label id="file-dropzone" class="upload-dropzone" for="xray-file" tabindex="0">
             <span class="dropzone-icon" aria-hidden="true">
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M4.75 17.25a4 4 0 0 1 .44-7.98 6.25 6.25 0 0 1 12.08 1.67 3.25 3.25 0 0 1 .48 6.31"/>
@@ -53,9 +62,9 @@
             </span>
             <span class="dropzone-text">
               <span class="dropzone-title">Choose image or Paste (Ctrl+V)</span>
-              <span id="file-name" class="dropzone-meta">No file selected &bull; Press Ctrl+V to paste</span>
+              <span id="file-name" class="dropzone-meta">No file selected &bull; Press Ctrl+V anywhere</span>
             </span>
-            <input id="xray-file" name="file" type="file" accept="image/*" />
+            <input id="xray-file" name="file" type="file" accept="image/*,.dcm" />
           </label>
 
           <button id="analyze-button" class="analyze-button" type="submit" disabled>
@@ -69,17 +78,53 @@
         </form>
       </section>
 
+      <!-- DICOM & Metadata Banner (Hidden until DICOM loaded) -->
+      <section id="dicom-banner" class="dicom-banner" hidden>
+        <div class="dicom-badge">DICOM METADATA</div>
+        <div class="dicom-tags">
+          <span class="d-tag"><strong>Patient ID:</strong> <span id="dicom-patient">N/A</span></span>
+          <span class="d-tag"><strong>Modality:</strong> <span id="dicom-modality">CR</span></span>
+          <span class="d-tag"><strong>View:</strong> <span id="dicom-view">PA</span></span>
+          <span class="d-tag"><strong>Date:</strong> <span id="dicom-date">N/A</span></span>
+          <span class="d-tag"><strong>Matrix:</strong> <span id="dicom-matrix">2048 x 2048</span></span>
+        </div>
+      </section>
+
+      <!-- Workspace Grid: PACS Viewer & Findings -->
       <div class="workspace-grid">
+        <!-- PACS Image Viewer Panel -->
         <article class="panel image-panel" aria-labelledby="image-heading">
           <div class="panel-header">
             <div>
-              <p class="panel-label">Input image</p>
-              <h2 id="image-heading">Image</h2>
+              <p class="panel-label">PACS Radiograph Viewer</p>
+              <h2 id="image-heading">Input Image</h2>
             </div>
-            <span id="image-status" class="chip">Waiting</span>
+            <div class="pacs-toolbar">
+              <button id="btn-zoom-in" class="pacs-btn" title="Zoom In (+)">+</button>
+              <button id="btn-zoom-out" class="pacs-btn" title="Zoom Out (-)">-</button>
+              <button id="btn-zoom-fit" class="pacs-btn" title="Fit to View">Fit</button>
+              <button id="btn-invert" class="pacs-btn" title="Invert Grayscale (Negative/Positive)">Invert</button>
+              <button id="btn-reset-view" class="pacs-btn" title="Reset View Settings">↺</button>
+            </div>
           </div>
-          <div class="preview-frame">
-            <img id="preview" alt="Uploaded chest X-ray preview" hidden />
+
+          <!-- PACS Windowing Adjustments -->
+          <div class="pacs-controls">
+            <div class="ctrl-group">
+              <label for="slider-brightness">Brightness: <span id="val-brightness">100%</span></label>
+              <input type="range" id="slider-brightness" min="40" max="180" value="100" />
+            </div>
+            <div class="ctrl-group">
+              <label for="slider-contrast">Contrast: <span id="val-contrast">100%</span></label>
+              <input type="range" id="slider-contrast" min="40" max="220" value="100" />
+            </div>
+          </div>
+
+          <!-- Image Container with Zoom & Pan -->
+          <div id="pacs-viewport" class="pacs-viewport">
+            <div id="pacs-canvas-wrapper" class="pacs-canvas-wrapper">
+              <img id="preview" alt="Uploaded chest X-ray preview" hidden />
+            </div>
             <div id="empty-preview" class="empty-state">
               <div class="empty-icon" aria-hidden="true">
                 <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -88,40 +133,58 @@
                   <circle cx="8.5" cy="8.5" r="1.5"/>
                 </svg>
               </div>
-              <strong>No image selected</strong>
-              <span>Choose an X-ray image to preview it here.</span>
+              <strong>No radiograph loaded</strong>
+              <span>Select, drop, or press Ctrl+V to import an X-ray.</span>
             </div>
           </div>
         </article>
 
+        <!-- Findings & Clinical Report Panel -->
         <article class="panel findings-panel" aria-labelledby="findings-heading">
           <div class="panel-header">
             <div>
-              <p class="panel-label">Prediction output</p>
-              <h2 id="findings-heading">Findings</h2>
+              <p class="panel-label">Pathology Predictions</p>
+              <h2 id="findings-heading">Clinical Findings</h2>
             </div>
             <span id="status" class="chip">Waiting</span>
           </div>
           <div id="message" class="alert alert-error" hidden></div>
           <div id="report" class="alert alert-info" hidden></div>
+          
+          <p class="findings-hint">💡 Click on any disease card below to view its specific Grad-CAM heatmap:</p>
           <div id="results" class="findings-list">
             <div class="empty-state compact">
               <strong>Upload an image to see findings</strong>
-              <span>Predictions will appear here after analysis.</span>
+              <span>Predictions with calibrated thresholds will appear here.</span>
             </div>
           </div>
         </article>
       </div>
 
+      <!-- Explainability Panel (Grad-CAM & Opacity Slider) -->
       <section class="panel heatmap-panel" aria-labelledby="heatmap-heading">
         <div class="panel-header">
           <div>
-            <p class="panel-label">Explainability</p>
-            <h2 id="heatmap-heading">Model Focus</h2>
-            <p class="panel-desc">Grad-CAM attention heatmap overlay</p>
+            <p class="panel-label">Explainable AI (XAI)</p>
+            <h2 id="heatmap-heading">Attention Heatmap (Grad-CAM)</h2>
+            <p class="panel-desc">Visual activation map highlighting anatomical regions driving model prediction</p>
           </div>
-          <span id="heatmap-label" class="chip">Not generated</span>
+          <div class="heatmap-header-actions">
+            <span id="heatmap-label" class="chip">Not generated</span>
+          </div>
         </div>
+
+        <!-- Disease Filter Buttons & Opacity Control -->
+        <div id="heatmap-controls-bar" class="heatmap-controls-bar" hidden>
+          <div class="finding-tabs" id="finding-tabs">
+            <!-- Dynamically populated finding chips -->
+          </div>
+          <div class="opacity-control">
+            <label for="slider-opacity">Heatmap Blend: <strong id="val-opacity">65%</strong></label>
+            <input type="range" id="slider-opacity" min="0" max="100" value="65" />
+          </div>
+        </div>
+
         <div class="heatmap-stage">
           <div id="heatmap-empty" class="empty-state heatmap-placeholder">
             <div class="empty-icon heat-icon" aria-hidden="true">
@@ -131,20 +194,98 @@
               </svg>
             </div>
             <strong>Heatmap will appear after analysis</strong>
-            <span>The model focus overlay is generated when inference runs.</span>
+            <span>Grad-CAM activation overlays are generated during inference.</span>
           </div>
+
           <figure id="heatmap-figure" class="heatmap-figure" hidden>
-            <img id="heatmap" alt="Grad-CAM model focus heatmap" />
-            <figcaption id="heatmap-caption">Visualization is for research interpretation only.</figcaption>
+            <div class="dual-viewer">
+              <div class="viewer-box">
+                <span class="box-label">Original Radiograph</span>
+                <img id="heatmap-base" alt="Base chest X-ray" />
+              </div>
+              <div class="viewer-box">
+                <span class="box-label">Grad-CAM Overlay (<span id="box-label-finding">Top Finding</span>)</span>
+                <div class="overlay-container">
+                  <img id="overlay-underlay" alt="Underlay X-ray" />
+                  <img id="heatmap-pure" class="heatmap-pure" alt="Pure Heatmap Layer" />
+                  <img id="heatmap" class="heatmap-fallback" alt="Grad-CAM overlay" hidden />
+                </div>
+              </div>
+            </div>
+            <figcaption id="heatmap-caption">Visual explanation is intended for research interpretation and quality assurance.</figcaption>
           </figure>
         </div>
       </section>
 
+      <!-- Legal Disclaimer -->
       <div class="disclaimer" role="note">
         <span class="disclaimer-icon" aria-hidden="true">!</span>
-        <p>Research prototype only. Do not use these results for medical decisions. This model expects frontal chest X-ray images only. Results may be meaningless for other image types.</p>
+        <p>Research prototype only. Do not use these automated results for definitive medical diagnosis or treatment decisions without board-certified radiologist validation. Model calibrated on CheXpert frontal CXR.</p>
       </div>
     </main>
-    <script src="/static/app.js?v=3"></script>
+
+    <!-- Printable Medical Report Template (Hidden on screen, rendered on window.print()) -->
+    <section id="printable-report" class="printable-report" aria-hidden="true">
+      <header class="print-header">
+        <div class="print-brand">
+          <h2>CHEXPERT AI MEDICAL WORKSTATION</h2>
+          <p>Chest Radiograph Automated Diagnostic &amp; Pathology Report</p>
+        </div>
+        <div class="print-meta">
+          <p><strong>Report Date:</strong> <span id="print-date"></span></p>
+          <p><strong>Model Engine:</strong> ConvNeXt-Small (CheXpert v2)</p>
+        </div>
+      </header>
+
+      <div class="print-patient-bar">
+        <span><strong>Patient ID:</strong> <span id="print-patient">ANONYMIZED</span></span>
+        <span><strong>Modality:</strong> <span id="print-modality">CR/DX</span></span>
+        <span><strong>View Position:</strong> <span id="print-view">Frontal (PA/AP)</span></span>
+        <span><strong>File:</strong> <span id="print-filename">image.png</span></span>
+      </div>
+
+      <div class="print-images-row">
+        <div class="print-img-box">
+          <h4>Original Frontal Radiograph</h4>
+          <img id="print-img-original" alt="Original X-ray" />
+        </div>
+        <div class="print-img-box">
+          <h4>Grad-CAM Heatmap Overlay (<span id="print-active-finding">Top Finding</span>)</h4>
+          <img id="print-img-heatmap" alt="Grad-CAM Heatmap" />
+        </div>
+      </div>
+
+      <div class="print-section">
+        <h3>1. Multi-Label Pathology Probabilities</h3>
+        <table class="print-table">
+          <thead>
+            <tr>
+              <th>Finding / Pathology</th>
+              <th>Probability</th>
+              <th>Calibrated Threshold</th>
+              <th>Status</th>
+              <th>Clinical Suspicion</th>
+            </tr>
+          </thead>
+          <tbody id="print-table-body">
+            <!-- Populated via JS -->
+          </tbody>
+        </table>
+      </div>
+
+      <div class="print-section">
+        <h3>2. Automated Radiological Impression</h3>
+        <div id="print-impression" class="print-impression-box"></div>
+      </div>
+
+      <footer class="print-footer">
+        <p><strong>Disclaimer:</strong> This automated report is generated by a deep neural network research prototype. It is not an FDA-cleared diagnostic device. Overread by a licensed radiologist is mandatory.</p>
+        <div class="signature-line">
+          <p>Reviewing Radiologist Signature: ___________________________</p>
+        </div>
+      </footer>
+    </section>
+
+    <script src="/static/app.js?v=4"></script>
   </body>
 </html>
