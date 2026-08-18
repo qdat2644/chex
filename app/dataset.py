@@ -7,7 +7,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from app.config import DEFAULT_LABELS
+from app.config import DEFAULT_LABELS, STANFORD_U_ONES_LABELS
 
 
 class CheXpertDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
@@ -17,7 +17,7 @@ class CheXpertDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         data_root: str | Path,
         transform,
         labels: list[str] | None = None,
-        uncertain_policy: str = "zero",
+        uncertain_policy: str = "u_ones_zeros",
         view: str = "all",
     ) -> None:
         self.csv_path = Path(csv_path)
@@ -49,7 +49,7 @@ class CheXpertDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         image_path = self._resolve_image_path(row["Path"])
         image = Image.open(image_path).convert("RGB")
         target = torch.tensor(
-            [self._normalize_label(row[label]) for label in self.labels],
+            [self._normalize_label(row[label], label) for label in self.labels],
             dtype=torch.float32,
         )
         return self.transform(image), target
@@ -71,14 +71,16 @@ class CheXpertDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
 
         return self.data_root / path
 
-    def _normalize_label(self, value) -> float:
+    def _normalize_label(self, value, label_name: str = "") -> float:
         if pd.isna(value):
             return 0.0
         value = float(value)
         if value == -1.0:
             if self.uncertain_policy == "one":
                 return 1.0
-            if self.uncertain_policy == "ignore":
-                return 0.0
+            if self.uncertain_policy in ("u_ones_zeros", "stanford"):
+                return 1.0 if label_name in STANFORD_U_ONES_LABELS else 0.0
+            if self.uncertain_policy == "smooth":
+                return 0.6
             return 0.0
         return 1.0 if value == 1.0 else 0.0

@@ -8,38 +8,108 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
-from torchvision import models, transforms
+from torchvision import transforms
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.config import DEFAULT_IMAGE_SIZE, resolve_label_preset
+from app.config import DEFAULT_IMAGE_SIZE, SUPPORTED_ARCHITECTURES, resolve_label_preset
 from app.dataset import CheXpertDataset
+from app.model import build_model
+
+
+class AsymmetricLoss(torch.nn.Module):
+    """
+    Asymmetric Loss for Multi-Label Classification.
+    Reduces the impact of easy negative examples and emphasizes hard positive examples.
+    """
+    def __init__(self, gamma_neg: float = 4.0, gamma_pos: float = 1.0, clip: float = 0.05, eps: float = 1e-8):
+        super().__init__()
+        self.gamma_neg = gamma_neg
+        self.gamma_pos = gamma_pos
+        self.clip = clip
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        xs_pos = torch.sigmoid(x)
+        xs_neg = 1.0 - xs_pos
+
+        if self.clip is not None and self.clip > 0:
+            xs_neg = (xs_neg + self.clip).clamp(max=1.0)
+
+        los_pos = y * torch.log(xs_pos.clamp(min=self.eps))
+        los_neg = (1.0 - y) * torch.log(xs_neg.clamp(min=self.eps))
+        loss = los_pos + los_neg
+
+        if self.gamma_neg > 0 or self.gamma_pos > 0:
+            pt0 = xs_pos * y
+            pt1 = xs_neg * (1.0 - y)
+            pt = pt0 + pt1
+            one_sided_gamma = self.gamma_pos * y + self.gamma_neg * (1.0 - y)
+            one_sided_w = torch.pow(1.0 - pt, one_sided_gamma)
+            loss = loss * one_sided_w
+
+        return -loss.sum() / max(1, x.size(0))
+
+
+class FocalLoss(torch.nn.Module):
+    """
+    Multi-label Focal Loss.
+    """
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        pt = torch.exp(-bce_loss)
+        focal_loss = self.alpha * (1.0 - pt) ** self.gamma * bce_loss
+        return focal_loss.mean()
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a CheXpert multi-label classifier.")
+    parser = argparse.ArgumentParser(description="Train an optimized CheXpert multi-label classifier.")
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--train-csv", type=Path)
     parser.add_argument("--valid-csv", type=Path)
     parser.add_argument("--valid-split", type=float, default=0.1)
     parser.add_argument("--limit", type=int, help="Use a small subset for quick smoke tests.")
-    parser.add_argument("--output", type=Path, default=Path("checkpoints/chexpert_densenet121.pt"))
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--output", type=Path, default=Path("checkpoints/chexpert_model.pt"))
+    parser.add_argument(
+        "--arch",
+        choices=SUPPORTED_ARCHITECTURES,
+        default="densenet121",
+        help="Backbone architecture: densenet121, convnext_small, efficientnet_v2_m, resnet50",
+    )
+    parser.add_argument(
+        "--loss",
+        choices=["asl", "focal", "bce"],
+        default="bce",
+        help="Loss function: asl (Asymmetric Loss), focal (Focal Loss), bce (Binary Cross Entropy)",
+    )
+    parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE, help="Input resolution (e.g. 224, 384)")
+    parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--uncertain-policy", choices=["zero", "one", "ignore"], default="zero")
+    parser.add_argument(
+        "--uncertain-policy",
+        choices=["u_ones_zeros", "smooth", "zero", "one", "ignore"],
+        default="u_ones_zeros",
+        help="Policy for -1 uncertainty labels (u_ones_zeros=Stanford baseline, smooth=0.6, zero=0, one=1)",
+    )
     parser.add_argument("--label-preset", choices=["competition", "all"], default="competition")
     parser.add_argument("--view", choices=["frontal", "lateral", "all"], default="frontal")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--pos-weight", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--pretrained", action="store_true", help="Initialize DenseNet121 with ImageNet weights.")
+    parser.add_argument("--pretrained", action="store_true", help="Initialize backbone with ImageNet pretrained weights.")
     parser.add_argument(
         "--scheduler",
         choices=["cosine", "plateau", "none"],
@@ -49,21 +119,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_model(num_labels: int, pretrained: bool) -> torch.nn.Module:
-    weights = models.DenseNet121_Weights.IMAGENET1K_V1 if pretrained else None
-    model = models.densenet121(weights=weights)
-    in_features = model.classifier.in_features
-    model.classifier = torch.nn.Linear(in_features, num_labels)
-    return model
-
-
-def build_transforms(train: bool) -> transforms.Compose:
+def build_transforms(train: bool, image_size: int = DEFAULT_IMAGE_SIZE) -> transforms.Compose:
     steps = [
-        transforms.Resize((DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE)),
+        transforms.Resize((image_size, image_size)),
         transforms.Grayscale(num_output_channels=3),
     ]
     if train:
-        steps.append(transforms.RandomHorizontalFlip())
+        steps.extend(
+            [
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomRotation(degrees=7),
+            ]
+        )
     steps.extend(
         [
             transforms.ToTensor(),
@@ -115,18 +182,21 @@ def run_epoch(
         all_probs.extend(torch.sigmoid(logits).detach().cpu().tolist())
         progress.set_postfix(loss=f"{float(loss.detach().cpu()):.4f}")
 
-    return total_loss / len(loader.dataset), all_targets, all_probs
+    return total_loss / max(1, len(loader.dataset)), all_targets, all_probs
 
 
 def label_aucs(targets: list[list[float]], probs: list[list[float]], labels: list[str]) -> dict[str, float | None]:
     scores: dict[str, float | None] = {}
     for label_index, label in enumerate(labels):
-        y_true = [row[label_index] for row in targets]
+        y_true = [1.0 if row[label_index] >= 0.5 else 0.0 for row in targets]
         y_score = [row[label_index] for row in probs]
         if len(set(y_true)) < 2:
             scores[label] = None
             continue
-        scores[label] = float(roc_auc_score(y_true, y_score))
+        try:
+            scores[label] = float(roc_auc_score(y_true, y_score))
+        except Exception:
+            scores[label] = None
     return scores
 
 
@@ -165,7 +235,7 @@ def calculate_pos_weight(dataset: CheXpertDataset | Subset, labels: list[str]) -
     frame = base.frame.iloc[indices] if indices is not None else base.frame
     targets = []
     for label in labels:
-        values = frame[label].map(base._normalize_label)
+        values = frame[label].apply(lambda v: base._normalize_label(v, label))
         targets.append(values.astype(float).to_numpy())
     target_array = np.stack(targets, axis=1)
     positives = target_array.sum(axis=0)
@@ -185,10 +255,12 @@ def checkpoint_payload(
     return {
         "model_state_dict": model.state_dict(),
         "labels": labels,
-        "image_size": DEFAULT_IMAGE_SIZE,
         "metadata": {
             "epoch": epoch,
             "best_metric": metric,
+            "architecture": args.arch,
+            "image_size": args.image_size,
+            "loss_type": args.loss,
             "label_preset": args.label_preset,
             "uncertain_policy": args.uncertain_policy,
             "view": args.view,
@@ -200,7 +272,7 @@ def checkpoint_payload(
             "lr": args.lr,
             "torch_version": str(torch.__version__),
             "cuda_available": torch.cuda.is_available(),
-            "cuda_version": torch.version.cuda,
+            "cuda_version": getattr(torch.version, "cuda", None),
             "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
         },
         "metrics": metrics_history,
@@ -222,10 +294,13 @@ def main() -> None:
     train_csv = args.train_csv or args.data_root / "train.csv"
     valid_csv = args.valid_csv or args.data_root / "valid.csv"
 
+    train_transforms = build_transforms(train=True, image_size=args.image_size)
+    valid_transforms = build_transforms(train=False, image_size=args.image_size)
+
     train_dataset = CheXpertDataset(
         train_csv,
         args.data_root,
-        build_transforms(train=True),
+        train_transforms,
         labels=labels,
         uncertain_policy=args.uncertain_policy,
         view=args.view,
@@ -236,7 +311,7 @@ def main() -> None:
         valid_dataset = CheXpertDataset(
             valid_csv,
             args.data_root,
-            build_transforms(train=False),
+            valid_transforms,
             labels=labels,
             uncertain_policy=args.uncertain_policy,
             view=args.view,
@@ -245,7 +320,7 @@ def main() -> None:
         valid_source = CheXpertDataset(
             train_csv,
             args.data_root,
-            build_transforms(train=False),
+            valid_transforms,
             labels=labels,
             uncertain_policy=args.uncertain_policy,
             view=args.view,
@@ -277,10 +352,18 @@ def main() -> None:
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_model(len(labels), pretrained=args.pretrained).to(device)
-    pos_weight = calculate_pos_weight(train_dataset, labels).to(device) if args.pos_weight else None
-    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    model = build_model(args.arch, len(labels), pretrained=args.pretrained).to(device)
+
+    # Loss selection
+    if args.loss == "asl":
+        criterion = AsymmetricLoss(gamma_neg=4.0, gamma_pos=1.0)
+    elif args.loss == "focal":
+        criterion = FocalLoss(alpha=0.25, gamma=2.0)
+    else:
+        pos_weight = calculate_pos_weight(train_dataset, labels).to(device) if args.pos_weight else None
+        criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
     scaler = torch.amp.GradScaler(device.type, enabled=args.amp and device.type == "cuda")
     use_amp = args.amp and device.type == "cuda"
 
@@ -306,6 +389,9 @@ def main() -> None:
         "valid_csv": str(valid_csv) if valid_csv.exists() else None,
         "train_rows": len(train_dataset),
         "valid_rows": len(valid_dataset),
+        "architecture": args.arch,
+        "loss_type": args.loss,
+        "image_size": args.image_size,
         "labels": labels,
         "label_preset": args.label_preset,
         "uncertain_policy": args.uncertain_policy,
@@ -350,7 +436,6 @@ def main() -> None:
             f"mean_auc={auc_text} lr={current_lr:.2e}"
         )
 
-        # Step scheduler
         if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             scheduler.step(auc if auc is not None else -valid_loss)
         elif scheduler is not None:

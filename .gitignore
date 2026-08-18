@@ -8,6 +8,11 @@ env/
 .env.*
 !.env.example
 
+tools/
+.torch/
+.uv_cache/
+*.bat
+
 data/
 archive/
 archive.zip

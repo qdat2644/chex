@@ -22,18 +22,26 @@ const buttonLabel = document.getElementById("button-label");
 
 let thresholdsLoaded = false;
 let thresholds = {};
+let selectedFile = null;
 
 setInitialState();
 refreshModelInfo();
 
-fileInput.addEventListener("change", () => {
-  const file = fileInput.files?.[0];
+function applySelectedFile(file) {
   if (!file) {
-    setInitialState();
     return;
   }
+  selectedFile = file;
 
-  fileName.textContent = file.name;
+  try {
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    fileInput.files = dt.files;
+  } catch {
+    // Fallback for browsers that don't allow modifying fileInput.files
+  }
+
+  fileName.textContent = file.name || "pasted_image.png";
   fileDropzone.classList.add("has-file");
   uploadState.textContent = "Image selected - ready to analyze.";
   button.disabled = false;
@@ -53,11 +61,111 @@ fileInput.addEventListener("change", () => {
   hideHeatmap();
   hideAlerts();
   renderEmpty("Upload an image to see findings", "Predictions will appear here after analysis.");
+}
+
+fileInput.addEventListener("change", () => {
+  const file = fileInput.files?.[0];
+  if (!file) {
+    setInitialState();
+    return;
+  }
+  applySelectedFile(file);
+});
+
+// Comprehensive Clipboard Paste (Ctrl+V) Handler
+async function handlePasteEvent(event) {
+  const clipboardData = event.clipboardData || window.clipboardData;
+  if (!clipboardData) return;
+
+  // 1. Try extracting direct file from clipboardData.files
+  const files = clipboardData.files;
+  if (files && files.length > 0) {
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      if (file.type.startsWith("image/") || /\.(png|jpe?g|webp|bmp|gif|tif|tiff)$/i.test(file.name)) {
+        event.preventDefault();
+        event.stopPropagation();
+        applySelectedFile(file);
+        return;
+      }
+    }
+  }
+
+  // 2. Try extracting from clipboardData.items
+  const items = clipboardData.items;
+  if (items && items.length > 0) {
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.type.startsWith("image/") || item.kind === "file") {
+        const blob = item.getAsFile();
+        if (blob) {
+          event.preventDefault();
+          event.stopPropagation();
+          const ext = (blob.type && blob.type.split("/")[1]) || "png";
+          const dateStr = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+          const file = new File([blob], `pasted_xray_${dateStr}.${ext}`, { type: blob.type || "image/png" });
+          applySelectedFile(file);
+          return;
+        }
+      }
+    }
+  }
+
+  // 3. Try base64 data URI in text/plain
+  const text = clipboardData.getData("text/plain") || clipboardData.getData("text");
+  if (text && text.startsWith("data:image/")) {
+    try {
+      const res = await fetch(text);
+      const blob = await res.blob();
+      if (blob) {
+        event.preventDefault();
+        event.stopPropagation();
+        const file = new File([blob], "pasted_xray.png", { type: blob.type });
+        applySelectedFile(file);
+        return;
+      }
+    } catch {}
+  }
+}
+
+// Bind to window, document, and dropzone
+window.addEventListener("paste", handlePasteEvent, true);
+document.addEventListener("paste", handlePasteEvent, true);
+fileDropzone.addEventListener("paste", handlePasteEvent, true);
+
+// Drag & Drop Handlers
+["dragenter", "dragover"].forEach((eventName) => {
+  window.addEventListener(eventName, (e) => e.preventDefault(), false);
+  fileDropzone.addEventListener(eventName, (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    fileDropzone.classList.add("has-file");
+  });
+});
+
+["dragleave", "drop"].forEach((eventName) => {
+  window.addEventListener(eventName, (e) => e.preventDefault(), false);
+  fileDropzone.addEventListener(eventName, (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!selectedFile) {
+      fileDropzone.classList.remove("has-file");
+    }
+  });
+});
+
+fileDropzone.addEventListener("drop", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  const file = event.dataTransfer?.files?.[0];
+  if (file && (file.type.startsWith("image/") || /\.(png|jpe?g|webp|bmp|gif)$/i.test(file.name))) {
+    applySelectedFile(file);
+  }
 });
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
-  const file = fileInput.files?.[0];
+  const file = selectedFile || fileInput.files?.[0];
   if (!file) {
     setInitialState();
     return;
@@ -87,9 +195,10 @@ form.addEventListener("submit", async (event) => {
 });
 
 function setInitialState() {
-  fileName.textContent = "No file selected";
+  selectedFile = null;
+  fileName.textContent = "No file selected • Press Ctrl+V to paste";
   fileDropzone.classList.remove("has-file");
-  uploadState.textContent = "PNG, JPG, JPEG supported";
+  uploadState.textContent = "PNG, JPG, JPEG supported (or paste with Ctrl+V)";
   button.disabled = true;
   button.classList.remove("is-loading");
   buttonLabel.textContent = "Analyze";

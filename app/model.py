@@ -30,6 +30,52 @@ class Heatmap:
     image_data_url: str
 
 
+def build_model(arch: str, num_labels: int, pretrained: bool = False) -> torch.nn.Module:
+    arch = arch.lower().replace("-", "_")
+    if arch == "densenet121":
+        weights = models.DenseNet121_Weights.IMAGENET1K_V1 if pretrained else None
+        model = models.densenet121(weights=weights)
+        in_features = model.classifier.in_features
+        model.classifier = torch.nn.Linear(in_features, num_labels)
+    elif arch in ("convnext_small", "convnext"):
+        weights = models.ConvNeXt_Small_Weights.IMAGENET1K_V1 if pretrained else None
+        model = models.convnext_small(weights=weights)
+        in_features = model.classifier[2].in_features
+        model.classifier[2] = torch.nn.Linear(in_features, num_labels)
+    elif arch in ("efficientnet_v2_m", "efficientnet"):
+        weights = models.EfficientNet_V2_M_Weights.IMAGENET1K_V1 if pretrained else None
+        model = models.efficientnet_v2_m(weights=weights)
+        in_features = model.classifier[1].in_features
+        model.classifier[1] = torch.nn.Linear(in_features, num_labels)
+    elif arch in ("resnet50", "resnet"):
+        weights = models.ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
+        model = models.resnet50(weights=weights)
+        in_features = model.fc.in_features
+        model.fc = torch.nn.Linear(in_features, num_labels)
+    else:
+        # Default fallback to DenseNet121
+        weights = models.DenseNet121_Weights.IMAGENET1K_V1 if pretrained else None
+        model = models.densenet121(weights=weights)
+        in_features = model.classifier.in_features
+        model.classifier = torch.nn.Linear(in_features, num_labels)
+    return model
+
+
+def get_target_layer_for_gradcam(model: torch.nn.Module, arch: str) -> torch.nn.Module:
+    arch = arch.lower().replace("-", "_")
+    if "convnext" in arch:
+        return model.features[-1]
+    if "efficientnet" in arch:
+        return model.features[-1]
+    if "resnet" in arch:
+        return model.layer4[-1]
+    if "densenet" in arch:
+        return getattr(model.features, "denseblock4", model.features)
+    if hasattr(model, "features"):
+        return model.features
+    return list(model.children())[-2]
+
+
 class CheXpertPredictor:
     def __init__(
         self,
@@ -42,7 +88,18 @@ class CheXpertPredictor:
         self.labels = labels or DEFAULT_LABELS
         self.threshold = threshold
         self.thresholds = thresholds or {}
+        self.image_size = image_size
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model: torch.nn.Module | None = None
+        self.metadata: dict[str, object] = {}
+        self.architecture = "DenseNet121"
+        self._update_transforms(image_size)
+
+        if checkpoint_path:
+            self.load(checkpoint_path)
+
+    def _update_transforms(self, image_size: int) -> None:
+        self.image_size = image_size
         self.transform = transforms.Compose(
             [
                 transforms.Resize((image_size, image_size)),
@@ -54,11 +111,6 @@ class CheXpertPredictor:
                 ),
             ]
         )
-        self.model: torch.nn.Module | None = None
-        self.metadata: dict[str, object] = {}
-
-        if checkpoint_path:
-            self.load(checkpoint_path)
 
     def set_thresholds(self, thresholds: dict[str, float]) -> None:
         self.thresholds = {label: float(value) for label, value in thresholds.items()}
@@ -72,17 +124,19 @@ class CheXpertPredictor:
             checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
         except (TypeError, pickle.UnpicklingError):
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
         labels = checkpoint.get("labels") if isinstance(checkpoint, dict) else None
         if labels:
             self.labels = list(labels)
         metadata = checkpoint.get("metadata") if isinstance(checkpoint, dict) else None
         if isinstance(metadata, dict):
             self.metadata = metadata
+            self.architecture = str(metadata.get("architecture", "DenseNet121"))
+            ckpt_size = metadata.get("image_size")
+            if ckpt_size and isinstance(ckpt_size, int):
+                self._update_transforms(ckpt_size)
 
-        model = models.densenet121(weights=None)
-        in_features = model.classifier.in_features
-        model.classifier = torch.nn.Linear(in_features, len(self.labels))
-
+        model = build_model(self.architecture, len(self.labels), pretrained=False)
         state_dict = checkpoint.get("model_state_dict", checkpoint)
         model.load_state_dict(state_dict)
         model.to(self.device)
@@ -115,23 +169,39 @@ class CheXpertPredictor:
     def explain_top_finding(self, image: Image.Image) -> Heatmap:
         if self.model is None:
             raise RuntimeError("Model checkpoint is not loaded.")
-        if not (hasattr(self.model, "features") and hasattr(self.model, "classifier")):
-            raise RuntimeError("Grad-CAM is only implemented for DenseNet checkpoints.")
 
         original = image.convert("RGB")
         tensor = self.transform(original).unsqueeze(0).to(self.device)
-        self.model.zero_grad(set_to_none=True)
 
-        features = self.model.features(tensor)
-        features.retain_grad()
-        pooled = F.adaptive_avg_pool2d(F.relu(features, inplace=False), (1, 1))
-        logits = self.model.classifier(torch.flatten(pooled, 1))
+        # Hook-based Grad-CAM works across any architecture
+        target_layer = get_target_layer_for_gradcam(self.model, self.architecture)
+        activations_list = []
+        gradients_list = []
+
+        def forward_hook(module, input, output):
+            activations_list.append(output)
+
+        def backward_hook(module, grad_in, grad_out):
+            gradients_list.append(grad_out[0])
+
+        h_fwd = target_layer.register_forward_hook(forward_hook)
+        h_bwd = target_layer.register_full_backward_hook(backward_hook)
+
+        self.model.zero_grad(set_to_none=True)
+        logits = self.model(tensor)
         probabilities = torch.sigmoid(logits).squeeze(0)
         label_index = int(torch.argmax(probabilities).detach().cpu())
+
         logits[0, label_index].backward()
 
-        gradients = features.grad.detach()[0]
-        activations = features.detach()[0]
+        h_fwd.remove()
+        h_bwd.remove()
+
+        if not activations_list or not gradients_list:
+            raise RuntimeError("Failed to capture Grad-CAM activations/gradients.")
+
+        activations = activations_list[0].detach()[0]
+        gradients = gradients_list[0].detach()[0]
         weights = gradients.mean(dim=(1, 2))
         cam = torch.relu((weights[:, None, None] * activations).sum(dim=0))
         cam = self._normalize_cam(cam)

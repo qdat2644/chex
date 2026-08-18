@@ -5,6 +5,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CHECKPOINT_PATH = PROJECT_ROOT / "checkpoints" / "chexpert_densenet121_v2.pt"
 DEFAULT_THRESHOLDS_PATH = PROJECT_ROOT / "outputs" / "evaluation" / "thresholds.json"
 
+SUPPORTED_ARCHITECTURES = [
+    "densenet121",
+    "convnext_small",
+    "efficientnet_v2_m",
+    "resnet50",
+]
+
 MODEL_INFO = {
     "architecture": "DenseNet121",
     "label_count": 5,
@@ -45,6 +52,9 @@ LABEL_PRESETS = {
     "competition": DEFAULT_LABELS,
     "all": ALL_CHEXPERT_LABELS,
 }
+
+# Stanford U-Ones mapping: Atelectasis, Edema, Effusion treat -1 as 1; others as 0
+STANFORD_U_ONES_LABELS = {"Atelectasis", "Edema", "Pleural Effusion"}
 
 DEFAULT_IMAGE_SIZE = 224
 DEFAULT_THRESHOLD = 0.5
