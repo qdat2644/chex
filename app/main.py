@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 from io import BytesIO
@@ -28,7 +29,15 @@ from app.config import (
     PROJECT_ROOT,
 )
 from app.model import CheXpertPredictor
-from app.schemas import DicomMetadata, FindingPrediction, HeatmapExplanation, PredictionResponse, QualityReport
+from app.schemas import (
+    BatchItemResult,
+    BatchPredictionResponse,
+    DicomMetadata,
+    FindingPrediction,
+    HeatmapExplanation,
+    PredictionResponse,
+    QualityReport,
+)
 
 
 app = FastAPI(title="CheXpert Web Reader - Medical AI Workstation")
@@ -358,3 +367,105 @@ async def explain_label(
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Grad-CAM generation failed: {e}")
+
+
+@app.post("/api/predict-batch", response_model=BatchPredictionResponse)
+async def predict_batch_cxrs(
+    files: list[UploadFile] = File(...),
+) -> BatchPredictionResponse:
+    """
+    High-throughput batch diagnostic inference for multiple CXR/DICOM files.
+    """
+    if not predictor.is_loaded:
+        raise HTTPException(status_code=400, detail="Model is not loaded.")
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided.")
+
+    valid_images: list[Image.Image] = []
+    metadata_list: list[dict] = []
+    errors: list[str] = []
+
+    for idx, f in enumerate(files):
+        try:
+            content = await f.read()
+            if not content:
+                errors.append(f"File {f.filename}: empty data.")
+                continue
+            fname = f.filename or f"image_{idx}.png"
+            img, dcm_meta = decode_image_or_dicom(content, fname)
+            quality = assess_cxr_quality(img, dcm_meta)
+
+            # Generate small thumbnail preview for batch table
+            thumb = img.copy()
+            thumb.thumbnail((120, 120))
+            thumb_buf = BytesIO()
+            thumb.save(thumb_buf, format="PNG")
+            thumb_b64 = f"data:image/png;base64,{base64.b64encode(thumb_buf.getvalue()).decode('ascii')}"
+
+            valid_images.append(img)
+            metadata_list.append({
+                "index": idx + 1,
+                "filename": fname,
+                "is_dicom": dcm_meta.is_dicom,
+                "patient_id": dcm_meta.patient_id or "ANONYMIZED",
+                "quality": quality,
+                "preview_url": thumb_b64,
+            })
+        except Exception as e:
+            errors.append(f"File {f.filename}: {e}")
+
+    if not valid_images:
+        return BatchPredictionResponse(
+            status="error",
+            total=len(files),
+            processed=0,
+            failed=len(errors),
+            results=[],
+            errors=errors,
+        )
+
+    # High-speed vectorized batch forward pass on PyTorch GPU/CPU
+    batch_predictions = predictor.predict_batch(valid_images)
+
+    results: list[BatchItemResult] = []
+    for meta, preds in zip(metadata_list, batch_predictions, strict=True):
+        findings = [
+            FindingPrediction(
+                label=p.label,
+                probability=p.probability,
+                positive=p.positive,
+                threshold=p.threshold,
+                suspicion_level=p.suspicion_level,
+            )
+            for p in preds
+        ]
+
+        sorted_findings = sorted(findings, key=lambda x: x.probability, reverse=True)
+        top_f = sorted_findings[0] if sorted_findings else None
+        pos_labels = [f.label for f in findings if f.positive]
+
+        results.append(
+            BatchItemResult(
+                index=meta["index"],
+                filename=meta["filename"],
+                is_dicom=meta["is_dicom"],
+                patient_id=meta["patient_id"],
+                findings=findings,
+                top_finding=top_f.label if top_f else "None",
+                top_probability=top_f.probability if top_f else 0.0,
+                positive_count=len(pos_labels),
+                positive_labels=pos_labels,
+                report=build_report(findings, meta["quality"]),
+                preview_url=meta["preview_url"],
+            )
+        )
+
+    return BatchPredictionResponse(
+        status="ok",
+        total=len(files),
+        processed=len(results),
+        failed=len(errors),
+        results=results,
+        errors=errors,
+    )
+

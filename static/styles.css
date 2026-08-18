@@ -185,6 +185,189 @@ figure { margin: 0; }
   transform: translateY(-1px);
 }
 
+.csv-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: linear-gradient(135deg, #059669, #047857);
+  color: #fff;
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 0 14px;
+  height: 36px;
+  border-radius: var(--radius-md);
+  border: 1px solid rgba(52, 211, 153, 0.4);
+  transition: all var(--transition);
+}
+
+.csv-btn:hover:not(:disabled) {
+  background: linear-gradient(135deg, #047857, #065f46);
+  box-shadow: 0 0 14px rgba(52, 211, 153, 0.35);
+  transform: translateY(-1px);
+}
+
+.csv-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* -----------------------------------------
+   Workspace Mode Switcher Tabs
+----------------------------------------- */
+.mode-tabs {
+  display: flex;
+  gap: 8px;
+  margin-top: 18px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 8px;
+}
+
+.mode-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 18px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.mode-tab:hover {
+  color: var(--text-primary);
+  border-color: var(--border-bright);
+}
+
+.mode-tab.active {
+  background: var(--primary-subtle);
+  color: var(--primary-light);
+  border-color: var(--primary-light);
+  box-shadow: 0 0 12px var(--primary-glow);
+}
+
+/* -----------------------------------------
+   Batch Processing Mode Styles
+----------------------------------------- */
+.batch-results-panel {
+  margin-top: 20px;
+}
+
+.batch-actions-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.table-responsive {
+  width: 100%;
+  overflow-x: auto;
+  margin-top: 14px;
+}
+
+.batch-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  text-align: left;
+}
+
+.batch-table th {
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-weight: 600;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-bright);
+  white-space: nowrap;
+}
+
+.batch-table td {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+.batch-table tbody tr {
+  transition: background var(--transition);
+}
+
+.batch-table tbody tr:hover:not(.empty-table-row) {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.batch-thumb-img {
+  width: 44px;
+  height: 44px;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: #000;
+  display: block;
+}
+
+.empty-table-cell {
+  text-align: center;
+  padding: 40px 16px !important;
+  color: var(--text-muted);
+}
+
+.empty-table-cell strong {
+  display: block;
+  font-size: 14px;
+  color: var(--text-primary);
+  margin-bottom: 4px;
+}
+
+.batch-tag-positive {
+  display: inline-block;
+  background: rgba(239, 68, 68, 0.2);
+  color: #fca5a5;
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  margin: 2px 3px 2px 0;
+}
+
+.batch-tag-clear {
+  display: inline-block;
+  background: rgba(16, 185, 129, 0.15);
+  color: #6ee7b7;
+  border: 1px solid rgba(16, 185, 129, 0.35);
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.btn-open-pacs {
+  background: var(--surface-2);
+  color: var(--primary-light);
+  border: 1px solid var(--border-bright);
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.btn-open-pacs:hover {
+  background: var(--primary-subtle);
+  border-color: var(--primary-light);
+}
+
+.pdf-btn:hover {
+  background: linear-gradient(135deg, #0369a1, #075985);
+  box-shadow: 0 0 16px rgba(56, 189, 248, 0.3);
+  transform: translateY(-1px);
+}
+
 .badge, .chip {
   display: inline-flex;
   align-items: center;

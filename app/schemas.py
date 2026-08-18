@@ -51,3 +51,27 @@ class PredictionResponse(BaseModel):
     quality: QualityReport = Field(default_factory=QualityReport)
     dicom: DicomMetadata = Field(default_factory=DicomMetadata)
     message: str | None = None
+
+
+class BatchItemResult(BaseModel):
+    index: int
+    filename: str
+    is_dicom: bool = False
+    patient_id: str | None = None
+    findings: list[FindingPrediction]
+    top_finding: str
+    top_probability: float
+    positive_count: int
+    positive_labels: list[str]
+    report: str
+    preview_url: str | None = None
+
+
+class BatchPredictionResponse(BaseModel):
+    status: str
+    total: int
+    processed: int
+    failed: int = 0
+    results: list[BatchItemResult]
+    errors: list[str] = Field(default_factory=list)
+

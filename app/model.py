@@ -186,6 +186,47 @@ class CheXpertPredictor:
             )
         return results
 
+    @torch.inference_mode()
+    def predict_batch(self, images: list[Image.Image]) -> list[list[Prediction]]:
+        if self.model is None:
+            raise RuntimeError("Model checkpoint is not loaded.")
+        if not images:
+            return []
+
+        tensors = torch.stack([self.transform(img.convert("RGB")) for img in images]).to(self.device)
+        logits = self.model(tensors)
+        batch_probs = torch.sigmoid(logits).detach().cpu().numpy()
+
+        batch_results: list[list[Prediction]] = []
+        for probs in batch_probs:
+            img_results: list[Prediction] = []
+            for label, prob_val in zip(self.labels, probs, strict=True):
+                prob = float(prob_val)
+                threshold = self.thresholds.get(label)
+                is_positive = bool(threshold is not None and prob >= threshold)
+
+                if threshold is not None:
+                    if prob >= min(1.0, threshold + 0.15):
+                        suspicion = "High suspicion"
+                    elif prob >= threshold:
+                        suspicion = "Moderate suspicion"
+                    else:
+                        suspicion = "Low suspicion"
+                else:
+                    suspicion = "Probability only"
+
+                img_results.append(
+                    Prediction(
+                        label=label,
+                        probability=prob,
+                        positive=is_positive,
+                        threshold=threshold,
+                        suspicion_level=suspicion,
+                    )
+                )
+            batch_results.append(img_results)
+        return batch_results
+
     def explain_finding(self, image: Image.Image, target_label: str | None = None) -> Heatmap:
         if self.model is None:
             raise RuntimeError("Model checkpoint is not loaded.")
