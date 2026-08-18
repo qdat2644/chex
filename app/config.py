@@ -6,10 +6,11 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-# Hugging Face Repository & Direct Download URLs
+# Hugging Face Repository & Pinned Revision URLs (Task 3)
 HUGGINGFACE_REPO = "qdat264/chexpert-convnext-small"
-HUGGINGFACE_CHECKPOINT_URL = f"https://huggingface.co/{HUGGINGFACE_REPO}/resolve/main/chexpert_convnext_small.pt"
-HUGGINGFACE_THRESHOLDS_URL = f"https://huggingface.co/{HUGGINGFACE_REPO}/resolve/main/thresholds.json"
+HUGGINGFACE_REVISION = os.getenv("HUGGINGFACE_REVISION", "d9b23e7f4c0b6b25ea958d0421295b9c0587b1c3")
+HUGGINGFACE_CHECKPOINT_URL = f"https://huggingface.co/{HUGGINGFACE_REPO}/resolve/{HUGGINGFACE_REVISION}/chexpert_convnext_small.pt"
+HUGGINGFACE_THRESHOLDS_URL = f"https://huggingface.co/{HUGGINGFACE_REPO}/resolve/{HUGGINGFACE_REVISION}/thresholds.json"
 
 # Checksum & Governance Policies (SHA-256)
 EXPECTED_CHECKPOINT_SHA256 = os.getenv(
@@ -22,11 +23,33 @@ EXPECTED_THRESHOLDS_SHA256 = os.getenv(
 )
 AUTO_DOWNLOAD_ENABLED = os.getenv("CHEXPERT_AUTO_DOWNLOAD", "true").lower() == "true"
 
-# Prioritize newest trained checkpoints
+# Paths
 _convnext_path = PROJECT_ROOT / "checkpoints" / "chexpert_convnext_small.pt"
 _densenet_path = PROJECT_ROOT / "checkpoints" / "chexpert_densenet121_v2.pt"
 DEFAULT_CHECKPOINT_PATH = _convnext_path if _convnext_path.exists() else _densenet_path
 DEFAULT_THRESHOLDS_PATH = PROJECT_ROOT / "outputs" / "evaluation" / "thresholds.json"
+MANIFEST_PATH = PROJECT_ROOT / "outputs" / "manifest.json"
+
+# Security & Authentication Configurations (Task 1 & Task 5)
+API_KEY = os.getenv("API_KEY") or os.getenv("CHEXPERT_API_KEY")
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
+
+
+def get_phi_secret() -> str | None:
+    """
+    Retrieves the PHI HMAC secret from environment variable or Docker secret mount.
+    """
+    secret_file = os.getenv("PHI_HMAC_SECRET_FILE", "/run/secrets/phi_hmac_secret")
+    p = Path(secret_file)
+    if p.exists() and p.is_file():
+        try:
+            content = p.read_text(encoding="utf-8").strip()
+            if content:
+                return content
+        except Exception:
+            pass
+    return os.getenv("PHI_HMAC_SECRET")
+
 
 SUPPORTED_ARCHITECTURES = [
     "densenet121",
@@ -36,7 +59,11 @@ SUPPORTED_ARCHITECTURES = [
 ]
 
 MODEL_INFO = {
+    "version": "1.0.0",
     "architecture": "ConvNeXt-Small",
+    "revision": HUGGINGFACE_REVISION,
+    "checkpoint_sha256": EXPECTED_CHECKPOINT_SHA256,
+    "thresholds_sha256": EXPECTED_THRESHOLDS_SHA256,
     "label_count": 5,
     "mean_auc": 0.8944,
     "mean_auc_display": "0.8944",
@@ -78,7 +105,6 @@ LABEL_PRESETS = {
     "all": ALL_CHEXPERT_LABELS,
 }
 
-# Stanford U-Ones mapping: Atelectasis, Edema, Effusion treat -1 as 1; others as 0
 STANFORD_U_ONES_LABELS = {"Atelectasis", "Edema", "Pleural Effusion"}
 
 DEFAULT_IMAGE_SIZE = 224

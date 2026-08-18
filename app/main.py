@@ -5,17 +5,20 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import tempfile
+import time
 import uuid
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
 from typing import BinaryIO
 
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, UnidentifiedImageError
 
@@ -27,13 +30,9 @@ MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB max per file
 MAX_BATCH_FILES = 50                    # 50 files max per batch request
 MAX_DICOM_PIXELS = 50_000_000           # 50 megapixels max per DICOM frame
 
-# PHI Protection Configuration
-_SECRET_ENV = os.getenv("PHI_HMAC_SECRET")
-APP_ENV = os.getenv("APP_ENV", "development").lower()
-if APP_ENV == "production" and not _SECRET_ENV:
-    raise RuntimeError("CRITICAL SECURITY CONFIG ERROR: PHI_HMAC_SECRET must be explicitly configured in production mode.")
-PHI_HMAC_SECRET = (_SECRET_ENV or "dev_temporary_chexpert_phi_secret_key_2026").encode("utf-8")
-EXPOSE_PHI = os.getenv("EXPOSE_PHI", "false").lower() == "true"
+# Audit Logging Setup
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("chexpert.audit")
 
 try:
     import pydicom
@@ -43,6 +42,7 @@ except ImportError:
     HAS_PYDICOM = False
 
 from app.config import (
+    API_KEY,
     AUTO_DOWNLOAD_ENABLED,
     DEFAULT_CHECKPOINT_PATH,
     DEFAULT_THRESHOLDS_PATH,
@@ -50,9 +50,13 @@ from app.config import (
     EXPECTED_THRESHOLDS_SHA256,
     HUGGINGFACE_CHECKPOINT_URL,
     HUGGINGFACE_REPO,
+    HUGGINGFACE_REVISION,
     HUGGINGFACE_THRESHOLDS_URL,
+    MANIFEST_PATH,
     MODEL_INFO,
     PROJECT_ROOT,
+    RATE_LIMIT_PER_MINUTE,
+    get_phi_secret,
 )
 from app.model import CheXpertPredictor
 from app.schemas import (
@@ -66,6 +70,19 @@ from app.schemas import (
 )
 
 static_dir = PROJECT_ROOT / "static"
+
+# In-memory sliding window rate limiter state
+_RATE_LIMIT_STORE: dict[str, list[float]] = defaultdict(list)
+
+
+def get_active_phi_secret() -> bytes:
+    sec = get_phi_secret()
+    if sec:
+        return sec.encode("utf-8")
+    app_env = os.getenv("APP_ENV", "development").lower()
+    if app_env == "production":
+        raise RuntimeError("CRITICAL SECURITY ERROR: PHI_HMAC_SECRET must be explicitly configured in production.")
+    return b"dev_temporary_chexpert_phi_secret_key_2026"
 
 
 def compute_file_sha256(filepath: Path) -> str:
@@ -82,12 +99,14 @@ def mask_phi(val: str | None) -> str:
     """
     Masks Protected Health Information (PHI) using HMAC-SHA256 with 16-character fingerprint.
     """
+    expose_phi = os.getenv("EXPOSE_PHI", "false").lower() == "true"
     if not val or str(val).strip().upper() in ("ANONYMIZED", "NONE", "N/A", "UNKNOWN"):
         return "ANONYMIZED"
-    if EXPOSE_PHI:
+    if expose_phi:
         return str(val).strip()
     raw_bytes = str(val).strip().encode("utf-8")
-    h = hmac.new(PHI_HMAC_SECRET, raw_bytes, hashlib.sha256).hexdigest()[:16].upper()
+    secret = get_active_phi_secret()
+    h = hmac.new(secret, raw_bytes, hashlib.sha256).hexdigest()[:16].upper()
     return f"ANONYMIZED_{h}"
 
 
@@ -95,10 +114,12 @@ def anonymize_filename(filename: str) -> str:
     """
     Generates deterministic anonymized scan filename: scan_<8_hex_hash>.png
     """
-    if EXPOSE_PHI or not filename:
+    expose_phi = os.getenv("EXPOSE_PHI", "false").lower() == "true"
+    if expose_phi or not filename:
         return filename or "scan.png"
     raw_bytes = filename.strip().encode("utf-8")
-    h = hmac.new(PHI_HMAC_SECRET, raw_bytes, hashlib.sha256).hexdigest()[:8].lower()
+    secret = get_active_phi_secret()
+    h = hmac.new(secret, raw_bytes, hashlib.sha256).hexdigest()[:8].lower()
     return f"scan_{h}.png"
 
 
@@ -154,7 +175,7 @@ def resolve_checkpoint_path() -> Path | None:
     ]
 
     for p in candidates:
-        if p.exists() and p.stat().st_size > 1000:
+        if p.exists() and p.is_file():
             if EXPECTED_CHECKPOINT_SHA256:
                 actual_hash = compute_file_sha256(p)
                 if actual_hash.lower() != EXPECTED_CHECKPOINT_SHA256.lower():
@@ -203,12 +224,34 @@ def load_thresholds(payload: dict[str, object] | None) -> dict[str, float]:
 
 @asynccontextmanager
 async def lifespan(app_obj: FastAPI):
-    # If predictor is not already injected (e.g. In isolated unit tests), load real models
+    app_env = os.getenv("APP_ENV", "development").lower()
+
+    # Fail-closed secret verification in production (Task 1 & Task 2)
+    if app_env == "production":
+        sec = get_phi_secret()
+        if not sec or len(sec) < 16:
+            raise RuntimeError(
+                "CRITICAL PRODUCTION SECURITY VIOLATION: PHI_HMAC_SECRET (min 16 chars) must be explicitly configured."
+            )
+
+    # Initialize model if not already injected by test harness
     if getattr(app_obj.state, "predictor", None) is None:
         ckpt_path = resolve_checkpoint_path()
         threshold_pl = load_threshold_payload()
         thresholds_dict = load_thresholds(threshold_pl)
-        app_obj.state.predictor = CheXpertPredictor(ckpt_path, thresholds=thresholds_dict)
+
+        # Fail-closed production artifact verification (Task 2)
+        if app_env == "production":
+            if not ckpt_path or not ckpt_path.exists():
+                raise RuntimeError("CRITICAL PRODUCTION ERROR: Missing valid model checkpoint.")
+            if not threshold_pl:
+                raise RuntimeError("CRITICAL PRODUCTION ERROR: Missing or invalid thresholds.json artifact.")
+
+        pred = CheXpertPredictor(ckpt_path, thresholds=thresholds_dict)
+        if app_env == "production" and not pred.is_loaded:
+            raise RuntimeError("CRITICAL PRODUCTION ERROR: Model checkpoint failed to load.")
+
+        app_obj.state.predictor = pred
         app_obj.state.threshold_payload = threshold_pl
         app_obj.state.checkpoint_path = ckpt_path
     yield
@@ -217,11 +260,68 @@ async def lifespan(app_obj: FastAPI):
 def create_app(
     predictor_instance: CheXpertPredictor | None = None,
     threshold_payload_instance: dict[str, object] | None = None,
+    api_key_override: str | None = None,
+    rate_limit_override: int | None = None,
 ) -> FastAPI:
     app_instance = FastAPI(title="CheXpert Web Reader - Medical AI Workstation", lifespan=lifespan)
     app_instance.state.predictor = predictor_instance
     app_instance.state.threshold_payload = threshold_payload_instance
     app_instance.state.checkpoint_path = getattr(predictor_instance, "checkpoint_path", None) if predictor_instance else None
+    app_instance.state.api_key = api_key_override if api_key_override is not None else API_KEY
+    app_instance.state.rate_limit = rate_limit_override if rate_limit_override is not None else RATE_LIMIT_PER_MINUTE
+
+    # Middleware: Request ID, Authentication, Rate Limiting, Audit Logging (Task 5)
+    @app_instance.middleware("http")
+    async def security_and_audit_middleware(request: Request, call_next):
+        req_id = uuid.uuid4().hex[:12]
+        start_time = time.perf_counter()
+        client_ip = request.client.host if request.client else "127.0.0.1"
+
+        # Rate Limiting (Sliding Window 60s)
+        limit = request.app.state.rate_limit
+        if limit and limit > 0 and request.url.path.startswith("/api/"):
+            now = time.time()
+            timestamps = _RATE_LIMIT_STORE[client_ip]
+            # prune timestamps older than 60s
+            _RATE_LIMIT_STORE[client_ip] = [t for t in timestamps if now - t < 60.0]
+            if len(_RATE_LIMIT_STORE[client_ip]) >= limit:
+                logger.warning(f"[AUDIT] RATE_LIMIT_EXCEEDED req_id={req_id} ip={client_ip} path={request.url.path}")
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Too many requests. Rate limit exceeded."},
+                    headers={"Retry-After": "60", "X-Request-ID": req_id},
+                )
+            _RATE_LIMIT_STORE[client_ip].append(now)
+
+        # Authentication Check on /api/* (Excluding public /health)
+        expected_key = request.app.state.api_key
+        if expected_key and request.url.path.startswith("/api/"):
+            auth_header = request.headers.get("Authorization", "")
+            x_api_key = request.headers.get("X-API-Key", "")
+            token = ""
+            if auth_header.startswith("Bearer "):
+                token = auth_header[7:].strip()
+            elif x_api_key:
+                token = x_api_key.strip()
+
+            if not token or not hmac.compare_digest(token, expected_key):
+                logger.warning(f"[AUDIT] AUTH_FAILED req_id={req_id} ip={client_ip} path={request.url.path}")
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Unauthorized: Invalid or missing API key."},
+                    headers={"X-Request-ID": req_id},
+                )
+
+        response: Response = await call_next(request)
+        duration_ms = (time.perf_counter() - start_time) * 1000.0
+
+        response.headers["X-Request-ID"] = req_id
+        logger.info(
+            f"[AUDIT] req_id={req_id} ip={client_ip} method={request.method} "
+            f"path={request.url.path} status={response.status_code} duration_ms={duration_ms:.1f}"
+        )
+        return response
+
     app_instance.mount("/static", StaticFiles(directory=static_dir), name="static")
 
     @app_instance.get("/")
@@ -230,7 +330,7 @@ def create_app(
 
     @app_instance.get("/health")
     def health(request: Request) -> dict[str, object]:
-        pred = request.app.state.predictor
+        pred = getattr(request.app.state, "predictor", None)
         ckpt_path = getattr(request.app.state, "checkpoint_path", None)
         return {
             "status": "ok",
@@ -243,14 +343,18 @@ def create_app(
 
     @app_instance.get("/api/model-info")
     def model_info(request: Request) -> dict[str, object]:
-        pred = request.app.state.predictor
+        pred = getattr(request.app.state, "predictor", None)
         ckpt_path = getattr(request.app.state, "checkpoint_path", None)
         pl = getattr(request.app.state, "threshold_payload", None)
         return {
+            "version": "1.0.0",
+            "revision": HUGGINGFACE_REVISION,
             "model_loaded": pred.is_loaded if pred else False,
             "labels": pred.labels if pred else [],
             "checkpoint": str(ckpt_path) if ckpt_path else None,
+            "checkpoint_sha256": EXPECTED_CHECKPOINT_SHA256,
             "thresholds_loaded": bool(pred.thresholds) if pred else False,
+            "thresholds_sha256": EXPECTED_THRESHOLDS_SHA256,
             "thresholds": pred.thresholds if pred else {},
             "threshold_report": pl,
             "model_info": get_current_model_info(pred, pl, ckpt_path),
@@ -392,7 +496,6 @@ def create_app(
         errors: list[str] = []
         CHUNK_SIZE = 8
 
-        # True chunked processing: decode chunk -> inference -> append -> free RAM
         for i in range(0, len(files), CHUNK_SIZE):
             chunk_files = files[i : i + CHUNK_SIZE]
             chunk_cids = client_id_list[i : i + CHUNK_SIZE]
@@ -513,9 +616,6 @@ async def stream_to_spooled_tempfile(file: UploadFile, max_bytes: int = MAX_FILE
 
 
 def decode_image_or_dicom(spool: BinaryIO, filename: str) -> tuple[Image.Image, DicomMetadata]:
-    """
-    Decodes standard image files or DICOM files with pre-decode multi-frame/size inspection.
-    """
     header_bytes = spool.read(132)
     spool.seek(0)
 
@@ -523,7 +623,6 @@ def decode_image_or_dicom(spool: BinaryIO, filename: str) -> tuple[Image.Image, 
 
     if is_dicom and HAS_PYDICOM:
         try:
-            # 1. Stop before pixels to inspect metadata header first (Task 1)
             dcm_header = pydicom.dcmread(spool, stop_before_pixels=True, force=True)
             num_frames = int(getattr(dcm_header, "NumberOfFrames", 1))
             rows = int(getattr(dcm_header, "Rows", 0))
@@ -582,8 +681,8 @@ def decode_image_or_dicom(spool: BinaryIO, filename: str) -> tuple[Image.Image, 
             dicom_meta = DicomMetadata(
                 is_dicom=True,
                 patient_id=mask_phi(raw_patient_id),
-                patient_name=mask_phi(raw_patient_name) if EXPOSE_PHI else "REDACTED",
-                study_date=str(raw_study_date) if EXPOSE_PHI else "REDACTED",
+                patient_name=mask_phi(raw_patient_name) if os.getenv("EXPOSE_PHI", "false").lower() == "true" else "REDACTED",
+                study_date=str(raw_study_date) if os.getenv("EXPOSE_PHI", "false").lower() == "true" else "REDACTED",
                 modality=str(getattr(dcm, "Modality", "CR / DX")),
                 view_position=str(getattr(dcm, "ViewPosition", "PA (Posteroanterior)")),
                 body_part=str(getattr(dcm, "BodyPartExamined", "CHEST")),

@@ -16,9 +16,11 @@ os.environ["CHEXPERT_AUTO_DOWNLOAD"] = "false"
 os.environ["APP_ENV"] = "development"
 
 from app.main import (
+    _RATE_LIMIT_STORE,
     anonymize_filename,
     create_app,
     decode_image_or_dicom,
+    lifespan,
     mask_phi,
     resolve_checkpoint_path,
     _download_hf_file,
@@ -28,6 +30,7 @@ from app.model import CheXpertPredictor, Heatmap, Prediction
 
 class ApiTest(unittest.TestCase):
     def setUp(self):
+        _RATE_LIMIT_STORE.clear()
         # Create Mock Predictor with a tiny neural net
         self.mock_predictor = CheXpertPredictor(None)
         self.mock_predictor.labels = [
@@ -89,9 +92,6 @@ class ApiTest(unittest.TestCase):
         self.assertTrue(payload["filename"].startswith("scan_"))
 
     def test_anonymized_filename_uniqueness(self) -> None:
-        """
-        Task 4: Ensure two different filenames generate two distinct anonymized scan names.
-        """
         name_1 = anonymize_filename("Patient_Alice_20260818.dcm")
         name_2 = anonymize_filename("Patient_Bob_20260818.dcm")
         self.assertNotEqual(name_1, name_2)
@@ -101,10 +101,6 @@ class ApiTest(unittest.TestCase):
         self.assertTrue(name_2.endswith(".png"))
 
     def test_app_state_isolation(self) -> None:
-        """
-        Task 5: Test that two distinct apps with two distinct predictors
-        do not bleed or interfere with each other's state.
-        """
         pred_a = CheXpertPredictor(None)
         pred_a.labels = ["Atelectasis"]
         pred_a.model = torch.nn.Sequential(
@@ -149,9 +145,6 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(res_b.json()["findings"][0]["probability"], 0.11)
 
     def test_dicom_multiframe_rejection_before_decode(self) -> None:
-        """
-        Task 1: Test that multi-frame DICOM (NumberOfFrames > 1) is rejected before decoding.
-        """
         try:
             import pydicom
             from pydicom.dataset import Dataset, FileMetaDataset
@@ -202,7 +195,10 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["labels"], expected_labels)
-        self.assertTrue(payload["model_loaded"])
+        self.assertEqual(payload["version"], "1.0.0")
+        self.assertIn("revision", payload)
+        self.assertIn("checkpoint_sha256", payload)
+        self.assertIn("thresholds_sha256", payload)
 
     def test_predict_and_explain_endpoints_offline(self) -> None:
         image_bytes = io.BytesIO()
@@ -219,11 +215,9 @@ class ApiTest(unittest.TestCase):
         self.assertIsNotNone(payload["heatmap"])
         self.assertTrue(payload["heatmap"]["image_data_url"].startswith("data:image/png;base64,"))
 
-        # Test PHI protection: raw filename should not be exposed
         self.assertNotIn("test_patient_name_001.jpg", payload["filename"])
         self.assertTrue(payload["filename"].startswith("scan_"))
 
-        # Explain endpoint
         explain_res = self.client.post(
             "/api/explain",
             files={"file": ("test.jpg", image_bytes.getvalue(), "image/jpeg")},
@@ -231,6 +225,82 @@ class ApiTest(unittest.TestCase):
         )
         self.assertEqual(explain_res.status_code, 200)
         self.assertEqual(explain_res.json()["label"], "Cardiomegaly")
+
+    def test_authentication_protection(self) -> None:
+        """
+        Task 5: Test API Key authentication on protected /api/* endpoints.
+        """
+        secure_app = create_app(self.mock_predictor, api_key_override="test_secret_api_key_2026")
+        secure_client = TestClient(secure_app)
+
+        # 1. /health is public without auth
+        health_res = secure_client.get("/health")
+        self.assertEqual(health_res.status_code, 200)
+
+        # 2. /api/model-info without auth returns 401
+        unauth_res = secure_client.get("/api/model-info")
+        self.assertEqual(unauth_res.status_code, 401)
+        self.assertIn("Unauthorized", unauth_res.json()["detail"])
+
+        # 3. /api/model-info with wrong token returns 401
+        wrong_token_res = secure_client.get("/api/model-info", headers={"Authorization": "Bearer wrong_token"})
+        self.assertEqual(wrong_token_res.status_code, 401)
+
+        # 4. /api/model-info with valid Bearer token returns 200
+        auth_res = secure_client.get("/api/model-info", headers={"Authorization": "Bearer test_secret_api_key_2026"})
+        self.assertEqual(auth_res.status_code, 200)
+
+        # 5. /api/model-info with X-API-Key header returns 200
+        x_key_res = secure_client.get("/api/model-info", headers={"X-API-Key": "test_secret_api_key_2026"})
+        self.assertEqual(x_key_res.status_code, 200)
+
+    def test_rate_limiting_trigger(self) -> None:
+        """
+        Task 5: Test rate limiter returns 429 when threshold exceeded.
+        """
+        limited_app = create_app(self.mock_predictor, rate_limit_override=3)
+        limited_client = TestClient(limited_app)
+
+        # Make 3 requests (within limit)
+        for _ in range(3):
+            r = limited_client.get("/api/model-info")
+            self.assertEqual(r.status_code, 200)
+
+        # 4th request must be rate-limited with 429
+        rate_limited_res = limited_client.get("/api/model-info")
+        self.assertEqual(rate_limited_res.status_code, 429)
+        self.assertEqual(rate_limited_res.headers.get("Retry-After"), "60")
+        self.assertIn("Rate limit exceeded", rate_limited_res.json()["detail"])
+
+    def test_production_missing_secret_fails_startup(self) -> None:
+        """
+        Task 1 & Task 2: Production mode missing secret halts startup.
+        """
+        with patch.dict(os.environ, {"APP_ENV": "production", "PHI_HMAC_SECRET": ""}):
+            app_prod = create_app()
+            with self.assertRaises(RuntimeError) as ctx:
+                with TestClient(app_prod):
+                    pass
+            self.assertIn("CRITICAL", str(ctx.exception))
+
+    def test_production_checksum_mismatch_fails_startup(self) -> None:
+        """
+        Task 2: Production mode with corrupt/mismatched checkpoint hash halts startup.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_ckpt = Path(tmpdir) / "corrupt_model.pt"
+            fake_ckpt.write_text("corrupted_data_bytes", encoding="utf-8")
+            with patch.dict(os.environ, {
+                "APP_ENV": "production",
+                "PHI_HMAC_SECRET": "a" * 32,
+                "CHEXPERT_CHECKPOINT": str(fake_ckpt),
+                "CHEXPERT_CHECKPOINT_SHA256": "0000000000000000000000000000000000000000000000000000000000000000",
+            }):
+                app_prod = create_app()
+                with self.assertRaises(RuntimeError) as ctx:
+                    with TestClient(app_prod):
+                        pass
+                self.assertIn("Integrity check failed", str(ctx.exception))
 
     def test_batch_predict_chunking_and_client_ids(self) -> None:
         buf = io.BytesIO()
