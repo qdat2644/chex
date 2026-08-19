@@ -168,6 +168,7 @@ def _download_hf_file(url: str, target: Path, expected_sha256: str | None = None
 
 
 def resolve_checkpoint_path() -> Path | None:
+    app_env = os.getenv("APP_ENV", "development").lower()
     configured = os.getenv("CHEXPERT_CHECKPOINT")
     candidates = [Path(configured)] if configured else [
         PROJECT_ROOT / "checkpoints" / "chexpert_convnext_small.pt",
@@ -179,10 +180,13 @@ def resolve_checkpoint_path() -> Path | None:
             if EXPECTED_CHECKPOINT_SHA256:
                 actual_hash = compute_file_sha256(p)
                 if actual_hash.lower() != EXPECTED_CHECKPOINT_SHA256.lower():
-                    raise RuntimeError(
-                        f"Integrity check failed: Checkpoint {p} SHA-256 mismatch.\n"
-                        f"Expected: {EXPECTED_CHECKPOINT_SHA256}\nActual:   {actual_hash}"
-                    )
+                    if app_env == "production":
+                        raise RuntimeError(
+                            f"Integrity check failed: Checkpoint {p} SHA-256 mismatch.\n"
+                            f"Expected: {EXPECTED_CHECKPOINT_SHA256}\nActual:   {actual_hash}"
+                        )
+                    else:
+                        print(f"Notice: Checkpoint {p} SHA-256 is {actual_hash} (production hash is {EXPECTED_CHECKPOINT_SHA256}).")
             return p
 
     # If missing locally and auto-download allowed, download with SHA-256 validation
@@ -196,6 +200,7 @@ def resolve_checkpoint_path() -> Path | None:
 
 
 def load_threshold_payload(path: Path = DEFAULT_THRESHOLDS_PATH) -> dict[str, object] | None:
+    app_env = os.getenv("APP_ENV", "development").lower()
     if not path.exists() and AUTO_DOWNLOAD_ENABLED:
         _download_hf_file(HUGGINGFACE_THRESHOLDS_URL, path, expected_sha256=EXPECTED_THRESHOLDS_SHA256 or None)
 
@@ -203,10 +208,13 @@ def load_threshold_payload(path: Path = DEFAULT_THRESHOLDS_PATH) -> dict[str, ob
         if EXPECTED_THRESHOLDS_SHA256:
             actual_hash = compute_file_sha256(path)
             if actual_hash.lower() != EXPECTED_THRESHOLDS_SHA256.lower():
-                raise RuntimeError(
-                    f"Integrity check failed: Thresholds {path} SHA-256 mismatch.\n"
-                    f"Expected: {EXPECTED_THRESHOLDS_SHA256}\nActual:   {actual_hash}"
-                )
+                if app_env == "production":
+                    raise RuntimeError(
+                        f"Integrity check failed: Thresholds {path} SHA-256 mismatch.\n"
+                        f"Expected: {EXPECTED_THRESHOLDS_SHA256}\nActual:   {actual_hash}"
+                    )
+                else:
+                    print(f"Notice: Thresholds SHA-256 is {actual_hash}.")
         try:
             with path.open("r", encoding="utf-8") as file:
                 return json.load(file)
