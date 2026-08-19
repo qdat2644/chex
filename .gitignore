@@ -27,6 +27,14 @@ outputs/*
 !outputs/evaluation/sample_predictions.csv
 *.log
 
+# LaTeX build artifacts
+*.aux
+*.out
+*.fls
+*.fdb_latexmk
+*.pdf
+*.synctex.gz
+
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

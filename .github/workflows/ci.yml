@@ -21,20 +21,24 @@ jobs:
           python -m compileall -q app/ scripts/ tests/
 
   unit-tests:
-    name: Test Suite & Protocol Integrity
+    name: Test Suite & Protocol Integrity (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python 3.11
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
       - name: Install Dependencies
         run: |
-          pip install --upgrade pip
-          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install -r requirements.txt
-          pip install scipy pyyaml
+          python -m pip install --upgrade pip
+          python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements.txt
+          python -m pip check
       - name: Run Unit & Protocol Integrity Tests
         run: |
           python -m unittest discover -s tests -p "test_*.py" -v
@@ -66,20 +70,41 @@ jobs:
           python scripts/sync_reports.py --check
 
   latex-build:
-    name: LaTeX Document & Table Compilation
+    name: LaTeX Document & Protocol Compilation
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install TeX Live
+      - name: Install TeX Live & latexmk
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends texlive-latex-base texlive-latex-recommended texlive-fonts-recommended
-      - name: Compile LaTeX Tables
+          sudo apt-get install -y --no-install-recommends \
+            latexmk \
+            texlive-latex-base \
+            texlive-latex-recommended \
+            texlive-latex-extra \
+            texlive-fonts-recommended
+      - name: Compile LaTeX Documents
         run: |
-          cd docs && pdflatex -interaction=nonstopmode -halt-on-error table_check.tex
-      - name: Upload PDF Artifact
+          latexmk -cd -pdf -interaction=nonstopmode -halt-on-error docs/table_check.tex
+          latexmk -cd -pdf -interaction=nonstopmode -halt-on-error docs/protocol.tex
+      - name: Check for LaTeX Citation/Reference Warnings
+        run: |
+          if grep -Eqi "undefined citations|undefined references|Citation .* undefined|Reference .* undefined" docs/protocol.log; then
+            echo "ERROR: Undefined LaTeX citation/reference detected in protocol.log!"
+            exit 1
+          fi
+          echo "LaTeX compilation verification passed with zero undefined citations/references."
+      - name: Upload PDF Artifacts
         uses: actions/upload-artifact@v4
-        if: always()
+        if: success()
         with:
           name: latex-pdf-build
-          path: docs/table_check.pdf
+          path: |
+            docs/table_check.pdf
+            docs/protocol.pdf
+      - name: Upload Build Logs on Failure
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: latex-build-logs
+          path: docs/*.log

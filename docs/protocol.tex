@@ -1,0 +1,84 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{caption}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\title{\textbf{Scientific Evaluation Protocol v0.1: Comparative Analysis of Thoracic Pathology Classification on Frontal Chest Radiographs}}
+\author{CheXpert Research Pipeline Team}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This document establishes the pre-specified, fail-closed scientific protocol for evaluating deep learning architectures (DenseNet-121 and ConvNeXt-Small) on frontal chest radiograph interpretation. The protocol guarantees patient-level data segregation, independent threshold calibration, pre-registered locked-test evaluation, 5-seed probability ensembling, and paired statistical hypothesis testing with Holm-Bonferroni family-wise error rate control.
+\end{abstract}
+
+\section{Research Question and Scope}
+\label{sec:research_question}
+The primary objective of this study is to conduct an empirical, reproducible comparison between a established baseline architecture (\textbf{DenseNet-121}) and a modern pure convolutional architecture (\textbf{ConvNeXt-Small}) across five target pathologies:
+\begin{enumerate}
+    \item Atelectasis
+    \item Cardiomegaly
+    \item Consolidation
+    \item Edema
+    \item Pleural Effusion
+\end{enumerate}
+
+\section{Data Partitioning and Anti-Leakage Architecture}
+\label{sec:data_partitioning}
+To prevent data contamination and overly optimistic generalization estimates, the dataset is strictly partitioned at the \textbf{patient level} ($N_{\text{patients}}$):
+\begin{itemize}
+    \item \textbf{Training Partition (80\%)}: Exclusively utilized for gradient-based parameter optimization.
+    \item \textbf{Internal Validation Partition (10\%)}: Utilized solely for learning rate scheduling, early stopping (patience = 5 epochs), and checkpoint selection based on macro AUROC.
+    \item \textbf{Calibration Partition (10\%)}: Reserved exclusively for decision threshold optimization ($\tau_c$) maximizing finding-specific $F_1$ score.
+    \item \textbf{Locked Test Partition}: Derived from the official CheXpert validation cohort, completely sealed and hashed prior to pre-registered evaluation.
+\end{itemize}
+
+\section{Multi-Seed Ensemble and Training Protocol}
+\label{sec:training_protocol}
+Both architectures are trained across five pre-specified random seeds ($S = \{42, 43, 44, 45, 46\}$) under identical optimization hyperparameters:
+\begin{itemize}
+    \item \textbf{Loss Function}: Asymmetric Loss (ASL) with $\gamma_- = 4.0, \gamma_+ = 0.0$.
+    \item \textbf{Optimization}: AdamW optimizer with learning rate $\eta = 10^{-4}$, weight decay $\lambda = 0.01$, and cosine annealing schedule.
+    \item \textbf{Ensemble Formulation}: The primary inferential prediction for patient $i$ on finding $c$ is the arithmetic mean across all five seeds:
+    \begin{equation}
+        \bar{p}_{i,c} = \frac{1}{|S|} \sum_{s \in S} p_{i,c}^{(s)}
+    \end{equation}
+\end{itemize}
+
+\section{Statistical Inference and Hypothesis Testing}
+\label{sec:statistical_inference}
+To assess statistical significance between the ensemble models:
+\begin{enumerate}
+    \item \textbf{Macro AUROC Difference}: Evaluated using a 2,000-replicate patient-level clustered non-parametric bootstrap to construct 95\% percentile confidence intervals for $\Delta \text{AUROC} = \text{AUROC}_{\text{ConvNeXt}} - \text{AUROC}_{\text{DenseNet}}$.
+    \item \textbf{Per-Label Significance}: Evaluated via non-parametric paired DeLong tests with Holm-Bonferroni step-down correction for multiple testing across the 5 findings.
+\end{enumerate}
+
+\section{Pre-Specified Benchmark Results}
+\label{sec:results}
+In accordance with our pre-registration commitment, all results remain TBD until the frozen ledger has been executed on the locked test partition:
+
+\begin{center}
+\input{../outputs/evaluation/table_results.tex}
+\end{center}
+
+\section{Reproducibility and Ledger Verification}
+\label{sec:reproducibility}
+Execution of the final locked evaluation requires a fail-closed frozen ledger (\texttt{outputs/frozen/protocol\_v0\_1.json}) containing deterministic SHA-256 hashes of all 10 model checkpoints, 10 threshold artifacts, dataset manifests, and configuration files.
+
+\end{document}
