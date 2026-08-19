@@ -48,6 +48,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
       - name: Check for Unsafe weights_only=False in App Code
         run: |
           if grep -rn "weights_only=False" app/; then
@@ -57,11 +61,7 @@ jobs:
           echo "weights_only=True check passed."
       - name: Scan for Secret Leaks & Prohibited Tokens
         run: |
-          if grep -rnE "KAGGLE_TOKEN=|KGAT_|\"kaggle_key\"|google\.colab" --exclude="test_secret_leakage.py" .; then
-            echo "ERROR: Potential secret or prohibited Colab import detected!"
-            exit 1
-          fi
-          echo "Secret scanning passed."
+          python tests/test_secret_leakage.py
 
   report-sync-check:
     name: Report & LaTeX Synchronization Check
