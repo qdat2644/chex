@@ -28,10 +28,23 @@ def compute_file_sha256(filepath: Path) -> str:
     return digest
 
 
+import shutil
+
+def get_git_exe() -> str:
+    exe = shutil.which("git")
+    if exe:
+        return exe
+    local_tool = PROJECT_ROOT / "tools" / "git" / "cmd" / "git.exe"
+    if local_tool.is_file():
+        return str(local_tool)
+    return "git"
+
+
 def get_clean_git_commit(allow_dirty: bool = False) -> str:
+    git_bin = get_git_exe()
     try:
         status_output = subprocess.check_output(
-            ["git", "status", "--porcelain"],
+            [git_bin, "status", "--porcelain"],
             cwd=str(PROJECT_ROOT),
             text=True,
         ).strip()
@@ -42,7 +55,7 @@ def get_clean_git_commit(allow_dirty: bool = False) -> str:
             )
 
         commit_sha = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
+            [git_bin, "rev-parse", "HEAD"],
             cwd=str(PROJECT_ROOT),
             text=True,
         ).strip()

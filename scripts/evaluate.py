@@ -30,9 +30,21 @@ from app.dataset import CheXpertDataset
 from app.model import CheXpertPredictor
 
 
+import shutil
+
+def get_git_exe() -> str:
+    exe = shutil.which("git")
+    if exe:
+        return exe
+    local_tool = PROJECT_ROOT / "tools" / "git" / "cmd" / "git.exe"
+    if local_tool.is_file():
+        return str(local_tool)
+    return "git"
+
+
 def get_git_commit_sha() -> str:
     try:
-        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(PROJECT_ROOT), text=True).strip()
+        return subprocess.check_output([get_git_exe(), "rev-parse", "HEAD"], cwd=str(PROJECT_ROOT), text=True).strip()
     except Exception:
         return "UNKNOWN"
 
