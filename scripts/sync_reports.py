@@ -12,7 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 def compute_file_sha256(filepath: Path) -> str:
-    if not filepath.exists():
+    if not filepath.is_file():
         return "NOT_FOUND"
     h = hashlib.sha256()
     with filepath.open("rb") as f:
@@ -84,20 +84,20 @@ Results must not be entered manually. README and LaTeX tables are generated from
 """.strip() + "\n"
 
 
-def generate_live_latex_table(data: dict) -> str:
+def generate_live_latex_results_table(data: dict) -> str:
     m_conv = data.get("architectures", {}).get("convnext_small", {}).get("metrics_per_label", {})
     m_dense = data.get("architectures", {}).get("densenet121", {}).get("metrics_per_label", {})
-    comp = data.get("model_comparison", {}).get("per_label_comparison", {})
+    comp = data.get("model_comparison", {}).get("results_per_label", {})
 
     lines = [
         r"\begin{table*}[t]",
         r"\centering",
         r"\small",
-        r"\caption{Locked-Test Empirical Frontal Chest Radiograph Diagnostic Performance. Point estimates denote AUROC with 95\% patient-level cluster bootstrap confidence intervals (2,000 resamples). $p$-values evaluated via paired DeLong test with Holm-Bonferroni correction.}",
+        r"\caption{Locked-Test Empirical Frontal Chest Radiograph Diagnostic Performance on 5-Seed Ensemble. Point estimates denote AUROC with 95\% patient-level cluster bootstrap confidence intervals (2,000 resamples). $p$-values evaluated via paired DeLong test with Holm-Bonferroni correction.}",
         r"\label{tab:chexpert_benchmark}",
         r"\begin{tabular}{lcccc}",
         r"\toprule",
-        r"\textbf{Pathology Finding} & \textbf{DenseNet-121} & \textbf{ConvNeXt-Small} & \textbf{$\Delta$ AUROC (95\% CI)} & \textbf{DeLong $p_{\text{adj}}$} \\",
+        r"\textbf{Pathology Finding} & \textbf{DenseNet-121 (5-Seed)} & \textbf{ConvNeXt-Small (5-Seed)} & \textbf{$\Delta$ AUROC (95\% CI)} & \textbf{DeLong $p_{\text{adj}}$} \\",
         r"\midrule",
     ]
 
@@ -124,6 +124,41 @@ def generate_live_latex_table(data: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def generate_live_readme(data: dict) -> str:
+    m_conv = data.get("architectures", {}).get("convnext_small", {}).get("metrics_per_label", {})
+    m_dense = data.get("architectures", {}).get("densenet121", {}).get("metrics_per_label", {})
+    comp = data.get("model_comparison", {}).get("results_per_label", {})
+
+    rows = []
+    for label in ["Atelectasis", "Cardiomegaly", "Consolidation", "Edema", "Pleural Effusion"]:
+        d_ci = m_dense.get(label, {}).get("ci_95", "TBD")
+        c_ci = m_conv.get(label, {}).get("ci_95", "TBD")
+        delta_ci = comp.get(label, {}).get("delta_auc_95_ci", "TBD")
+        p_adj = comp.get(label, {}).get("delong_p_holm_adj")
+        p_str = f"{p_adj:.3f}" if p_adj is not None else "TBD"
+        rows.append(f"| **{label}** | {d_ci} | {c_ci} | {delta_ci} | {p_str} |")
+
+    mean_d = data.get("architectures", {}).get("densenet121", {}).get("macro_auroc_95_ci", "TBD")
+    mean_c = data.get("architectures", {}).get("convnext_small", {}).get("macro_auroc_95_ci", "TBD")
+    delta_m = data.get("model_comparison", {}).get("macro_comparison", {}).get("macro_delta_95_ci", "TBD")
+
+    table_body = "\n".join(rows)
+
+    return f"""# CheXpert AI Workstation
+
+> **Protocol status:** Protocol-compliant locked evaluation completed. Single source artifact: `{data.get('git_commit', 'UNKNOWN')}`.
+
+## Benchmark Results (5-Seed Ensemble)
+
+| Finding | DenseNet-121 (5-Seed) | ConvNeXt-Small (5-Seed) | $\\Delta$ AUROC (95% CI) | Paired DeLong $p_{{\\text{{adj}}}}$ |
+|---|---:|---:|---:|---:|
+{table_body}
+| **Macro AUROC** | **{mean_d}** | **{mean_c}** | **{delta_m}** | — |
+
+Generated automatically from `outputs/final/protocol_v0_1/benchmark_artifact.json`.
+"""
+
+
 def main():
     parser = argparse.ArgumentParser(description="Synchronize README and LaTeX tables strictly from final benchmark artifact.")
     parser.add_argument("--artifact", type=Path, help="Path to final benchmark_artifact.json")
@@ -136,18 +171,17 @@ def main():
     tex_per_label_path = tex_eval_dir / "table_per_label.tex"
     tex_comp_path = tex_eval_dir / "model_comparison.tex"
 
-    # Also keep protocol_v0_1 output in sync if requested
     tex_final_dir = PROJECT_ROOT / "outputs" / "final" / "protocol_v0_1"
     tex_final_results = tex_final_dir / "table_results.tex"
 
     artifact_file = args.artifact or PROJECT_ROOT / "outputs" / "final" / "protocol_v0_1" / "benchmark_artifact.json"
 
-    if artifact_file.exists():
+    if artifact_file.is_file():
         try:
             data = json.loads(artifact_file.read_text(encoding="utf-8"))
             if data.get("artifact_type") == "official_scientific_benchmark" and data.get("architectures"):
-                tex_content = generate_live_latex_table(data)
-                readme_content = generate_tbd_readme()
+                tex_content = generate_live_latex_results_table(data)
+                readme_content = generate_live_readme(data)
             else:
                 tex_content = generate_tbd_latex()
                 readme_content = generate_tbd_readme()
@@ -165,7 +199,7 @@ def main():
         (tex_comp_path, tex_content),
     ]
 
-    if artifact_file.exists():
+    if artifact_file.is_file():
         targets.append((tex_final_results, tex_content))
 
     if args.check:

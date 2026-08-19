@@ -32,14 +32,14 @@ from app.model import CheXpertPredictor
 
 def get_git_commit_sha() -> str:
     try:
-        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(PROJECT_ROOT), text=True).strip()
     except Exception:
         return "UNKNOWN"
 
 
 def compute_file_sha256(filepath: Path) -> str:
-    if not filepath.exists():
-        return "NOT_FOUND"
+    if not filepath.is_file():
+        raise FileNotFoundError(f"Cannot compute SHA-256: file does not exist at '{filepath}'")
     h = hashlib.sha256()
     with filepath.open("rb") as f:
         while chunk := f.read(65536):
@@ -48,9 +48,6 @@ def compute_file_sha256(filepath: Path) -> str:
 
 
 def compute_expected_calibration_error(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 15) -> float:
-    """
-    Computes Expected Calibration Error (ECE) with fixed equal-width probability bins.
-    """
     bin_boundaries = np.linspace(0, 1, n_bins + 1)
     ece = 0.0
     total_samples = len(y_true)
@@ -84,10 +81,6 @@ def patient_level_cluster_bootstrap(
     n_boot: int = 2000,
     seed: int = 42,
 ) -> dict[str, dict[str, tuple[float, float]]]:
-    """
-    Patient-level cluster bootstrap: samples patient IDs with replacement,
-    aggregates all studies belonging to selected patients, and calculates 95% percentile CIs.
-    """
     rng = np.random.RandomState(seed)
     unique_patients = np.unique(patient_ids)
     n_patients = len(unique_patients)
@@ -98,7 +91,6 @@ def patient_level_cluster_bootstrap(
             patient_to_indices[pid] = []
         patient_to_indices[pid].append(idx)
 
-    # Storage for bootstrap distributions
     auc_dist: dict[str, list[float]] = {lbl: [] for lbl in labels}
     f1_dist: dict[str, list[float]] = {lbl: [] for lbl in labels}
     sens_dist: dict[str, list[float]] = {lbl: [] for lbl in labels}
@@ -170,46 +162,89 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--locked-test-manifest", type=Path, required=True, help="Path to locked_test_manifest.json")
     parser.add_argument("--checkpoint", type=Path, required=True, help="Trained model checkpoint .pt")
     parser.add_argument("--threshold-artifact", type=Path, required=True, help="Frozen threshold artifact JSON")
+    parser.add_argument("--frozen-ledger", type=Path, help="Path to outputs/frozen/protocol_v0_1.json ledger (MANDATORY for final evaluation)")
     parser.add_argument("--data-root", type=Path, default=PROJECT_ROOT / "archive", help="Data root directory")
     parser.add_argument("--output-dir", type=Path, help="Output directory for predictions and report")
+    parser.add_argument("--arch", type=str, help="Expected architecture name (e.g. convnext_small, densenet121)")
+    parser.add_argument("--seed", type=int, default=42, help="Expected seed")
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--limit", type=int, help="Optional subset limit for fast testing")
+    parser.add_argument("--limit", type=int, help="Subset limit (STRICTLY FORBIDDEN in final evaluation)")
     parser.add_argument("--n-boot", type=int, default=2000, help="Number of bootstrap resamples (>= 2000)")
-    parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
 
 @torch.inference_mode()
 def main() -> None:
     args = parse_args()
+
+    # 1. Guard against --limit in final evaluation mode
+    if args.frozen_ledger and args.limit:
+        raise RuntimeError("FAIL-CLOSED ERROR: --limit is strictly forbidden during final frozen evaluation!")
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    # 1. Verify Locked-Test Manifest
-    if not args.locked_test_manifest.exists():
-        raise FileNotFoundError(f"Locked test manifest not found: {args.locked_test_manifest}")
+    # 2. Verify Locked-Test Manifest
+    if not args.locked_test_manifest.is_file():
+        raise FileNotFoundError(f"Locked test manifest not found: '{args.locked_test_manifest}'")
 
-    manifest_data = json.loads(args.locked_test_manifest.read_text(encoding="utf-8"))
-    manifest_sha256 = compute_file_sha256(args.locked_test_manifest)
+    locked_manifest_data = json.loads(args.locked_test_manifest.read_text(encoding="utf-8"))
+    locked_manifest_sha256 = compute_file_sha256(args.locked_test_manifest)
 
-    if manifest_data.get("role") != "locked_test" or not manifest_data.get("locked"):
+    if locked_manifest_data.get("role") != "locked_test" or not locked_manifest_data.get("locked"):
         raise RuntimeError("SECURITY VIOLATION: Manifest is not marked as role='locked_test' and locked=True!")
 
-    locked_csv = args.locked_test_manifest.parent / manifest_data.get("csv", "locked_test.csv")
-    if not locked_csv.exists():
-        raise FileNotFoundError(f"Locked test CSV not found: {locked_csv}")
+    locked_csv = args.locked_test_manifest.parent / locked_manifest_data.get("csv", "locked_test.csv")
+    if not locked_csv.is_file():
+        raise FileNotFoundError(f"Locked test CSV not found: '{locked_csv}'")
 
-    # 2. Verify Threshold Artifact & Linkage
-    if not args.threshold_artifact.exists():
-        raise FileNotFoundError(f"Threshold artifact not found: {args.threshold_artifact}")
+    # 3. Verify Threshold Artifact & Checkpoint Integrity (Zero Mismatch Tolerance)
+    if not args.checkpoint.is_file():
+        raise FileNotFoundError(f"Checkpoint file not found: '{args.checkpoint}'")
+    if not args.threshold_artifact.is_file():
+        raise FileNotFoundError(f"Threshold artifact not found: '{args.threshold_artifact}'")
 
-    th_data = json.loads(args.threshold_artifact.read_text(encoding="utf-8"))
-    th_sha256 = compute_file_sha256(args.threshold_artifact)
     ckpt_sha256 = compute_file_sha256(args.checkpoint)
+    th_sha256 = compute_file_sha256(args.threshold_artifact)
+    th_data = json.loads(args.threshold_artifact.read_text(encoding="utf-8"))
 
-    # Verify Linkage: Checkpoint SHA match
-    if th_data.get("checkpoint_sha256") and th_data["checkpoint_sha256"] != ckpt_sha256:
-        print(f"WARNING: Threshold artifact checkpoint_sha256 ({th_data['checkpoint_sha256']}) does not match checkpoint ({ckpt_sha256})!", file=sys.stderr)
+    # FAIL-CLOSED: Checkpoint SHA mismatch
+    if th_data.get("checkpoint_sha256") != ckpt_sha256:
+        raise RuntimeError(
+            f"FAIL-CLOSED MISMATCH ERROR: Threshold artifact records checkpoint SHA '{th_data.get('checkpoint_sha256')}' "
+            f"which does not match actual checkpoint '{ckpt_sha256}'!"
+        )
+
+    # 4. Verify Frozen Ledger Linkage (if provided)
+    if args.frozen_ledger:
+        if not args.frozen_ledger.is_file():
+            raise FileNotFoundError(f"Frozen ledger not found: '{args.frozen_ledger}'")
+
+        ledger_data = json.loads(args.frozen_ledger.read_text(encoding="utf-8"))
+        if ledger_data.get("locked_test_manifest_sha256") != locked_manifest_sha256:
+            raise RuntimeError(
+                f"FAIL-CLOSED LEDGER ERROR: Ledger locked_test_manifest_sha256 "
+                f"'{ledger_data.get('locked_test_manifest_sha256')}' does not match manifest '{locked_manifest_sha256}'!"
+            )
+
+        arch_key = args.arch or "convnext_small"
+        seed_key = str(args.seed)
+        arch_models = ledger_data.get("models", {}).get(arch_key, {})
+        seed_entry = arch_models.get(seed_key)
+
+        if not seed_entry:
+            raise RuntimeError(f"FAIL-CLOSED LEDGER ERROR: No ledger entry found for {arch_key} seed {seed_key}!")
+
+        if seed_entry.get("checkpoint_sha256") != ckpt_sha256:
+            raise RuntimeError(
+                f"FAIL-CLOSED LEDGER ERROR: Checkpoint SHA in ledger ({seed_entry.get('checkpoint_sha256')}) "
+                f"does not match actual checkpoint SHA ({ckpt_sha256})!"
+            )
+        if seed_entry.get("threshold_sha256") != th_sha256:
+            raise RuntimeError(
+                f"FAIL-CLOSED LEDGER ERROR: Threshold SHA in ledger ({seed_entry.get('threshold_sha256')}) "
+                f"does not match actual threshold SHA ({th_sha256})!"
+            )
 
     thresholds_dict: dict[str, float] = {}
     for k, v in th_data.get("thresholds", {}).items():
@@ -217,21 +252,25 @@ def main() -> None:
             raise RuntimeError(f"CANNOT EVALUATE: Label '{k}' has null threshold in calibration artifact!")
         thresholds_dict[k] = float(v)
 
-    # 3. Load Model Predictor
+    # 5. Load Model Predictor
     predictor = CheXpertPredictor(args.checkpoint, thresholds=thresholds_dict)
     if predictor.model is None:
-        raise RuntimeError("Checkpoint failed to load.")
+        raise RuntimeError("Checkpoint failed to load into predictor.")
 
-    # 4. Load Locked Test Dataset
+    # 6. Verify Labels & Uncertainty Policy Match
+    if th_data.get("labels") and list(th_data["labels"]) != list(predictor.labels):
+        raise RuntimeError(f"FAIL-CLOSED ERROR: Label order mismatch between threshold artifact and predictor model!")
+
+    # 7. Load Locked Test Dataset
     dataset = CheXpertDataset(
         locked_csv,
         args.data_root,
         predictor.transform,
         labels=predictor.labels,
         uncertain_policy="u_ones_zeros",
-        view=manifest_data.get("view", "frontal"),
+        view=locked_manifest_data.get("view", "frontal"),
     )
-    if args.limit:
+    if args.limit and not args.frozen_ledger:
         dataset = Subset(dataset, range(min(args.limit, len(dataset))))
 
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
@@ -266,7 +305,7 @@ def main() -> None:
     probs_arr = np.array(probs_all)
     masks_arr = np.array(masks_all)
 
-    # 5. Patient-Level Cluster Bootstrap for 95% Confidence Intervals
+    # 8. Patient-Level Cluster Bootstrap for 95% Confidence Intervals
     print(f"Running Patient-Level Cluster Bootstrap ({args.n_boot} resamples)...")
     ci_results = patient_level_cluster_bootstrap(
         patient_ids_all,
@@ -279,7 +318,7 @@ def main() -> None:
         seed=args.seed,
     )
 
-    # 6. Compute Comprehensive Per-Label and Macro Metrics
+    # 9. Compute Comprehensive Per-Label and Macro Metrics
     label_metrics = {}
     valid_aucs = []
     valid_f1s = []
@@ -296,7 +335,6 @@ def main() -> None:
         th = thresholds_dict[label]
         y_pred = (y_prob >= th).astype(int)
 
-        # Point estimates directly from original data
         if len(np.unique(y_true)) > 1:
             point_auc = float(roc_auc_score(y_true, y_prob))
             auprc = float(average_precision_score(y_true, y_prob))
@@ -349,8 +387,10 @@ def main() -> None:
     out_dir = args.output_dir or PROJECT_ROOT / "outputs" / "evaluation"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 7. Export Anonymized Stable Prediction CSV
-    pred_csv_path = out_dir / f"{predictor.architecture}_seed{args.seed}_locked_predictions.csv"
+    arch_name = args.arch or predictor.architecture.lower().replace("-", "_")
+
+    # 10. Export Anonymized Stable Prediction CSV
+    pred_csv_path = out_dir / f"{arch_name}_seed{args.seed}_locked_predictions.csv"
     pred_records = []
     for i in range(len(dataset)):
         rec = {
@@ -367,7 +407,7 @@ def main() -> None:
     pd.DataFrame(pred_records).to_csv(pred_csv_path, index=False)
     print(f"Exported prediction CSV: {pred_csv_path}")
 
-    # 8. Export Evaluation Report
+    # 11. Export Evaluation Report
     report = {
         "schema_version": "1.0",
         "protocol_version": "0.1",
@@ -375,9 +415,9 @@ def main() -> None:
         "git_commit": get_git_commit_sha(),
         "checkpoint": str(args.checkpoint),
         "checkpoint_sha256": ckpt_sha256,
-        "locked_test_manifest_sha256": manifest_sha256,
+        "locked_test_manifest_sha256": locked_manifest_sha256,
         "threshold_artifact_sha256": th_sha256,
-        "model_architecture": predictor.architecture,
+        "model_architecture": arch_name,
         "seed": args.seed,
         "num_studies": len(dataset),
         "num_patients": len(set(patient_ids_all)),
@@ -393,12 +433,12 @@ def main() -> None:
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
-    report_path = out_dir / f"{predictor.architecture}_seed{args.seed}_report.json"
+    report_path = out_dir / f"{arch_name}_seed{args.seed}_report.json"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"Saved evaluation report: {report_path}")
 
     print("\n=== LOCKED TEST BENCHMARK RESULTS ===")
-    print(f"Macro Mean AUROC: {report['macro_metrics']['mean_auroc_95_ci']}")
+    print(f"Architecture: {arch_name} (Seed {args.seed}) | Macro Mean AUROC: {report['macro_metrics']['mean_auroc_95_ci']}")
     for lbl, m in label_metrics.items():
         print(f"  {lbl:20s}: AUROC={m['ci_95']} | Sens={m['sensitivity']:.3f} | Spec={m['specificity']:.3f} | F1={m['f1_score']:.3f} | ECE={m['ece_15bins']:.3f}")
 
