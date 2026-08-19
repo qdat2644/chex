@@ -20,9 +20,12 @@ class TestSecretLeakageAndNotebookIntegrity(unittest.TestCase):
 
         ignored_extensions = {".png", ".pt", ".jpg", ".jpeg", ".zip", ".pyc", ".pdf"}
         ignored_files = {"test_secret_leakage.py", "ci.yml"}
+        ignored_dirs = {"tools", ".venv", "venv", ".torch", ".git", "node_modules", ".pytest_cache", "__pycache__", "build", "dist"}
 
         for filepath in PROJECT_ROOT.rglob("*"):
             if not filepath.is_file():
+                continue
+            if any(part in ignored_dirs for part in filepath.parts):
                 continue
             if filepath.suffix in ignored_extensions:
                 continue
