@@ -93,6 +93,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, help="Directory to save run artifacts (e.g. outputs/runs/convnext_small/seed_42)")
     parser.add_argument("--arch", choices=SUPPORTED_ARCHITECTURES, default="convnext_small", help="Model architecture")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--epochs", type=int, help="Optional training epochs (overrides config)")
+    parser.add_argument("--batch-size", type=int, help="Optional batch size (overrides config)")
+    parser.add_argument("--num-workers", type=int, default=None, help="DataLoader worker processes")
     parser.add_argument("--limit", type=int, help="Optional subset limit for fast smoke testing")
     parser.add_argument("--resume", type=Path, help="Resume training from an existing checkpoint .pt")
     return parser.parse_args()
@@ -195,8 +198,9 @@ def checkpoint_payload(
     labels: list[str],
     metadata: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    raw_model = model.module if isinstance(model, torch.nn.DataParallel) else model
     return {
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": raw_model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict() if optimizer else None,
         "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
         "rng_state": {
@@ -228,36 +232,30 @@ def main():
     manifest_data = json.loads(args.manifest.read_text(encoding="utf-8"))
     manifest_sha256 = compute_file_sha256(args.manifest)
 
-    # Reject if manifest contains locked_test role
-    splits = manifest_data.get("splits", {})
-    if "locked_test" in splits or manifest_data.get("role") == "locked_test":
-        raise RuntimeError("LEAKAGE PREVENTION ERROR: Manifest contains locked_test! Training is forbidden on locked test set.")
+    # Security Guard: Reject locked test manifest
+    if manifest_data.get("role") == "locked_test" or manifest_data.get("locked"):
+        raise RuntimeError("SECURITY VIOLATION: train.py cannot accept locked test manifest!")
 
-    train_meta = splits.get("train", {})
-    val_meta = splits.get("internal_validation", {})
+    train_csv = args.manifest.parent / manifest_data["splits"]["train"]["csv"]
+    val_csv = args.manifest.parent / manifest_data["splits"]["internal_validation"]["csv"]
 
-    if not train_meta or not val_meta:
-        raise RuntimeError("LEAKAGE PREVENTION ERROR: Manifest must contain 'train' and 'internal_validation' split definitions!")
+    if not train_csv.is_file():
+        raise FileNotFoundError(f"Missing train CSV: {train_csv}")
+    if not val_csv.is_file():
+        raise FileNotFoundError(f"Missing internal validation CSV: {val_csv}")
 
-    train_csv = args.manifest.parent / train_meta.get("csv", "train.csv")
-    val_csv = args.manifest.parent / val_meta.get("csv", "internal_validation.csv")
-
-    if not train_csv.exists() or not val_csv.exists():
-        raise FileNotFoundError(f"Missing split CSVs referenced in manifest: {train_csv} or {val_csv}")
-
-    # Set Output Directory
+    # 3. Setup Hyperparameters & Preprocessing
     out_dir = args.output_dir or PROJECT_ROOT / "outputs" / "runs" / args.arch / f"seed_{args.seed}"
     out_dir.mkdir(parents=True, exist_ok=True)
     logs_dir = out_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    # Extract Configuration Parameters
     train_cfg = config.get("training", {})
     aug_cfg = config.get("augmentation", {})
     model_cfg = config.get("model", {})
 
-    epochs = int(train_cfg.get("epochs", 20))
-    batch_size = int(train_cfg.get("batch_size", 32))
+    epochs = int(args.epochs) if args.epochs else int(train_cfg.get("epochs", 20))
+    batch_size = int(args.batch_size) if args.batch_size else int(train_cfg.get("batch_size", 32))
     lr = float(train_cfg.get("learning_rate", 1e-4))
     weight_decay = float(train_cfg.get("weight_decay", 1e-2))
     patience = int(train_cfg.get("early_stopping_patience", 5))
@@ -270,7 +268,7 @@ def main():
     h_flip = bool(aug_cfg.get("horizontal_flip", False))
     labels = model_cfg.get("labels", DEFAULT_LABELS)
 
-    # Preprocessing Pipeline Definition
+    # Preprocessing Pipeline
     train_transform_list = [transforms.Resize((image_size, image_size))]
     if rot_degrees > 0:
         train_transform_list.append(transforms.RandomRotation(degrees=rot_degrees))
@@ -319,24 +317,35 @@ def main():
         train_dataset = Subset(train_dataset, range(min(args.limit, len(train_dataset))))
         val_dataset = Subset(val_dataset, range(min(max(2, args.limit // 4), len(val_dataset))))
 
+    import os
+    if args.num_workers is not None:
+        workers = args.num_workers
+    else:
+        workers = min(4, os.cpu_count() or 2) if torch.cuda.is_available() else 0
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=workers,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=(workers > 0),
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=workers,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=(workers > 0),
     )
 
     # Initialize Model & Loss
     model = build_model(args.arch, len(labels), pretrained=pretrained).to(device)
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        print(f"[Multi-GPU] Detected {torch.cuda.device_count()} GPUs. Wrapping model with DataParallel.")
+        model = torch.nn.DataParallel(model)
 
     if loss_name == "asl":
         criterion = AsymmetricLoss(gamma_neg=4.0, gamma_pos=1.0, clip=0.05)
