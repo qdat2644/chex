@@ -14,7 +14,6 @@ from torch.utils.data import DataLoader
 from app.dataset import CheXpertDataset
 from scripts.train import (
     AsymmetricLoss,
-    checkpoint_payload,
     run_epoch,
     set_seed,
 )

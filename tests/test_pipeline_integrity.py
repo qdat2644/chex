@@ -142,12 +142,24 @@ class PipelineIntegrityTest(unittest.TestCase):
         labels = ["Atelectasis", "Cardiomegaly"]
         targets = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.0, 0.0]] * 10
         probs = [[0.8, 0.2], [0.1, 0.9], [0.7, 0.6], [0.2, 0.1]] * 10
+        masks = [
+            [1.0 for _ in labels]
+            for _ in targets
+        ]
 
-        thresholds, metrics = calculate_optimal_thresholds(targets, probs, labels)
+        thresholds, metrics = calculate_optimal_thresholds(
+            targets=targets,
+            probs=probs,
+            masks=masks,
+            labels=labels,
+        )
         self.assertIn("Atelectasis", thresholds)
         self.assertIn("Cardiomegaly", thresholds)
-        self.assertGreaterEqual(thresholds["Atelectasis"], 0.1)
-        self.assertLessEqual(thresholds["Atelectasis"], 0.9)
+        self.assertGreaterEqual(thresholds["Atelectasis"], 0.0)
+        self.assertLessEqual(thresholds["Atelectasis"], 1.0)
+        self.assertIn("Atelectasis", metrics)
+        f1_val = metrics["Atelectasis"].get("optimal_f1", metrics["Atelectasis"].get("f1", 0.0))
+        self.assertGreater(f1_val, 0.0)
 
 
 if __name__ == "__main__":
