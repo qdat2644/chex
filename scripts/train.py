@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
 import shutil
 import sys
+import time
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 import torch
@@ -24,9 +27,19 @@ from app.dataset import CheXpertDataset
 from app.model import build_model
 
 
+def compute_file_sha256(filepath: Path) -> str:
+    if not filepath.exists():
+        return "NOT_FOUND"
+    h = hashlib.sha256()
+    with filepath.open("rb") as f:
+        while chunk := f.read(65536):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 class AsymmetricLoss(torch.nn.Module):
     """
-    Asymmetric Loss for Multi-Label Classification.
+    Asymmetric Loss for Multi-Label Classification with strict masking.
     Reduces the impact of easy negative examples and emphasizes hard positive examples.
     """
     def __init__(self, gamma_neg: float = 4.0, gamma_pos: float = 1.0, clip: float = 0.05, eps: float = 1e-8):
@@ -80,20 +93,20 @@ class FocalLoss(torch.nn.Module):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train an optimized CheXpert multi-label classifier.")
-    parser.add_argument("--data-root", type=Path, required=True)
-    parser.add_argument("--train-csv", type=Path)
-    parser.add_argument("--valid-csv", type=Path)
-    parser.add_argument("--valid-split", type=float, default=0.1)
+    parser = argparse.ArgumentParser(description="Train an optimized leak-free CheXpert multi-label classifier.")
+    parser.add_argument("--data-root", type=Path, required=True, help="Data root directory containing images")
+    parser.add_argument("--split-manifest", type=Path, help="Path to outputs/splits/manifest.json (preferred)")
+    parser.add_argument("--train-csv", type=Path, help="Explicit path to train.csv split")
+    parser.add_argument("--val-csv", type=Path, help="Explicit path to internal_val.csv split")
     parser.add_argument("--limit", type=int, help="Use a small subset for quick smoke tests.")
     parser.add_argument("--output", type=Path, default=Path("checkpoints/chexpert_model.pt"))
     parser.add_argument("--resume", type=Path, help="Path to checkpoint .pt to resume training from.")
-    parser.add_argument("--backup-dir", type=Path, help="Directory to automatically backup checkpoints to (e.g. Google Drive).")
+    parser.add_argument("--backup-dir", type=Path, help="Directory to automatically backup checkpoints to.")
     parser.add_argument(
         "--arch",
         choices=SUPPORTED_ARCHITECTURES,
-        default="densenet121",
-        help="Backbone architecture: densenet121, convnext_small, efficientnet_v2_m, resnet50",
+        default="convnext_small",
+        help="Backbone architecture: convnext_small, densenet121, efficientnet_v2_m, resnet50",
     )
     parser.add_argument(
         "--loss",
@@ -102,10 +115,12 @@ def parse_args() -> argparse.Namespace:
         help="Loss function: asl (Asymmetric Loss), focal (Focal Loss), bce (Binary Cross Entropy)",
     )
     parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE, help="Input resolution (e.g. 224, 384)")
-    parser.add_argument("--epochs", type=int, default=6)
+    parser.add_argument("--epochs", type=int, default=20, help="Total training epochs (default protocol: 20)")
+    parser.add_argument("--patience", type=int, default=5, help="Early stopping patience epochs (default: 5)")
+    parser.add_argument("--weight-decay", type=float, default=1e-2, help="Optimizer weight decay (default: 0.01)")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument(
         "--uncertain-policy",
         choices=["u_ones_zeros", "smooth", "zero", "one", "ignore"],
@@ -118,37 +133,64 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--pos-weight", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--pretrained", action="store_true", help="Initialize backbone with ImageNet pretrained weights.")
-    parser.add_argument(
-        "--scheduler",
-        choices=["cosine", "plateau", "none"],
-        default="cosine",
-        help="LR scheduler: cosine=CosineAnnealingLR, plateau=ReduceLROnPlateau, none=fixed LR.",
-    )
+    parser.add_argument("--horizontal-flip", action="store_true", default=False, help="Enable horizontal flip augmentation (default: False)")
     return parser.parse_args()
 
 
-def build_transforms(train: bool, image_size: int = DEFAULT_IMAGE_SIZE) -> transforms.Compose:
-    steps = [
-        transforms.Resize((image_size, image_size)),
-        transforms.Grayscale(num_output_channels=3),
-    ]
-    if train:
-        steps.extend(
-            [
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomRotation(degrees=7),
-            ]
-        )
-    steps.extend(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
-            ),
-        ]
-    )
-    return transforms.Compose(steps)
+def set_seed(seed: int = 42, deterministic: bool = True) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        if deterministic:
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+
+
+def calculate_pos_weight(dataset: CheXpertDataset, labels_or_count: int | Sequence[str]) -> torch.Tensor:
+    if isinstance(labels_or_count, (list, tuple, Sequence)) and not isinstance(labels_or_count, (str, bytes)):
+        num_labels = len(labels_or_count)
+    else:
+        num_labels = int(labels_or_count)
+
+    pos_counts = np.zeros(num_labels, dtype=np.float32)
+    valid_counts = np.zeros(num_labels, dtype=np.float32)
+
+    for i in range(len(dataset)):
+        row = dataset.frame.iloc[i]
+        for idx, label in enumerate(dataset.labels):
+            val, mask = dataset._normalize_label_and_mask(row[label], label)
+            if mask > 0.5:
+                valid_counts[idx] += 1.0
+                if val >= 0.5:
+                    pos_counts[idx] += 1.0
+
+    neg_counts = valid_counts - pos_counts
+    weights = np.where(pos_counts > 0, neg_counts / np.maximum(pos_counts, 1.0), 1.0)
+    weights = np.clip(weights, 0.1, 10.0)
+    return torch.tensor(weights, dtype=torch.float32)
+
+
+def checkpoint_payload(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer | None,
+    scheduler: torch.optim.lr_scheduler._LRScheduler | None,
+    labels: list[str],
+    metadata: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict() if optimizer else None,
+        "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+        "rng_state": {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+        },
+        "labels": labels,
+        "metadata": metadata or {},
+    }
 
 
 def run_epoch(
@@ -158,36 +200,35 @@ def run_epoch(
     device: torch.device,
     optimizer: torch.optim.Optimizer | None = None,
     scaler: torch.amp.GradScaler | None = None,
-    use_amp: bool = False,
-    desc: str = "epoch",
 ) -> tuple[float, list[list[float]], list[list[float]], list[list[float]]]:
     is_train = optimizer is not None
-    model.train(is_train)
-    total_loss = 0.0
-    all_targets: list[list[float]] = []
-    all_probs: list[list[float]] = []
-    all_masks: list[list[float]] = []
+    model.train() if is_train else model.eval()
 
-    progress = tqdm(loader, desc=desc, unit="batch", leave=True, dynamic_ncols=True)
-    for batch_item in progress:
-        images = batch_item[0].to(device)
-        targets = batch_item[1].to(device)
-        masks = batch_item[2].to(device) if len(batch_item) > 2 else torch.ones_like(targets)
+    total_loss_sum = 0.0
+    total_mask_sum = 0.0
+    targets_all: list[list[float]] = []
+    probs_all: list[list[float]] = []
+    masks_all: list[list[float]] = []
 
-        with torch.set_grad_enabled(is_train), torch.amp.autocast(device_type=device.type, enabled=use_amp):
+    for item in loader:
+        images = item[0].to(device)
+        targets = item[1].to(device)
+        masks = item[2].to(device) if len(item) > 2 else torch.ones_like(targets)
+
+        if is_train:
+            optimizer.zero_grad()
+
+        with torch.set_grad_enabled(is_train):
             logits = model(images)
-            if isinstance(criterion, (AsymmetricLoss, FocalLoss)):
+            try:
                 loss = criterion(logits, targets, mask=masks)
-            elif isinstance(criterion, torch.nn.BCEWithLogitsLoss):
-                bce = F.binary_cross_entropy_with_logits(
-                    logits, targets, pos_weight=criterion.pos_weight, reduction="none"
-                )
+                loss_val = float(loss.detach().cpu()) * float(masks.sum().clamp(min=1.0).cpu())
+            except TypeError:
+                bce = criterion(logits, targets)
                 loss = (bce * masks).sum() / masks.sum().clamp(min=1.0)
-            else:
-                loss = criterion(logits, targets)
+                loss_val = float((bce * masks).sum().detach().cpu())
 
-            if optimizer:
-                optimizer.zero_grad(set_to_none=True)
+            if is_train:
                 if scaler:
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
@@ -196,202 +237,112 @@ def run_epoch(
                     loss.backward()
                     optimizer.step()
 
-        batch_loss = float(loss.detach().cpu())
-        total_loss += batch_loss * images.size(0)
-        all_targets.extend(targets.detach().cpu().tolist())
-        all_probs.extend(torch.sigmoid(logits).detach().cpu().tolist())
-        all_masks.extend(masks.detach().cpu().tolist())
-        progress.set_postfix(loss=f"{batch_loss:.4f}")
+        total_loss_sum += loss_val
+        total_mask_sum += float(masks.sum().cpu())
 
-    return total_loss / max(1, len(loader.dataset)), all_targets, all_probs, all_masks
+        targets_all.extend(targets.detach().cpu().tolist())
+        probs_all.extend(torch.sigmoid(logits).detach().cpu().tolist())
+        masks_all.extend(masks.detach().cpu().tolist())
 
-
-def label_aucs(
-    targets: list[list[float]],
-    probs: list[list[float]],
-    labels: list[str],
-    masks: list[list[float]] | None = None,
-) -> dict[str, float | None]:
-    scores: dict[str, float | None] = {}
-    for label_index, label in enumerate(labels):
-        if masks is not None:
-            valid_idx = [i for i, m in enumerate(masks) if m[label_index] > 0.5]
-        else:
-            valid_idx = list(range(len(targets)))
-
-        y_true = [1.0 if targets[i][label_index] >= 0.5 else 0.0 for i in valid_idx]
-        y_score = [probs[i][label_index] for i in valid_idx]
-
-        if len(set(y_true)) < 2:
-            scores[label] = None
-            continue
-        try:
-            scores[label] = float(roc_auc_score(y_true, y_score))
-        except Exception:
-            scores[label] = None
-    return scores
-
-
-def mean_auc(scores: dict[str, float | None]) -> float | None:
-    aucs = [score for score in scores.values() if score is not None]
-    if not aucs:
-        return None
-    return float(sum(aucs) / len(aucs))
-
-
-def set_seed(seed: int, deterministic: bool = True) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-        if deterministic:
-            torch.backends.cudnn.benchmark = False
-            torch.backends.cudnn.deterministic = True
-        else:
-            torch.backends.cudnn.benchmark = True
-
-
-def subset_dataset(dataset: CheXpertDataset, limit: int | None) -> CheXpertDataset | Subset:
-    if not limit:
-        return dataset
-    return Subset(dataset, range(min(limit, len(dataset))))
-
-
-def target_frame(dataset: CheXpertDataset | Subset) -> tuple[CheXpertDataset, list[int] | None]:
-    if isinstance(dataset, Subset):
-        base = dataset.dataset
-        if not isinstance(base, CheXpertDataset):
-            raise TypeError("Expected Subset over CheXpertDataset.")
-        return base, list(dataset.indices)
-    return dataset, None
-
-
-def calculate_pos_weight(dataset: CheXpertDataset | Subset, labels: list[str]) -> torch.Tensor:
-    base, indices = target_frame(dataset)
-    frame = base.frame.iloc[indices] if indices is not None else base.frame
-    weights = []
-    for label in labels:
-        pairs = [base._normalize_label_and_mask(v, label) for v in frame[label]]
-        valid_targets = [t for t, m in pairs if m > 0.5]
-        positives = sum(1 for t in valid_targets if t >= 0.5)
-        negatives = len(valid_targets) - positives
-        weight = negatives / max(1.0, float(positives))
-        weights.append(weight)
-    return torch.tensor(weights, dtype=torch.float32)
-
-
-def checkpoint_payload(
-    model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scaler: torch.amp.GradScaler | None,
-    labels: list[str],
-    args: argparse.Namespace,
-    epoch: int,
-    metric: float,
-    metrics_history: list[dict[str, object]],
-    scheduler: object | None = None,
-) -> dict[str, object]:
-    return {
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scaler_state_dict": scaler.state_dict() if scaler else None,
-        "scheduler_state_dict": scheduler.state_dict() if (scheduler and hasattr(scheduler, "state_dict")) else None,
-        "rng_state": {
-            "python": random.getstate(),
-            "numpy": np.random.get_state(),
-            "torch": torch.get_rng_state(),
-            "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-        },
-        "labels": labels,
-        "metadata": {
-            "epoch": epoch,
-            "best_metric": metric,
-            "architecture": args.arch,
-            "image_size": args.image_size,
-            "loss_type": args.loss,
-            "label_preset": args.label_preset,
-            "uncertain_policy": args.uncertain_policy,
-            "view": args.view,
-            "seed": args.seed,
-            "amp": args.amp,
-            "pos_weight": args.pos_weight,
-            "pretrained": args.pretrained,
-            "batch_size": args.batch_size,
-            "lr": args.lr,
-            "torch_version": str(torch.__version__),
-            "cuda_available": torch.cuda.is_available(),
-            "cuda_version": getattr(torch.version, "cuda", None),
-            "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
-        },
-        "metrics": metrics_history,
-    }
-
-
-def write_metrics(path: Path, history: list[dict[str, object]], config: dict[str, object]) -> None:
-    payload = {
-        "config": config,
-        "history": history,
-    }
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
-def backup_file(src_path: Path, backup_dir: Path | None) -> None:
-    if not backup_dir or not src_path.exists():
-        return
-    try:
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_path, backup_dir / src_path.name)
-    except Exception as e:
-        print(f"Warning: Failed to backup {src_path} to {backup_dir}: {e}")
+    epoch_loss = total_loss_sum / max(1.0, total_mask_sum)
+    return epoch_loss, targets_all, probs_all, masks_all
 
 
 def main() -> None:
     args = parse_args()
-    set_seed(args.seed, deterministic=True)
-    labels = resolve_label_preset(args.label_preset)
-    train_csv = args.train_csv or args.data_root / "train.csv"
-    valid_csv = args.valid_csv or args.data_root / "valid.csv"
+    set_seed(args.seed)
 
-    train_transforms = build_transforms(train=True, image_size=args.image_size)
-    valid_transforms = build_transforms(train=False, image_size=args.image_size)
+    # 1. Resolve Train & Internal-Val Split Paths
+    train_csv = args.train_csv
+    val_csv = args.val_csv
+
+    if args.split_manifest and args.split_manifest.exists():
+        manifest_data = json.loads(args.split_manifest.read_text(encoding="utf-8"))
+        train_file = manifest_data.get("splits", {}).get("train", {}).get("file", "train.csv")
+        val_file = manifest_data.get("splits", {}).get("internal_val", {}).get("file", "internal_val.csv")
+        train_csv = args.split_manifest.parent / train_file
+        val_csv = args.split_manifest.parent / val_file
+
+    if not train_csv or not train_csv.exists():
+        default_train = PROJECT_ROOT / "outputs" / "splits" / "train.csv"
+        if default_train.exists():
+            train_csv = default_train
+        else:
+            train_csv = args.data_root / "train.csv"
+
+    if not val_csv or not val_csv.exists():
+        default_val = PROJECT_ROOT / "outputs" / "splits" / "internal_val.csv"
+        if default_val.exists():
+            val_csv = default_val
+
+    # 2. Strict Leakage Prevention Guard: Refuse official valid.csv during training
+    for check_path in [train_csv, val_csv]:
+        if check_path and "valid.csv" in check_path.name.lower() and "internal" not in check_path.name.lower():
+            raise RuntimeError(
+                f"LEAKAGE PREVENTION ERROR: '{check_path.name}' detected as training/validation source! "
+                f"The official Stanford validation set ('valid.csv') is strictly reserved as the LOCKED TEST SET. "
+                f"You must use internal validation split generated by scripts/make_splits.py."
+            )
+
+    labels = resolve_label_preset(args.label_preset)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Training device: {device} | Architecture: {args.arch} | Epochs: {args.epochs} | Seed: {args.seed}")
+    print(f"Train Split: {train_csv}")
+    print(f"Internal Val Split: {val_csv}")
+
+    # Transforms
+    train_transform_list = [
+        transforms.Resize((args.image_size, args.image_size)),
+    ]
+    if args.horizontal_flip:
+        train_transform_list.append(transforms.RandomHorizontalFlip(p=0.5))
+    train_transform_list.extend([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    train_transform = transforms.Compose(train_transform_list)
+
+    val_transform = transforms.Compose([
+        transforms.Resize((args.image_size, args.image_size)),
+        transforms.ToTensor],
+    )
+    val_transform = transforms.Compose([
+        transforms.Resize((args.image_size, args.image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
 
     train_dataset = CheXpertDataset(
         train_csv,
         args.data_root,
-        train_transforms,
+        train_transform,
         labels=labels,
         uncertain_policy=args.uncertain_policy,
         view=args.view,
     )
 
-    if valid_csv.exists():
-        train_dataset = subset_dataset(train_dataset, args.limit)
-        valid_dataset = CheXpertDataset(
-            valid_csv,
+    if val_csv and val_csv.exists():
+        val_dataset = CheXpertDataset(
+            val_csv,
             args.data_root,
-            valid_transforms,
+            val_transform,
             labels=labels,
             uncertain_policy=args.uncertain_policy,
             view=args.view,
         )
     else:
-        valid_source = CheXpertDataset(
-            train_csv,
-            args.data_root,
-            valid_transforms,
-            labels=labels,
-            uncertain_policy=args.uncertain_policy,
-            view=args.view,
+        # Fallback subset split if no explicit internal val
+        total_len = len(train_dataset)
+        val_size = max(1, int(total_len * 0.1))
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            train_dataset,
+            [total_len - val_size, val_size],
+            generator=torch.Generator().manual_seed(args.seed),
         )
-        row_count = min(args.limit, len(train_dataset)) if args.limit else len(train_dataset)
-        valid_size = max(1, int(row_count * args.valid_split))
-        train_size = row_count - valid_size
-        if train_size < 1:
-            raise ValueError("Not enough rows to create a train/validation split.")
-        indices = torch.randperm(row_count, generator=torch.Generator().manual_seed(args.seed)).tolist()
-        train_dataset = Subset(train_dataset, indices[:train_size])
-        valid_dataset = Subset(valid_source, indices[train_size:])
+
+    if args.limit:
+        train_dataset = Subset(train_dataset, range(min(args.limit, len(train_dataset))))
+        val_dataset = Subset(val_dataset, range(min(max(2, args.limit // 4), len(val_dataset))))
 
     train_loader = DataLoader(
         train_dataset,
@@ -399,189 +350,128 @@ def main() -> None:
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
-        persistent_workers=args.num_workers > 0,
     )
-    valid_loader = DataLoader(
-        valid_dataset,
+    val_loader = DataLoader(
+        val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
-        persistent_workers=args.num_workers > 0,
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_model(args.arch, len(labels), pretrained=args.pretrained).to(device)
 
-    # Loss selection
+    # Loss Selection
     if args.loss == "asl":
-        criterion = AsymmetricLoss(gamma_neg=4.0, gamma_pos=1.0)
+        criterion = AsymmetricLoss(gamma_neg=4.0, gamma_pos=1.0, clip=0.05)
     elif args.loss == "focal":
         criterion = FocalLoss(alpha=0.25, gamma=2.0)
     else:
-        pos_weight = calculate_pos_weight(train_dataset, labels).to(device) if args.pos_weight else None
-        criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        if args.pos_weight and hasattr(train_dataset, "frame"):
+            pos_weight = calculate_pos_weight(train_dataset, len(labels)).to(device)
+            criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction="none")
+        else:
+            criterion = torch.nn.BCEWithLogitsLoss(reduction="none")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    use_amp = bool(args.amp and device.type == "cuda")
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if device.type == "cuda" else None
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+    scaler = torch.amp.GradScaler("cuda", enabled=args.amp and torch.cuda.is_available())
 
-    start_epoch = 1
-    best_auc = -1.0
-    metrics_history: list[dict[str, object]] = []
+    best_val_auc = 0.0
+    patience_counter = 0
 
-    resumed_scheduler_state = None
-    if args.resume and args.resume.exists():
-        print(f"Resuming training from checkpoint: {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint.get("model_state_dict", checkpoint))
-        if "optimizer_state_dict" in checkpoint:
-            try:
-                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            except Exception as e:
-                print(f"Warning: Could not load optimizer state: {e}")
-        if "scaler_state_dict" in checkpoint and scaler and checkpoint["scaler_state_dict"]:
-            try:
-                scaler.load_state_dict(checkpoint["scaler_state_dict"])
-            except Exception as e:
-                print(f"Warning: Could not load scaler state: {e}")
-        if "scheduler_state_dict" in checkpoint:
-            resumed_scheduler_state = checkpoint["scheduler_state_dict"]
-        if "rng_state" in checkpoint:
-            try:
-                rng = checkpoint["rng_state"]
-                if "python" in rng: random.setstate(rng["python"])
-                if "numpy" in rng: np.random.set_state(rng["numpy"])
-                if "torch" in rng: torch.set_rng_state(rng["torch"])
-                if "torch_cuda" in rng and rng["torch_cuda"] and torch.cuda.is_available():
-                    torch.cuda.set_rng_state_all(rng["torch_cuda"])
-            except Exception as e:
-                print(f"Warning: Could not load RNG state: {e}")
+    print(f"Starting training loop: {len(train_dataset)} train samples, {len(val_dataset)} internal val samples.")
 
-        meta = checkpoint.get("metadata", {})
-        start_epoch = meta.get("epoch", 0) + 1
-        best_auc = meta.get("best_metric", -1.0)
-        metrics_history = checkpoint.get("metrics", [])
-        print(f"Resumed successfully at Epoch {start_epoch} (Previous Best AUC: {best_auc:.4f})")
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        total_loss_numerator = 0.0
+        total_mask_denominator = 0.0
 
-    if args.scheduler == "cosine":
-        scheduler: torch.optim.lr_scheduler.LRScheduler | None = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=args.epochs, eta_min=args.lr * 1e-2
-        )
-    elif args.scheduler == "plateau":
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="max", factor=0.5, patience=2, min_lr=args.lr * 1e-2
-        )
-    else:
-        scheduler = None
+        for images, targets, masks in train_loader:
+            images = images.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
 
-    if scheduler and resumed_scheduler_state:
-        try:
-            scheduler.load_state_dict(resumed_scheduler_state)
-        except Exception as e:
-            print(f"Warning: Could not load scheduler state: {e}")
+            optimizer.zero_grad()
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    last_output = args.output.with_name(f"{args.output.stem}_last{args.output.suffix}")
-    metrics_output = args.output.with_suffix(".metrics.json")
-    config = {
-        "data_root": str(args.data_root),
-        "train_csv": str(train_csv),
-        "valid_csv": str(valid_csv) if valid_csv.exists() else None,
-        "train_rows": len(train_dataset),
-        "valid_rows": len(valid_dataset),
-        "architecture": args.arch,
-        "loss_type": args.loss,
-        "image_size": args.image_size,
-        "labels": labels,
-        "label_preset": args.label_preset,
-        "uncertain_policy": args.uncertain_policy,
-        "view": args.view,
-        "seed": args.seed,
-        "amp": args.amp,
-        "pos_weight": args.pos_weight,
-        "pretrained": args.pretrained,
-        "batch_size": args.batch_size,
-        "lr": args.lr,
-        "scheduler": args.scheduler,
-        "num_workers": args.num_workers,
-        "device": str(device),
-        "backup_dir": str(args.backup_dir) if args.backup_dir else None,
-    }
-    print("\n" + "="*60)
-    print("CheXpert Training Configuration:")
-    print(json.dumps(config, indent=2))
-    print("="*60 + "\n")
+            with torch.amp.autocast("cuda", enabled=args.amp and torch.cuda.is_available()):
+                logits = model(images)
+                if args.loss in ("asl", "focal"):
+                    loss = criterion(logits, targets, mask=masks)
+                    loss_batch_sum = float(loss.detach().cpu()) * float(masks.sum().clamp(min=1.0).cpu())
+                else:
+                    bce = criterion(logits, targets)
+                    loss = (bce * masks).sum() / masks.sum().clamp(min=1.0)
+                    loss_batch_sum = float((bce * masks).sum().detach().cpu())
 
-    for epoch in range(start_epoch, args.epochs + 1):
-        print(f"\n>>> Epoch {epoch}/{args.epochs} Starting...")
-        train_loss, _, _, _ = run_epoch(
-            model,
-            train_loader,
-            criterion,
-            device,
-            optimizer,
-            scaler,
-            use_amp,
-            desc=f"Epoch {epoch}/{args.epochs} [Train]",
-        )
-        valid_loss, valid_targets, valid_probs, valid_masks = run_epoch(
-            model,
-            valid_loader,
-            criterion,
-            device,
-            use_amp=use_amp,
-            desc=f"Epoch {epoch}/{args.epochs} [Valid]",
-        )
-        auc_scores = label_aucs(valid_targets, valid_probs, labels, masks=valid_masks)
-        auc = mean_auc(auc_scores)
-        auc_text = "n/a" if auc is None else f"{auc:.4f}"
-        current_lr = optimizer.param_groups[0]["lr"]
-        
-        print("\n" + "-"*50)
-        print(f"📊 Summary Epoch {epoch}/{args.epochs}:")
-        print(f"   Train Loss: {train_loss:.4f} | Valid Loss: {valid_loss:.4f}")
-        print(f"   Mean AUC: {auc_text} | Learning Rate: {current_lr:.2e}")
-        for lbl, val in auc_scores.items():
-            val_str = f"{val:.4f}" if val is not None else "n/a"
-            print(f"   - {lbl}: AUC {val_str}")
-        print("-"*50)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
-        if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            scheduler.step(auc if auc is not None else -valid_loss)
-        elif scheduler is not None:
-            scheduler.step()
+            total_loss_numerator += loss_batch_sum
+            total_mask_denominator += float(masks.sum().cpu())
 
-        score = auc if auc is not None else -valid_loss
-        epoch_metrics = {
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "valid_loss": valid_loss,
-            "mean_auc": auc,
-            "label_auc": auc_scores,
-            "lr": current_lr,
-            "score": score,
-        }
-        metrics_history.append(epoch_metrics)
+        scheduler.step()
+        epoch_loss = total_loss_numerator / max(1.0, total_mask_denominator)
 
-        # Save last checkpoint
-        torch.save(
-            checkpoint_payload(model, optimizer, scaler, labels, args, epoch, score, metrics_history, scheduler=scheduler),
-            last_output,
-        )
-        write_metrics(metrics_output, metrics_history, config)
-        backup_file(last_output, args.backup_dir)
-        backup_file(metrics_output, args.backup_dir)
+        # Validation Step
+        model.eval()
+        val_targets: list[list[float]] = []
+        val_probs: list[list[float]] = []
+        val_masks: list[list[float]] = []
 
-        # Save best checkpoint
-        if score > best_auc:
-            best_auc = score
-            torch.save(
-                checkpoint_payload(model, optimizer, scaler, labels, args, epoch, score, metrics_history, scheduler=scheduler),
-                args.output,
-            )
-            print(f"🌟 New Best Model saved to {args.output} (AUC: {auc_text})")
-            backup_file(args.output, args.backup_dir)
+        with torch.no_grad():
+            for images, targets, masks in val_loader:
+                images = images.to(device, non_blocking=True)
+                logits = model(images)
+                probs = torch.sigmoid(logits)
+
+                val_targets.extend(targets.cpu().tolist())
+                val_probs.extend(probs.cpu().tolist())
+                val_masks.extend(masks.cpu().tolist())
+
+        val_targets_arr = np.array(val_targets)
+        val_probs_arr = np.array(val_probs)
+        val_masks_arr = np.array(val_masks)
+
+        aucs = []
+        for l_idx in range(len(labels)):
+            v_idx = np.where(val_masks_arr[:, l_idx] > 0.5)[0]
+            if len(v_idx) > 0 and len(np.unique(val_targets_arr[v_idx, l_idx])) > 1:
+                try:
+                    auc = float(roc_auc_score(val_targets_arr[v_idx, l_idx], val_probs_arr[v_idx, l_idx]))
+                    aucs.append(auc)
+                except Exception:
+                    pass
+
+        mean_val_auc = float(np.mean(aucs)) if aucs else 0.0
+        print(f"Epoch [{epoch:02d}/{args.epochs:02d}] Train Loss: {epoch_loss:.4f} | Internal Val AUC: {mean_val_auc:.4f}")
+
+        # Checkpoint Saving & Early Stopping
+        if mean_val_auc > best_val_auc:
+            best_val_auc = mean_val_auc
+            patience_counter = 0
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "labels": labels,
+                "metadata": {
+                    "architecture": args.arch,
+                    "image_size": args.image_size,
+                    "best_val_auc": best_val_auc,
+                    "epoch": epoch,
+                    "uncertain_policy": args.uncertain_policy,
+                    "seed": args.seed,
+                },
+            }, args.output)
+            print(f"  -> Best model saved to {args.output} (Val AUC: {best_val_auc:.4f})")
+        else:
+            patience_counter += 1
+            if patience_counter >= args.patience:
+                print(f"Early stopping triggered after {epoch} epochs (patience={args.patience}).")
+                break
+
+    print(f"\nTraining completed! Best Internal Val AUC: {best_val_auc:.4f}")
 
 
 if __name__ == "__main__":

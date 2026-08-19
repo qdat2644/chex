@@ -660,19 +660,38 @@ def decode_image_or_dicom(spool: BinaryIO, filename: str) -> tuple[Image.Image, 
                     detail=f"Unsupported DICOM compression or transfer syntax: {pe}",
                 )
 
-            arr = arr.astype(float)
+            # Strict medical DICOM pipeline order:
+            # 1. Raw pixels
+            arr = arr.astype(np.float32)
 
+            # 2. Modality LUT / Rescale Slope & Intercept
+            slope = float(getattr(dcm, "RescaleSlope", 1.0))
+            intercept = float(getattr(dcm, "RescaleIntercept", 0.0))
+            arr = (arr * slope) + intercept
+
+            # 3. VOI LUT / Windowing
             try:
                 arr = apply_voi_lut(arr, dcm)
             except Exception:
-                slope = float(getattr(dcm, "RescaleSlope", 1.0))
-                intercept = float(getattr(dcm, "RescaleIntercept", 0.0))
-                arr = (arr * slope) + intercept
+                wc = getattr(dcm, "WindowCenter", None)
+                ww = getattr(dcm, "WindowWidth", None)
+                if wc is not None and ww is not None:
+                    try:
+                        wc_val = float(wc[0]) if isinstance(wc, (list, tuple, pydicom.multival.MultiValue)) else float(wc)
+                        ww_val = float(ww[0]) if isinstance(ww, (list, tuple, pydicom.multival.MultiValue)) else float(ww)
+                        if ww_val > 0:
+                            min_val = wc_val - 0.5 - (ww_val - 1) / 2.0
+                            max_val = wc_val - 0.5 + (ww_val - 1) / 2.0
+                            arr = np.clip((arr - min_val) / max(1e-5, (max_val - min_val)), 0.0, 1.0) * 255.0
+                    except Exception:
+                        pass
 
+            # 4. MONOCHROME1 Inversion
             photometric = str(getattr(dcm, "PhotometricInterpretation", "MONOCHROME2")).upper()
             if "MONOCHROME1" in photometric:
                 arr = np.amax(arr) - arr
 
+            # 5. Normalization
             arr_min = float(np.min(arr))
             arr_max = float(np.max(arr))
             if arr_max > arr_min:

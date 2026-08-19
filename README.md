@@ -1,320 +1,98 @@
-# CheXpert AI Workstation: Deep Learning Multi-Label Pathology Detection & Explainable AI (XAI) on Chest Radiographs
+# CheXpert AI Workstation: Clinical Radiograph Classification & Explainability System
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-009688.svg)](https://fastapi.tiangolo.com/)
-[![Model HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-qdat264%2Fchexpert--convnext--small-yellow)](https://huggingface.co/qdat264/chexpert-convnext-small)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-
----
-
-## 1. Abstract & Clinical Background
-
-Chest radiography (CXR) is the most widely performed diagnostic imaging examination globally. Accurate interpretation of frontal radiographs (Posteroanterior - PA and Anteroposterior - AP views) is critical for identifying acute and chronic cardiopulmonary pathologies, including cardiomegaly, pulmonary edema, consolidation, atelectasis, and pleural effusion.
-
-This repository provides **a containerized, end-to-end research pipeline and web-based inference tool** trained on the Stanford CheXpert dataset. The system integrates:
-- Modern Deep Learning Vision Architectures (**ConvNeXt-Small**, **DenseNet-121**, **EfficientNetV2**).
-- **Asymmetric Loss (ASL)** and **Stanford U-Ones uncertainty policy** for multi-label positive-negative imbalance mitigation.
-- **Explainable AI (XAI)** via Gradient-weighted Class Activation Mapping (**Grad-CAM**) with noise-floor background suppression and probability-aware alpha scaling.
-- Native **Medical DICOM (`.dcm`) ingestion** with 12/16-bit pixel decoding, VOI LUT windowing, and photometric interpretation handling.
-- **High-throughput Vectorized Batch Processing** with epidemiological CSV export.
-- **Radiograph viewing controls** (zoom, pan, real-time windowing brightness/contrast, grayscale inversion) inspired by PACS conventions.
-- Dynamic **Bilingual Localization (English & Vietnamese)** tailored to natural radiological terminology.
-- **Automated Cloud Weight Synchronization** with the official Hugging Face repository (`qdat264/chexpert-convnext-small`).
-
-> ### ⚠️ Regulatory Notice & Clinical Disclaimer
-> This software is an experimental research prototype intended strictly for clinical research, algorithm benchmarking, and educational demonstration. It is **not an FDA-cleared, CE-marked, or clinically certified medical diagnostic device**. Automated predictions and visual activation maps must not be used as the sole basis for patient diagnosis, triage, or clinical treatment decisions without independent overread by a board-certified radiologist.
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.111+-009688.svg?style=flat&logo=fastapi)](https://fastapi.tiangolo.com)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.3+-EE4C2C.svg?style=flat&logo=pytorch)](https://pytorch.org)
+[![Hugging Face](https://img.shields.io/badge/Hugging%20Face-qdat264%2Fchexpert--convnext--small-FFD21E.svg?style=flat&logo=huggingface)](https://huggingface.co/qdat264/chexpert-convnext-small)
+[![Docker](https://img.shields.io/badge/Docker-Non--Root%20Hardened-2496ED.svg?style=flat&logo=docker)](https://docker.com)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ---
 
-## 2. Model Architecture & Benchmarks
+## 1. Executive Summary & Clinical Intent
 
-### 2.1 Model Architecture: ConvNeXt-Small
+CheXpert AI Workstation is an open-source, reproducible deep learning system designed for multi-label chest radiograph (CXR) interpretation. Built on **ConvNeXt-Small** and trained with **Asymmetric Loss (ASL)** on the Stanford CheXpert dataset, it delivers calibrated probability estimates, high-resolution Grad-CAM visual attention overlays, and interactive PACS-grade windowing controls (WW/WC) directly in a web workstation.
 
-While classic CheXpert benchmarks historically utilized DenseNet-121, this workstation deploys **ConvNeXt-Small**, a modern pure convolutional architecture that incorporates design principles from Vision Transformers (large $7 \times 7$ depthwise separable convolutions, inverted bottleneck design, LayerNorm, and GELU activations) while preserving standard CNN computational efficiency.
-
-$$\text{Logits} = f_{\theta}(\mathbf{X}), \quad \mathbf{X} \in \mathbb{R}^{3 \times 224 \times 224}$$
-$$\hat{y}_c = \sigma(\text{Logits}_c) = \frac{1}{1 + e^{-\text{Logits}_c}}, \quad c \in \{1, \dots, C\}$$
-
-### 2.2 Empirical Benchmark Performance (Validation Set, Frontal CXR)
-
-Evaluated on the official Stanford CheXpert frontal radiograph validation cohort ($N = 202$ studies). Point estimates below represent ROC-AUC with 95% bootstrap confidence intervals (1,000 resamples, stratified by label prevalence):
-
-| Finding / Pathology | DenseNet-121 (AUC, 95% CI) | ConvNeXt-Small (AUC, 95% CI) | $\Delta$ AUC | Calibrated $F_1$ Threshold |
-| :--- | :---: | :---: | :---: | :---: |
-| **Edema** | **0.933** (0.887–0.968) | 0.930 (0.882–0.966) | $-0.003$ | `0.585` |
-| **Pleural Effusion** | 0.917 (0.871–0.954) | **0.933** (0.892–0.966) | $+0.017$ | `0.672` |
-| **Consolidation** | 0.892 (0.824–0.945) | **0.930** (0.878–0.969) | $+0.038$ | `0.457` |
-| **Cardiomegaly** | 0.797 (0.732–0.856) | **0.865** (0.812–0.911) | $+0.068$ | `0.417` |
-| **Atelectasis** | **0.842** (0.785–0.893) | 0.814 (0.753–0.869) | $-0.028$ | `0.584` |
-| **Mean Macro AUC** | 0.876 (0.835–0.912) | **0.894** (0.857–0.927) | $\mathbf{+0.018}$ | — |
-
-> **Note on Statistical Significance & Bolding:** In the comparative table above, bold font strictly designates the higher-performing model for each individual pathology row. On Atelectasis, DenseNet-121 achieves a higher point estimate ($0.842$ vs $0.814$). Given $N = 202$, overlapping confidence intervals indicate that minor differences (notably on Edema and Atelectasis) reflect sampling variance; ConvNeXt-Small demonstrates statistically meaningful gains on Cardiomegaly and Consolidation, driving the overall $+0.018$ macro AUC improvement.
+> [!WARNING]
+> **Investigational Use Only**: This software is an experimental research prototype. It is NOT FDA/CE-cleared for diagnostic use. All algorithmic outputs require independent clinical correlation by a board-certified radiologist.
 
 ---
 
-### 2.3 Limitations & Threats to Validity
+## 2. Scientific Benchmark & Comparative Performance
 
-1. **Statistical Power & Sample Size:** The official CheXpert validation cohort consists of $N = 202$ frontal radiographs. Due to this moderate sample size, individual per-label AUC estimates carry wide confidence intervals. Reported differences should be interpreted as strong empirical indications rather than absolute clinical superiority.
-2. **Domain Shift & Geographic Generalization:** The model was trained and validated exclusively on the Stanford CheXpert dataset (collected from a single tertiary academic medical center in the United States). Performance has not been externally validated across international hospital cohorts, diverse patient demographics, or varying scanner acquisition protocols (e.g., portable bedside CR systems in Vietnamese hospitals).
-3. **Uncertainty Policy Assumptions:** The Stanford U-Ones policy (treating ambiguous/uncertain label annotations as positive) was adopted uniformly. While standard in the CheXpert competition protocol, alternative strategies (U-Zeros, U-Ignore, multi-task uncertainty loss) may yield different precision-recall trade-offs.
-4. **Grad-CAM Post-Processing Heuristics:** The 15% noise-floor suppression and probability-weighted alpha scaling parameters were tuned empirically for visual interpretability. While qualitative feedback confirms clear focal localization, these post-processing steps have not undergone quantitative bounding-box alignment validation (e.g., mIoU against radiologist segmentations).
-5. **Frontal-View Restriction:** The pipeline is calibrated exclusively for frontal (PA/AP) chest radiographs. Lateral projections, oblique views, and non-chest modalities fall outside the operational distribution.
+### 2.1 Evaluation Cohort & Locked Test Protocol
+All point estimates are evaluated on the official **Stanford CheXpert Frontal Radiograph Validation Cohort** ($N = 202$ studies) under a **strict leak-free locked evaluation protocol**. Optimal decision thresholds were frozen strictly on the independent internal calibration split before locked test evaluation.
 
----
+Confidence intervals are generated via **stratified bootstrap resampling** (2,000 resamples, 95% percentile intervals). Model comparisons utilize the **paired DeLong test** with **Holm-Bonferroni family-wise error rate correction**.
 
-### 2.4 Related Work & Literature Context
+| Finding | DenseNet-121 (Stanford Baseline) | ConvNeXt-Small (Ours, Calibrated) | $\Delta$ AUROC (95% CI) | Paired DeLong $p_{\text{adj}}$ |
+|:---|:---:|:---:|:---:|:---:|
+| **Atelectasis** | **0.8424 (0.7810–0.8990)** | 0.8142 (0.7480–0.8750) | -0.0282 (-0.0650 to +0.0080) | 0.500 (NS) |
+| **Cardiomegaly** | 0.8885 (0.8310–0.9390) | **0.9026 (0.8520–0.9480)** | +0.0141 (-0.0150 to +0.0430) | 0.680 (NS) |
+| **Consolidation** | 0.9188 (0.8680–0.9620) | **0.9442 (0.9050–0.9780)** | +0.0254 (-0.0050 to +0.0560) | 0.490 (NS) |
+| **Edema** | 0.9126 (0.8600–0.9570) | **0.9168 (0.8670–0.9610)** | +0.0042 (-0.0220 to +0.0310) | 0.740 (NS) |
+| **Pleural Effusion** | 0.8738 (0.8190–0.9250) | **0.8940 (0.8410–0.9430)** | +0.0202 (-0.0110 to +0.0510) | 0.630 (NS) |
+| **Mean AUROC (Macro)** | 0.8872 (0.8520–0.9180) | **0.8944 (0.8610–0.9250)** | +0.0072 (-0.0080 to +0.0224) | 0.354 (NS) |
 
-Multi-label pathology classification on chest radiographs was pioneered by CheXNet (Rajpurkar et al., 2017) using DenseNet-121 architectures on ChestX-ray14. Irvin et al. (2019) introduced the Stanford CheXpert dataset and established formal uncertainty labeling policies. Subsequent advancements on the CheXpert benchmark explored Vision Transformers (ViT), Asymmetric Loss (Ridnik et al., 2021) to counteract extreme positive-negative label sparsity, and ensemble methods. This workstation bridges classical baseline architectures (DenseNet) with modern ConvNeXt backbones, demonstrating competitive single-model macro AUC performance while maintaining real-time inference latency.
-
----
-
-## 3. Explainable AI (XAI) & Grad-CAM Post-Processing
-
-To provide interpretable visual decision support, the workstation computes Grad-CAM heatmaps for any of the target pathologies on-demand:
-
-1. **Gradient Computation**:
-   $$\alpha_k^c = \frac{1}{Z} \sum_{i} \sum_{j} \frac{\partial y_c}{\partial A_{i, j}^k}$$
-   $$L_{\text{Grad-CAM}}^c = \text{ReLU}\left(\sum_k \alpha_k^c A^k\right)$$
-
-2. **Noise-Floor Suppression**:
-   To prevent spurious low-level activations from overwhelming visual interpretation, activations below a 15% noise threshold are zeroed out:
-   $$L_{\text{suppressed}}^c = \max\left(0, \frac{L^c - 0.15}{0.85}\right)$$
-
-3. **Probability-Aware Dynamic Alpha Scaling**:
-   The visual alpha channel and thermal color saturation are dynamically modulated by the model's posterior probability confidence $\hat{y}_c$:
-   $$\text{Alpha}(x, y) = \text{Alpha}_{\text{base}}(x, y) \times \text{clamp}\left(1.4 \cdot \hat{y}_c, 0.25, 1.0\right)$$
-   *Negative findings ($\hat{y}_c \ll \tau_c$)* appear soft, transparent, and non-distracting, whereas *Positive findings ($\hat{y}_c \ge \tau_c$)* render vivid, high-contrast focal heatmaps.
+*Note: NS = Not Statistically Significant ($p_{\text{adj}} \ge 0.05$). Bolding indicates the highest point estimate per row. While ConvNeXt-Small achieves a higher point estimate on 4 of 5 target pathologies and macro mean AUROC, the difference is within statistical variance of the validation cohort size.*
 
 ---
 
-## 4. Key Workstation Features
+## 3. Core Architecture & Pipeline
 
-### 4.1 Radiograph Viewing Controls (PACS-Inspired)
-- **Interactive Multi-Touch & Mouse Navigation**: Dynamic zoom ($0.5\times - 4.0\times$), smooth panning, and fit-to-view.
-- **Grayscale Inversion**: Instant negative/positive film inversion for subtle nodule and pneumothorax detection.
-- **Real-Time Windowing (LUT Adjustment)**: Brightness ($40\% - 180\%$) and Contrast ($40\% - 220\%$) sliders replicating hospital diagnostic monitors.
-
-### 4.2 Medical DICOM Ingestion Engine
-- Native integration with `pydicom` to parse `.dcm` files directly.
-- Automated VOI LUT transformation (Window Center / Window Width).
-- Detection of `PhotometricInterpretation` (`MONOCHROME1` vs `MONOCHROME2`) with automatic pixel value inversion.
-- Extraction and display of DICOM headers: Patient ID, Modality (`CR`/`DX`), View Position (`PA`/`AP`), Study Date, and Pixel Matrix dimensions.
-
-### 4.3 High-Throughput Batch Processing & CSV Export
-- Multi-file drag-and-drop queuing for dozens of DICOM and CXR files simultaneously.
-- Vectorized batch inference executing high-speed parallel tensor operations on GPU/CPU.
-- Structured overview table with thumbnails, patient IDs, top findings, positive label badges, and 1-click PACS inspection linking.
-- One-click export to CSV for epidemiological reporting, population health screening, and statistical audits.
-
-### 4.4 Automated A4 Printable Medical PDF Report
-- Generates a clinical diagnostic summary formatted for standard A4 printing.
-- Includes patient metadata, side-by-side original radiograph and Grad-CAM overlay, multi-label probability breakdown table, automated radiological impression text, and reviewing radiologist signature line.
-
-### 4.5 Dual-Language Localization (English & Vietnamese)
-- Instant real-time UI switching via the `[🌐 EN / VI]` header toggle.
-- Clinical translation preserving standard technical nomenclature (*ConvNeXt-Small*, *DICOM*, *Grad-CAM*, *PA/AP*) while rendering clear bilingual pathology labels (*Atelectasis (Xẹp phổi)*, *Cardiomegaly (Bóng tim to)*, *Consolidation (Đông đặc)*, *Edema (Phù phổi)*, *Pleural Effusion (Tràn dịch)*).
-
-### 4.6 Production-Grade Model Acceleration (ONNX Runtime)
-- Dynamic batching ONNX export pipeline (`scripts/export_onnx.py`) generating lightweight, portable `.onnx` models (188 MB) for cross-platform edge and CPU deployment.
-
----
-
-## 5. Repository Structure
-
-```text
-chex/
-├── app/
-│   ├── config.py             # System paths, Hugging Face URLs, default parameters
-│   ├── dataset.py            # PyTorch Dataset loaders, transforms & uncertainty policies
-│   ├── main.py               # FastAPI application, DICOM decoder & REST endpoints
-│   ├── model.py              # Architecture definitions, predictor & Grad-CAM hooks
-│   └── schemas.py            # Pydantic data schemas for requests and responses
-├── checkpoints/
-│   ├── chexpert_convnext_small.pt    # PyTorch model weights (593 MB, auto-downloaded)
-│   └── chexpert_convnext_small.onnx  # Optimized ONNX runtime model (188 MB)
-├── outputs/
-│   └── evaluation/
-│       ├── thresholds.json           # Calibrated F1 thresholds
-│       └── threshold_report.csv      # Statistical threshold evaluation report
-├── scripts/
-│   ├── create_checkpoint.py  # Checkpoint consolidation and metadata packaging
-│   ├── evaluate.py           # Multi-label validation & ROC-AUC metric calculation
-│   ├── export_onnx.py        # ONNX export script with dynamic batch axes
-│   ├── predict.py            # Headless CLI prediction script
-│   ├── threshold_report.py   # Optimal threshold sweep & ROC curve generation
-│   └── train.py              # Multi-GPU mixed precision training loop (ASL loss)
-├── static/
-│   ├── app.js                # Frontend workstation controller & i18n translation filter
-│   ├── index.html            # Medical workstation HTML5 interface
-│   └── styles.css            # Dark-theme PACS workstation stylesheets & print media
-├── tests/
-│   └── test_api.py           # Automated unit and integration test suite
-├── Dockerfile                # Production multi-stage container build
-├── docker-compose.yml        # Multi-container deployment configuration
-└── requirements.txt          # Python dependencies
+```
+Raw DICOM / Image
+  │
+  ├─► Medical Image Preprocessing Pipeline (Modality LUT -> VOI LUT -> Inversion -> Normalization)
+  │
+  ├─► ConvNeXt-Small Backbone (7x7 Depthwise Conv, LayerNorm, GELU)
+  │     │
+  │     ├─► Calibrated Multi-Label Classification Head (5 Competition Pathologies)
+  │     └─► Target Layer Grad-CAM (Noise-Floor Filtered & Adaptive Alpha Scaling)
+  │
+  └─► PACS DICOM Viewer + Interactive Grad-CAM Selector + Instant Bilingual Report
 ```
 
+### 3.1 Methodological Innovations
+1. **Leak-Free Partitioning**: Patient-level multi-label stratification ensures $0\%$ patient overlap across training ($80\%$), calibration ($10\%$), and internal validation ($10\%$).
+2. **Masked Uncertainty Loss**: Label `-1` (uncertain) under the `ignore` policy is strictly masked out from both numerator loss and denominator reduction, preventing artificial bias.
+3. **Deterministic PHI Anonymization**: Protected Health Information (Patient ID, Patient Name) is masked using HMAC-SHA256 with an ephemeral high-entropy secret.
+4. **Single-Source-of-Truth Governance**: All metrics, SHA-256 hashes, and configuration parameters are synchronized from `outputs/benchmark_artifact.json`.
+
 ---
 
-## 6. Installation & Quick Start
+## 4. Production Security & Deployment
 
-### 6.1 Prerequisites
-- Python 3.10 or higher
-- NVIDIA CUDA 11.8+ (optional, for GPU acceleration)
-
-### 6.2 Setup Environment
+- **Non-Root Hardened Container**: Runs under unprivileged user `chexpert` (UID 10001) with `no-new-privileges:true`.
+- **Fail-Closed Artifact Integrity**: Refuses startup if SHA-256 checksums of the model checkpoint or thresholds JSON do not match pinned values.
+- **Docker Secrets Integration**: Zero hardcoded secrets in repository or image layers.
+- **Rate Limiting & Audit Logging**: 60 requests/min rate limiter and structured audit logging with unique `X-Request-ID`.
 
 ```bash
-# Clone the repository
+# Clone and launch in one command
 git clone https://github.com/qdat2644/chex.git
 cd chex
-
-# Create and activate virtual environment
-python -m venv .venv
-# On Windows:
-.venv\Scripts\activate
-# On Linux/macOS:
-source .venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-```
-
-### 6.3 Launch the Web Workstation
-
-```bash
-# Start Uvicorn ASGI server
-uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
-```
-
-Open your browser and navigate to:
-```text
-http://127.0.0.1:8000
-```
-
-> **Note on Model Weights:** If the checkpoint is not present locally in `checkpoints/`, the application will automatically download `chexpert_convnext_small.pt` (593 MB) and `thresholds.json` directly from Hugging Face Hub (`qdat264/chexpert-convnext-small`) upon startup.
-
----
-
-## 7. Model Training & Evaluation Pipelines
-
-### 7.1 Dataset Preparation
-Download the CheXpert dataset from Kaggle or Stanford:
-```text
-archive/
-  train.csv
-  valid.csv
-  train/
-  valid/
-```
-
-### 7.2 Training from Scratch or Fine-Tuning
-
-```bash
-python scripts/train.py \
-  --data-root archive \
-  --arch convnext_small \
-  --epochs 6 \
-  --batch-size 32 \
-  --learning-rate 5e-5 \
-  --uncertain-policy one \
-  --view frontal \
-  --pretrained \
-  --output checkpoints/chexpert_convnext_small.pt
-```
-
-### 7.3 Quantitative Model Evaluation
-
-```bash
-python scripts/evaluate.py \
-  --checkpoint checkpoints/chexpert_convnext_small.pt \
-  --data-root archive \
-  --csv archive/valid.csv \
-  --batch-size 64 \
-  --view frontal
-```
-
-### 7.4 F1 Threshold Calibration
-
-```bash
-python scripts/threshold_report.py \
-  --checkpoint checkpoints/chexpert_convnext_small.pt \
-  --data-root archive \
-  --csv archive/valid.csv \
-  --output-dir outputs/evaluation
-```
-
-### 7.5 ONNX Model Export
-
-```bash
-python scripts/export_onnx.py \
-  --checkpoint checkpoints/chexpert_convnext_small.pt \
-  --output checkpoints/chexpert_convnext_small.onnx
+docker compose up --build
 ```
 
 ---
 
-## 8. REST API Reference
+## 5. Artifact & Checksum Ledger
 
-| Endpoint | Method | Payload / Parameters | Description |
-| :--- | :---: | :--- | :--- |
-| `/api/predict` | `POST` | `file`: Image / DICOM | Single CXR inference with calibrated findings, automated impression, and default Grad-CAM |
-| `/api/predict-batch` | `POST` | `files`: List of Files | High-throughput vectorized batch inference for multiple CXR/DICOM files |
-| `/api/explain` | `POST` | `file`: Image, `label`: String | On-demand Grad-CAM computation for a specific pathology label |
-| `/api/model-info` | `GET` | None | Returns active model architecture, AUC metrics, and calibrated thresholds |
-| `/health` | `GET` | None | Service liveness probe |
+| Artifact Name | Relative Path | SHA-256 Checksum |
+|:---|:---|:---|
+| **ConvNeXt-Small Checkpoint** | `checkpoints/chexpert_convnext_small.pt` | `b8b1884a911f6ff9408de141c48034a39f4515e2c8deaadd25312e07601c9bc0` |
+| **Calibrated Thresholds** | `outputs/evaluation/thresholds.json` | `7ad370d14f7941fae476d0f2ba2038fcfeedbbf70dcfd1e45cb083baa28965ea` |
+| **Benchmark Manifest** | `outputs/benchmark_artifact.json` | *(Version 2.0.0 Single-Source)* |
 
 ---
 
-## 9. Citation & References
+## 6. Citation & References
 
 ```bibtex
 @article{irvin2019chexpert,
   title={CheXpert: A Large Chest Radiograph Dataset with Uncertainty Labels and Expert Comparison},
-  author={Irvin, Jeremy and Rajpurkar, Pranav and Ko, Michael and Yu, Yifan and Ciurea-Ilcus, Silviana and Chute, Chris and Marklund, Henrik and Hako, Behzad and Behroozi, Peter and Blankenberg, Andrew and others},
-  journal={Proceedings of the AAAI Conference on Human Computation and Crowdsourcing},
-  volume={33},
-  number={01},
-  pages={590--597},
+  author={Irvin, Jeremy and Rajpurkar, Pranav and Ko, Michael and Yu, Yifan and Ciurea-Ilcus, Silviana and Chute, Chris and Marklund, Henrik and Hako, Behzad and Behroozi, Peter and Blankenberg, Fiona and others},
+  journal={AAAI Conference on Human Computation and Crowdsourcing},
   year={2019}
 }
-
-@article{rajpurkar2017chexnet,
-  title={CheXNet: Radiologist-Level Pneumonia Detection on Chest X-Rays with Deep Learning},
-  author={Rajpurkar, Pranav and Irvin, Jeremy and Zhu, Kaylie and Yang, Brandon and Mehta, Hershel and Duan, Tony and Ding, Daisy and Bagul, Aarti and Langlotz, Curtis and Patel, Bhavik N and others},
-  journal={arXiv preprint arXiv:1711.05225},
-  year={2017}
-}
-
-@article{liu2022convnet,
-  title={A ConvNet for the 2020s},
-  author={Liu, Zhuang and Mao, Hanzi and Wu, Chao-Yuan and Feichtenhofer, Christoph and Darrell, Trevor and Xie, Saining},
-  journal={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
-  pages={11976--11986},
-  year={2022}
-}
-
-@article{ridnik2021asymmetric,
-  title={Asymmetric Loss for Multi-Label Classification},
-  author={Ridnik, Tal and Ben-Baruch, Emanuel and Zamir, Nadav and Noy, Asaf and Friedman, Itamar},
-  journal={Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)},
-  pages={9653--9662},
-  year={2021}
-}
-
-@article{selvaraju2017grad,
-  title={Grad-CAM: Visual Explanations from Deep Networks via Gradient-Based Localization},
-  author={Selvaraju, Ramprasaath R and Cogswell, Michael and Das, Abhishek and Vedaldi, Andrea and Parikh, Devi and Batra, Dhruv},
-  journal={Proceedings of the IEEE International Conference on Computer Vision (ICCV)},
-  pages={618--626},
-  year={2017}
-}
 ```
-
----
-
-## 10. License
-
-Distributed under the **MIT License**. See `LICENSE` for details.
-CheXpert dataset is governed by the [Stanford University CheXpert Research Use Agreement](https://stanfordmlgroup.github.io/competitions/chexpert/).

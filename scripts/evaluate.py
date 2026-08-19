@@ -8,8 +8,17 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
-from sklearn.metrics import f1_score, precision_recall_curve, roc_auc_score
+from sklearn.metrics import (
+    average_precision_score,
+    brier_score_loss,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 from torch.utils.data import DataLoader, Subset
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -37,90 +46,19 @@ def compute_file_sha256(filepath: Path) -> str:
     return h.hexdigest()
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate a CheXpert checkpoint, calculate stratified bootstrap CIs, and calibrate optimal thresholds.")
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--data-root", type=Path, required=True)
-    parser.add_argument("--csv", type=Path)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--limit", type=int)
-    parser.add_argument(
-        "--uncertain-policy",
-        choices=["u_ones_zeros", "smooth", "zero", "one", "ignore"],
-        default="u_ones_zeros",
-    )
-    parser.add_argument("--view", choices=["frontal", "lateral", "all"], default=None)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output-thresholds", type=Path, help="Save optimal calibrated thresholds and metrics to json")
-    return parser.parse_args()
-
-
-def calculate_optimal_thresholds(
-    targets: list[list[float]],
-    probs: list[list[float]],
-    labels: list[str],
-    masks: list[list[float]] | None = None,
-) -> dict[str, object]:
-    thresholds_dict: dict[str, float] = {}
-    metrics_dict: dict[str, object] = {}
-
-    for label_index, label in enumerate(labels):
-        if masks is not None:
-            valid_idx = [i for i, m in enumerate(masks) if m[label_index] > 0.5]
-        else:
-            valid_idx = list(range(len(targets)))
-
-        if not valid_idx:
-            thresholds_dict[label] = 0.5
-            metrics_dict[label] = {"label": label, "threshold": 0.5, "f1": 0.0, "valid_count": 0}
-            continue
-
-        y_true = np.array([1 if targets[i][label_index] >= 0.5 else 0 for i in valid_idx])
-        y_prob = np.array([probs[i][label_index] for i in valid_idx])
-
-        if len(np.unique(y_true)) < 2:
-            thresholds_dict[label] = 0.5
-            metrics_dict[label] = {"label": label, "threshold": 0.5, "f1": 0.0, "valid_count": len(valid_idx)}
-            continue
-
-        precisions, recalls, candidates = precision_recall_curve(y_true, y_prob)
-        f1_scores = (2 * precisions * recalls) / np.clip(precisions + recalls, 1e-8, None)
-        best_idx = np.argmax(f1_scores)
-        best_threshold = float(candidates[best_idx]) if best_idx < len(candidates) else 0.5
-        best_threshold = float(np.clip(best_threshold, 0.1, 0.9))
-
-        y_pred = (y_prob >= best_threshold).astype(int)
-        f1 = float(f1_score(y_true, y_pred, zero_division=0))
-        precision = float(precisions[best_idx])
-        recall = float(recalls[best_idx])
-
-        thresholds_dict[label] = best_threshold
-        metrics_dict[label] = {
-            "label": label,
-            "threshold": best_threshold,
-            "precision": precision,
-            "recall": recall,
-            "f1": f1,
-            "valid_count": len(valid_idx),
-            "positive_count": int(np.sum(y_true == 1)),
-            "negative_count": int(np.sum(y_true == 0)),
-        }
-
-    return {
-        "thresholds": thresholds_dict,
-        "metrics": metrics_dict,
-    }
-
-
-def compute_stratified_bootstrap_auc_ci(y_true: np.ndarray, y_score: np.ndarray, n_boot: int = 1000, seed: int = 42) -> tuple[float, float, float]:
+def compute_stratified_bootstrap_auc_ci(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    n_boot: int = 2000,
+    seed: int = 42,
+) -> tuple[float, float, float]:
     """
-    Stratified bootstrap resampling (maintains class balance in each bootstrap replicate).
+    Stratified bootstrap resampling with 2,000 resamples (95% percentile CI).
     """
     rng = np.random.RandomState(seed)
     pos_idx = np.where(y_true == 1)[0]
     neg_idx = np.where(y_true == 0)[0]
-    
+
     if len(pos_idx) == 0 or len(neg_idx) == 0:
         return 0.0, 0.0, 0.0
 
@@ -141,66 +79,82 @@ def compute_stratified_bootstrap_auc_ci(y_true: np.ndarray, y_score: np.ndarray,
     return float(np.mean(aucs)), float(lower), float(upper)
 
 
-def label_aucs(
-    targets: list[list[float]],
-    probs: list[list[float]],
-    labels: list[str],
-    masks: list[list[float]] | None = None,
-    seed: int = 42,
-) -> dict[str, object]:
-    scores: dict[str, object] = {}
-    for label_index, label in enumerate(labels):
-        if masks is not None:
-            valid_idx = [i for i, m in enumerate(masks) if m[label_index] > 0.5]
-        else:
-            valid_idx = list(range(len(targets)))
-
-        if not valid_idx:
-            scores[label] = {"auc": None, "ci_lower": None, "ci_upper": None, "valid_count": 0}
-            continue
-
-        y_true = np.array([1.0 if targets[i][label_index] >= 0.5 else 0.0 for i in valid_idx])
-        y_score = np.array([probs[i][label_index] for i in valid_idx])
-
-        if len(np.unique(y_true)) < 2:
-            scores[label] = {"auc": None, "ci_lower": None, "ci_upper": None, "valid_count": len(valid_idx)}
-        else:
-            try:
-                point_auc = float(roc_auc_score(y_true, y_score))
-                _, lower, upper = compute_stratified_bootstrap_auc_ci(y_true, y_score, n_boot=1000, seed=seed)
-                scores[label] = {
-                    "auc": point_auc,
-                    "ci_lower": lower,
-                    "ci_upper": upper,
-                    "ci_95": f"{point_auc:.3f} ({lower:.3f}–{upper:.3f})",
-                    "valid_count": len(valid_idx),
-                }
-            except Exception:
-                scores[label] = {"auc": None, "ci_lower": None, "ci_upper": None, "valid_count": len(valid_idx)}
-    return scores
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate a CheXpert checkpoint on the Locked Test Set.")
+    parser.add_argument("--checkpoint", type=Path, required=True, help="Trained model checkpoint .pt")
+    parser.add_argument("--data-root", type=Path, required=True, help="Data root directory")
+    parser.add_argument("--csv", type=Path, help="Evaluation dataset CSV (default: archive/valid.csv)")
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--limit", type=int)
+    parser.add_argument(
+        "--uncertain-policy",
+        choices=["u_ones_zeros", "smooth", "zero", "one", "ignore"],
+        default="u_ones_zeros",
+    )
+    parser.add_argument("--view", choices=["frontal", "lateral", "all"], default=None)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--frozen-thresholds",
+        type=Path,
+        help="Path to frozen_thresholds.json artifact (MANDATORY for --locked-test mode)",
+    )
+    parser.add_argument(
+        "--locked-test",
+        action="store_true",
+        default=False,
+        help="Enforce strict locked evaluation protocol (strictly forbids threshold fitting on test data)",
+    )
+    parser.add_argument("--output-predictions", type=Path, help="Export per-study anonymized predictions CSV")
+    parser.add_argument("--output-report", type=Path, help="Export evaluation summary JSON")
+    return parser.parse_args()
 
 
 @torch.inference_mode()
 def main() -> None:
     args = parse_args()
 
-    # Reproducibility seeds
+    # Reproducibility seed
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-    predictor = CheXpertPredictor(args.checkpoint)
-    if predictor.model is None:
-        raise RuntimeError("Checkpoint failed to load.")
-    metadata = getattr(predictor, "metadata", {})
-    view = args.view or metadata.get("view", "frontal")
 
     csv_path = args.csv or args.data_root / "valid.csv"
     if not csv_path.exists():
         csv_path = args.data_root / "train.csv"
+
+    # Strict Locked Test Protocol Guard
+    thresholds_dict: dict[str, float] = {}
+    threshold_meta: dict[str, object] = {}
+
+    if args.locked_test:
+        if not args.frozen_thresholds or not args.frozen_thresholds.exists():
+            default_frozen = PROJECT_ROOT / "outputs" / "evaluation" / "frozen_thresholds.json"
+            if default_frozen.exists():
+                args.frozen_thresholds = default_frozen
+            else:
+                raise RuntimeError(
+                    "LOCKED TEST PROTOCOL VIOLATION: --locked-test mode requires a valid frozen threshold artifact "
+                    "calibrated strictly on the calibration set! Provide --frozen-thresholds."
+                )
+
+        print(f"Loading frozen thresholds from: {args.frozen_thresholds}")
+        th_data = json.loads(args.frozen_thresholds.read_text(encoding="utf-8"))
+        thresholds_dict = {k: float(v) for k, v in th_data.get("thresholds", {}).items()}
+        threshold_meta = {
+            "frozen_thresholds_file": str(args.frozen_thresholds),
+            "frozen_thresholds_sha256": compute_file_sha256(args.frozen_thresholds),
+            "calibration_method": th_data.get("calibration_method", "optimal_f1"),
+        }
+    elif args.frozen_thresholds and args.frozen_thresholds.exists():
+        th_data = json.loads(args.frozen_thresholds.read_text(encoding="utf-8"))
+        thresholds_dict = {k: float(v) for k, v in th_data.get("thresholds", {}).items()}
+
+    predictor = CheXpertPredictor(args.checkpoint, thresholds=thresholds_dict)
+    if predictor.model is None:
+        raise RuntimeError("Checkpoint failed to load.")
+
+    metadata = getattr(predictor, "metadata", {})
+    view = args.view or metadata.get("view", "frontal")
 
     dataset = CheXpertDataset(
         csv_path,
@@ -218,66 +172,130 @@ def main() -> None:
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
     )
 
-    criterion = torch.nn.BCEWithLogitsLoss(reduction="none")
-    total_loss = 0.0
     targets_all: list[list[float]] = []
     probs_all: list[list[float]] = []
     masks_all: list[list[float]] = []
 
+    print(f"Evaluating {len(dataset)} studies from {csv_path.name}...")
     for item in loader:
         images = item[0].to(predictor.device)
         targets = item[1].to(predictor.device)
         masks = item[2].to(predictor.device) if len(item) > 2 else torch.ones_like(targets)
 
         logits = predictor.model(images)
-        bce = criterion(logits, targets)
-        loss = (bce * masks).sum() / masks.sum().clamp(min=1.0)
-        total_loss += float(loss.detach().cpu()) * images.size(0)
+        probs = torch.sigmoid(logits)
 
         targets_all.extend(targets.detach().cpu().tolist())
-        probs_all.extend(torch.sigmoid(logits).detach().cpu().tolist())
+        probs_all.extend(probs.detach().cpu().tolist())
         masks_all.extend(masks.detach().cpu().tolist())
 
-    aucs_dict = label_aucs(targets_all, probs_all, predictor.labels, masks=masks_all, seed=args.seed)
-    valid_aucs = [v["auc"] for v in aucs_dict.values() if v["auc"] is not None]
-    mean_auc = float(sum(valid_aucs) / len(valid_aucs)) if valid_aucs else None
+    targets_arr = np.array(targets_all)
+    probs_arr = np.array(probs_all)
+    masks_arr = np.array(masks_all)
 
-    calibration = calculate_optimal_thresholds(targets_all, probs_all, predictor.labels, masks=masks_all)
+    # Compute Comprehensive Metrics
+    label_metrics: dict[str, dict[str, object]] = {}
+    valid_aucs = []
 
-    commit_sha = get_git_commit_sha()
-    ckpt_hash = compute_file_sha256(args.checkpoint)
-    dataset_hash = compute_file_sha256(csv_path)
+    for idx, label in enumerate(predictor.labels):
+        valid_idx = np.where(masks_arr[:, idx] > 0.5)[0]
+        if len(valid_idx) == 0:
+            continue
 
-    result = {
-        "commit_sha": commit_sha,
+        y_true = np.array([1 if targets_arr[i, idx] >= 0.5 else 0 for i in valid_idx])
+        y_prob = probs_arr[valid_idx, idx]
+        th = thresholds_dict.get(label, 0.5)
+        y_pred = (y_prob >= th).astype(int)
+
+        # AUROC & 95% Bootstrap CI
+        if len(np.unique(y_true)) > 1:
+            point_auc = float(roc_auc_score(y_true, y_prob))
+            _, ci_lower, ci_upper = compute_stratified_bootstrap_auc_ci(y_true, y_prob, n_boot=2000, seed=args.seed)
+            auprc = float(average_precision_score(y_true, y_prob))
+            valid_aucs.append(point_auc)
+        else:
+            point_auc, ci_lower, ci_upper, auprc = None, None, None, None
+
+        # Confusion Matrix & Diagnostic Metrics
+        tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+        sens = float(tp / max(1, tp + fn))
+        spec = float(tn / max(1, tn + fp))
+        ppv = float(tp / max(1, tp + fp))
+        npv = float(tn / max(1, tn + fn))
+        f1 = float(f1_score(y_true, y_pred, zero_division=0))
+        brier = float(brier_score_loss(y_true, y_prob))
+
+        label_metrics[label] = {
+            "auroc": point_auc,
+            "ci_95": f"{point_auc:.4f} ({ci_lower:.4f}–{ci_upper:.4f})" if point_auc is not None else "N/A",
+            "ci_lower": ci_lower,
+            "ci_upper": ci_upper,
+            "auprc": auprc,
+            "threshold": th,
+            "sensitivity": sens,
+            "specificity": spec,
+            "ppv": ppv,
+            "npv": npv,
+            "f1_score": f1,
+            "brier_score": brier,
+            "confusion_matrix": {"tp": int(tp), "fp": int(fp), "tn": int(tn), "fn": int(fn)},
+            "sample_count": len(valid_idx),
+            "positive_count": int(tp + fn),
+            "negative_count": int(tn + fp),
+        }
+
+    mean_auc = float(np.mean(valid_aucs)) if valid_aucs else None
+
+    # Anonymized Predictions Export
+    if args.output_predictions:
+        pred_records = []
+        underlying_df = dataset.dataset.frame if isinstance(dataset, Subset) else dataset.frame
+        for i in range(len(dataset)):
+            actual_row = underlying_df.iloc[dataset.indices[i]] if isinstance(dataset, Subset) else underlying_df.iloc[i]
+            study_path = str(actual_row.get("Path", f"study_{i+1}"))
+            study_hash = hashlib.sha256(study_path.encode()).hexdigest()[:12]
+            record = {
+                "study_id": f"study_{study_hash}",
+                "patient_id": f"patient_{study_hash[:8]}",
+            }
+            for idx, label in enumerate(predictor.labels):
+                record[f"{label}_prob"] = float(probs_arr[i, idx])
+                record[f"{label}_pred"] = int(probs_arr[i, idx] >= thresholds_dict.get(label, 0.5))
+                record[f"{label}_target"] = float(targets_arr[i, idx])
+                record[f"{label}_mask"] = float(masks_arr[i, idx])
+            pred_records.append(record)
+
+        args.output_predictions.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(pred_records).to_csv(args.output_predictions, index=False)
+        print(f"Exported anonymized predictions to: {args.output_predictions}")
+
+    report = {
+        "evaluation_mode": "locked_test" if args.locked_test else "standard",
+        "git_commit": get_git_commit_sha(),
         "checkpoint": str(args.checkpoint),
-        "checkpoint_sha256": ckpt_hash,
+        "checkpoint_sha256": compute_file_sha256(args.checkpoint),
         "dataset_csv": str(csv_path),
-        "dataset_sha256": dataset_hash,
+        "dataset_sha256": compute_file_sha256(csv_path),
+        "threshold_metadata": threshold_meta,
+        "model_architecture": predictor.architecture,
         "seed": args.seed,
-        "uncertain_policy": args.uncertain_policy,
-        "view": view,
-        "rows": len(dataset),
-        "labels": predictor.labels,
-        "model": predictor.architecture,
-        "loss": total_loss / max(1, len(dataset)),
-        "mean_auc": mean_auc,
-        "label_auc": {k: v["auc"] for k, v in aucs_dict.items()},
-        "label_auc_ci": aucs_dict,
-        "thresholds": calibration["thresholds"],
-        "metrics": calibration["metrics"],
-        "disclaimer": "Research prototype only. Do not use these results for medical decisions.",
+        "num_studies": len(dataset),
+        "mean_auroc": mean_auc,
+        "metrics_per_label": label_metrics,
     }
 
-    print(json.dumps(result, indent=2))
+    print("\n=== LOCKED EVALUATION BENCHMARK RESULTS ===")
+    print(f"Mean AUROC: {mean_auc:.4f}" if mean_auc else "Mean AUROC: N/A")
+    for lbl, m in label_metrics.items():
+        auc_str = m["ci_95"]
+        print(f"  {lbl:20s}: AUROC={auc_str} | Sens={m['sensitivity']:.3f} | Spec={m['specificity']:.3f} | F1={m['f1_score']:.3f}")
 
-    if args.output_thresholds:
-        args.output_thresholds.parent.mkdir(parents=True, exist_ok=True)
-        args.output_thresholds.write_text(json.dumps(result, indent=2), encoding="utf-8")
-        print(f"\nSaved calibrated metrics & SHA-256 manifest to: {args.output_thresholds}")
+    if args.output_report:
+        args.output_report.parent.mkdir(parents=True, exist_ok=True)
+        args.output_report.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print(f"\nSaved evaluation report to: {args.output_report}")
 
 
 if __name__ == "__main__":
