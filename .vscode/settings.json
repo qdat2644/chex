@@ -1,0 +1,9 @@
+{
+  "python.defaultInterpreterPath": "c:\\test\\.venv\\Scripts\\python.exe",
+  "python.analysis.extraPaths": [
+    "c:\\test"
+  ],
+  "python.analysis.autoSearchPaths": true,
+  "python.analysis.diagnosticMode": "workspace",
+  "python.analysis.typeCheckingMode": "basic"
+}

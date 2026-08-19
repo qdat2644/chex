@@ -4,7 +4,6 @@ import argparse
 import hashlib
 import json
 import random
-import shutil
 import sys
 import time
 from pathlib import Path
@@ -23,7 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.config import DEFAULT_IMAGE_SIZE, SUPPORTED_ARCHITECTURES, resolve_label_preset
+from app.config import DEFAULT_LABELS, SUPPORTED_ARCHITECTURES
 from app.dataset import CheXpertDataset
 from app.model import build_model
 
