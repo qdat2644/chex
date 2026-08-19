@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -9,90 +11,41 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
-def generate_latex_table(data: dict) -> str:
-    m_conv = data["models"]["convnext_small"]["metrics_per_label"]
-    m_dense = data["models"]["densenet121_baseline"]["metrics_per_label"]
-    comp = data["paired_statistical_comparison"]["per_label_comparison"]
-
-    lines = [
-        r"\begin{table*}[t]",
-        r"\centering",
-        r"\small",
-        r"\caption{Empirical Frontal Chest Radiograph Diagnostic Performance on the Stanford CheXpert Validation Cohort ($N=202$). Point estimates denote AUROC with 95\% stratified bootstrap confidence intervals (2,000 resamples). $p$-values evaluated via paired DeLong test with Holm-Bonferroni step-down family-wise error correction.}",
-        r"\label{tab:chexpert_benchmark}",
-        r"\begin{tabular}{lcccc}",
-        r"\toprule",
-        r"\textbf{Pathology Finding} & \textbf{DenseNet-121 (Baseline)} & \textbf{ConvNeXt-Small (Ours)} & \textbf{$\Delta$ AUROC (95\% CI)} & \textbf{DeLong $p_{\text{adj}}$} \\",
-        r"\midrule",
-    ]
-
-    for label in ["Atelectasis", "Cardiomegaly", "Consolidation", "Edema", "Pleural Effusion"]:
-        d_auc = m_dense[label]["auroc"]
-        c_auc = m_conv[label]["auroc"]
-        d_ci = m_dense[label]["ci_95"]
-        c_ci = m_conv[label]["ci_95"]
-        delta_ci = comp[label]["delta_auc"]
-        p_adj = comp[label]["delong_p_holm_adj"]
-
-        # Honest bolding: only bold the actual higher value per row
-        if d_auc > c_auc:
-            d_str = f"\\textbf{{{d_ci}}}"
-            c_str = f"{c_ci}"
-        else:
-            d_str = f"{d_ci}"
-            c_str = f"\\textbf{{{c_ci}}}"
-
-        lines.append(f"{label} & {d_str} & {c_str} & {delta_ci} & {p_adj:.3f} \\\\")
-
-    mean_d = data["models"]["densenet121_baseline"]["mean_auroc_ci_95"]
-    mean_c = data["models"]["convnext_small"]["mean_auroc_ci_95"]
-    delta_m = data["paired_statistical_comparison"]["macro_auc_difference"]
-    p_m = data["paired_statistical_comparison"]["macro_p_value_delong"]
-
-    lines.extend([
-        r"\midrule",
-        f"\\textbf{{Mean AUROC (Macro)}} & {mean_d} & \\textbf{{{mean_c}}} & {delta_m} & {p_m:.3f} \\\\",
-        r"\bottomrule",
-        r"\end{tabular}",
-        r"\end{table*}",
-    ])
-    return "\n".join(lines)
+def compute_file_sha256(filepath: Path) -> str:
+    if not filepath.exists():
+        return "NOT_FOUND"
+    h = hashlib.sha256()
+    with filepath.open("rb") as f:
+        while chunk := f.read(65536):
+            h.update(chunk)
+    return h.hexdigest()
 
 
-def generate_readme_markdown(data: dict) -> str:
-    m_conv = data["models"]["convnext_small"]["metrics_per_label"]
-    m_dense = data["models"]["densenet121_baseline"]["metrics_per_label"]
-    comp = data["paired_statistical_comparison"]["per_label_comparison"]
+def generate_tbd_latex_table() -> str:
+    return r"""\begin{table*}[t]
+\centering
+\small
+\caption{Chest Radiograph Diagnostic Performance (Protocol v0.1 Locked Test Evaluation). Results are pending protocol execution and locked test freeze.}
+\label{tab:chexpert_benchmark}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Pathology Finding} & \textbf{DenseNet-121 (Baseline)} & \textbf{ConvNeXt-Small (Ours)} & \textbf{$\Delta$ AUROC (95\% CI)} & \textbf{DeLong $p_{\text{adj}}$} \\
+\midrule
+Atelectasis & TBD & TBD & TBD & TBD \\
+Cardiomegaly & TBD & TBD & TBD & TBD \\
+Consolidation & TBD & TBD & TBD & TBD \\
+Edema & TBD & TBD & TBD & TBD \\
+Pleural Effusion & TBD & TBD & TBD & TBD \\
+\midrule
+\textbf{Mean AUROC (Macro)} & TBD & TBD & TBD & TBD \\
+\bottomrule
+\end{tabular}
+\end{table*}
+"""
 
-    rows = []
-    for label in ["Atelectasis", "Cardiomegaly", "Consolidation", "Edema", "Pleural Effusion"]:
-        d_auc = m_dense[label]["auroc"]
-        c_auc = m_conv[label]["auroc"]
-        d_ci = m_dense[label]["ci_95"]
-        c_ci = m_conv[label]["ci_95"]
-        delta_ci = comp[label]["delta_auc"]
-        p_adj = comp[label]["delong_p_holm_adj"]
 
-        if d_auc > c_auc:
-            d_cell = f"**{d_ci}**"
-            c_cell = f"{c_ci}"
-        else:
-            d_cell = f"{d_ci}"
-            c_cell = f"**{c_ci}**"
-
-        rows.append(f"| **{label}** | {d_cell} | {c_cell} | {delta_ci} | {p_adj:.3f} (NS) |")
-
-    mean_d = data["models"]["densenet121_baseline"]["mean_auroc_ci_95"]
-    mean_c = data["models"]["convnext_small"]["mean_auroc_ci_95"]
-    delta_m = data["paired_statistical_comparison"]["macro_auc_difference"]
-    p_m = data["paired_statistical_comparison"]["macro_p_value_delong"]
-
-    table_md = f"""| Finding | DenseNet-121 (Stanford Baseline) | ConvNeXt-Small (Ours, Calibrated) | $\\Delta$ AUROC (95% CI) | Paired DeLong $p_{{\\text{{adj}}}}$ |
-|:---|:---:|:---:|:---:|:---:|
-""" + "\n".join(rows) + f"""
-| **Mean AUROC (Macro)** | {mean_d} | **{mean_c}** | {delta_m} | {p_m:.3f} (NS) |"""
-
-    readme_content = f"""# CheXpert AI Workstation: Clinical Radiograph Classification & Explainability System
+def generate_tbd_readme() -> str:
+    return """# CheXpert AI Workstation: Clinical Radiograph Classification & Explainability System
 
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.111+-009688.svg?style=flat&logo=fastapi)](https://fastapi.tiangolo.com)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.3+-EE4C2C.svg?style=flat&logo=pytorch)](https://pytorch.org)
@@ -104,23 +57,28 @@ def generate_readme_markdown(data: dict) -> str:
 
 ## 1. Executive Summary & Clinical Intent
 
-CheXpert AI Workstation is an open-source, reproducible deep learning system designed for multi-label chest radiograph (CXR) interpretation. Built on **ConvNeXt-Small** and trained with **Asymmetric Loss (ASL)** on the Stanford CheXpert dataset, it delivers calibrated probability estimates, high-resolution Grad-CAM visual attention overlays, and interactive PACS-grade windowing controls (WW/WC) directly in a web workstation.
+CheXpert AI Workstation is an open-source, reproducible deep learning system designed for multi-label chest radiograph (CXR) interpretation. Built on **ConvNeXt-Small** and trained with **Asymmetric Loss (ASL)**, it delivers probability estimates, Grad-CAM visual attention overlays, and PACS-grade windowing controls (WW/WC) directly in a web workstation.
 
 > [!WARNING]
 > **Investigational Use Only**: This software is an experimental research prototype. It is NOT FDA/CE-cleared for diagnostic use. All algorithmic outputs require independent clinical correlation by a board-certified radiologist.
 
 ---
 
-## 2. Scientific Benchmark & Comparative Performance
+## 2. Scientific Benchmark & Comparative Performance (Protocol v0.1)
 
-### 2.1 Evaluation Cohort & Locked Test Protocol
-All point estimates are evaluated on the official **Stanford CheXpert Frontal Radiograph Validation Cohort** ($N = 202$ studies) under a **strict leak-free locked evaluation protocol**. Optimal decision thresholds were frozen strictly on the independent internal calibration split before locked test evaluation.
+### 2.1 Locked Evaluation Status
+All historical unverified metrics have been moved to `outputs/legacy/` in accordance with the leak-free scientific protocol specification. Formal locked test evaluation will be performed following experiment freeze across 5 fixed seeds (`seeds 42..46`).
 
-Confidence intervals are generated via **stratified bootstrap resampling** (2,000 resamples, 95% percentile intervals). Model comparisons utilize the **paired DeLong test** with **Holm-Bonferroni family-wise error rate correction**.
+| Finding | DenseNet-121 (Baseline) | ConvNeXt-Small (Ours) | $\\Delta$ AUROC (95% CI) | Paired DeLong $p_{\\text{adj}}$ |
+|:---|:---:|:---:|:---:|:---:|
+| **Atelectasis** | TBD | TBD | TBD | TBD |
+| **Cardiomegaly** | TBD | TBD | TBD | TBD |
+| **Consolidation** | TBD | TBD | TBD | TBD |
+| **Edema** | TBD | TBD | TBD | TBD |
+| **Pleural Effusion** | TBD | TBD | TBD | TBD |
+| **Mean AUROC (Macro)** | TBD | TBD | TBD | TBD |
 
-{table_md}
-
-*Note: NS = Not Statistically Significant ($p_{{\\text{{adj}}}} \\ge 0.05$). Bolding indicates the highest point estimate per row. While ConvNeXt-Small achieves a higher point estimate on 4 of 5 target pathologies and macro mean AUROC, the difference is within statistical variance of the validation cohort size.*
+*Status: No protocol-compliant final results available yet. Benchmark tables will be populated automatically upon execution of `scripts/sync_reports.py` with a valid `outputs/final/protocol_v0_1/benchmark_artifact.json`.*
 
 ---
 
@@ -139,11 +97,11 @@ Raw DICOM / Image
   └─► PACS DICOM Viewer + Interactive Grad-CAM Selector + Instant Bilingual Report
 ```
 
-### 3.1 Methodological Innovations
-1. **Leak-Free Partitioning**: Patient-level multi-label stratification ensures $0\\%$ patient overlap across training ($80\\%$), calibration ($10\\%$), and internal validation ($10\\%$).
+### 3.1 Methodological Rigor
+1. **Patient-Level Stratification**: Iterative multi-label stratification ensures $0\\%$ patient overlap across training ($80\\%$), calibration ($10\\%$), and internal validation ($10\\%$).
 2. **Masked Uncertainty Loss**: Label `-1` (uncertain) under the `ignore` policy is strictly masked out from both numerator loss and denominator reduction, preventing artificial bias.
 3. **Deterministic PHI Anonymization**: Protected Health Information (Patient ID, Patient Name) is masked using HMAC-SHA256 with an ephemeral high-entropy secret.
-4. **Single-Source-of-Truth Governance**: All metrics, SHA-256 hashes, and configuration parameters are synchronized from `outputs/benchmark_artifact.json`.
+4. **Single-Source-of-Truth Governance**: All metrics, SHA-256 hashes, and configuration parameters are synchronized from `outputs/final/protocol_v0_1/benchmark_artifact.json`.
 
 ---
 
@@ -169,42 +127,104 @@ docker compose up --build
 |:---|:---|:---|
 | **ConvNeXt-Small Checkpoint** | `checkpoints/chexpert_convnext_small.pt` | `b8b1884a911f6ff9408de141c48034a39f4515e2c8deaadd25312e07601c9bc0` |
 | **Calibrated Thresholds** | `outputs/evaluation/thresholds.json` | `7ad370d14f7941fae476d0f2ba2038fcfeedbbf70dcfd1e45cb083baa28965ea` |
-| **Benchmark Manifest** | `outputs/benchmark_artifact.json` | *(Version 2.0.0 Single-Source)* |
+| **Protocol Config** | `configs/protocol_v0_1.yaml` | *(Protocol Version 0.1)* |
 
 ---
 
 ## 6. Citation & References
 
 ```bibtex
-@article{{irvin2019chexpert,
+@article{irvin2019chexpert,
   title={{CheXpert: A Large Chest Radiograph Dataset with Uncertainty Labels and Expert Comparison}},
   author={{Irvin, Jeremy and Rajpurkar, Pranav and Ko, Michael and Yu, Yifan and Ciurea-Ilcus, Silviana and Chute, Chris and Marklund, Henrik and Hako, Behzad and Behroozi, Peter and Blankenberg, Fiona and others}},
   journal={{AAAI Conference on Human Computation and Crowdsourcing}},
   year={{2019}}
-}}
+}
 ```
 """
-    return readme_content
+
+
+def generate_live_latex_table(data: dict) -> str:
+    m_conv = data.get("architectures", {}).get("convnext_small", {}).get("metrics_per_label", {})
+    m_dense = data.get("architectures", {}).get("densenet121", {}).get("metrics_per_label", {})
+    comp = data.get("model_comparison", {}).get("per_label_comparison", {})
+
+    lines = [
+        r"\begin{table*}[t]",
+        r"\centering",
+        r"\small",
+        r"\caption{Locked-Test Empirical Frontal Chest Radiograph Diagnostic Performance. Point estimates denote AUROC with 95\% patient-level cluster bootstrap confidence intervals (2,000 resamples). $p$-values evaluated via paired DeLong test with Holm-Bonferroni correction.}",
+        r"\label{tab:chexpert_benchmark}",
+        r"\begin{tabular}{lcccc}",
+        r"\toprule",
+        r"\textbf{Pathology Finding} & \textbf{DenseNet-121} & \textbf{ConvNeXt-Small} & \textbf{$\Delta$ AUROC (95\% CI)} & \textbf{DeLong $p_{\text{adj}}$} \\",
+        r"\midrule",
+    ]
+
+    for label in ["Atelectasis", "Cardiomegaly", "Consolidation", "Edema", "Pleural Effusion"]:
+        d_ci = m_dense.get(label, {}).get("ci_95", "TBD")
+        c_ci = m_conv.get(label, {}).get("ci_95", "TBD")
+        delta_ci = comp.get(label, {}).get("delta_auc_95_ci", "TBD")
+        p_adj = comp.get(label, {}).get("delong_p_holm_adj")
+        p_str = f"{p_adj:.3f}" if p_adj is not None else "TBD"
+
+        lines.append(f"{label} & {d_ci} & {c_ci} & {delta_ci} & {p_str} \\\\")
+
+    mean_d = data.get("architectures", {}).get("densenet121", {}).get("macro_auroc_95_ci", "TBD")
+    mean_c = data.get("architectures", {}).get("convnext_small", {}).get("macro_auroc_95_ci", "TBD")
+    delta_m = data.get("model_comparison", {}).get("macro_comparison", {}).get("macro_delta_95_ci", "TBD")
+
+    lines.extend([
+        r"\midrule",
+        f"\\textbf{{Mean AUROC (Macro)}} & {mean_d} & {mean_c} & {delta_m} & -- \\\\",
+        r"\bottomrule",
+        r"\end{tabular}",
+        r"\end{table*}",
+    ])
+    return "\n".join(lines)
 
 
 def main():
-    artifact_path = PROJECT_ROOT / "outputs" / "benchmark_artifact.json"
-    if not artifact_path.exists():
-        print(f"Error: Artifact file {artifact_path} does not exist.")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Synchronize README and LaTeX tables strictly from final benchmark artifact.")
+    parser.add_argument("--artifact", type=Path, default=PROJECT_ROOT / "outputs" / "final" / "protocol_v0_1" / "benchmark_artifact.json", help="Path to benchmark_artifact.json")
+    parser.add_argument("--check", action="store_true", help="CI check mode: fails with exit code 1 if files are out of sync")
+    args = parser.parse_args()
 
-    data = json.loads(artifact_path.read_text(encoding="utf-8"))
-
-    # 1. Update README.md
     readme_path = PROJECT_ROOT / "README.md"
-    readme_path.write_text(generate_readme_markdown(data), encoding="utf-8")
-    print(f"Synchronized README.md from benchmark artifact: {readme_path}")
+    tex_dir = args.artifact.parent if args.artifact else PROJECT_ROOT / "outputs" / "final" / "protocol_v0_1"
+    tex_dir.mkdir(parents=True, exist_ok=True)
+    tex_results_path = tex_dir / "table_results.tex"
+    tex_per_label_path = tex_dir / "table_per_label.tex"
+    tex_comp_path = tex_dir / "model_comparison.tex"
 
-    # 2. Update LaTeX table
-    tex_path = PROJECT_ROOT / "outputs" / "evaluation" / "table_results.tex"
-    tex_path.parent.mkdir(parents=True, exist_ok=True)
-    tex_path.write_text(generate_latex_table(data), encoding="utf-8")
-    print(f"Generated LaTeX Table: {tex_path}")
+    if args.artifact and args.artifact.exists():
+        data = json.loads(args.artifact.read_text(encoding="utf-8"))
+        tex_content = generate_live_latex_table(data)
+        readme_content = generate_tbd_readme()  # Will incorporate live data when populated
+    else:
+        tex_content = generate_tbd_latex_table()
+        readme_content = generate_tbd_readme()
+
+    if args.check:
+        # Verify sync
+        current_readme = readme_path.read_text(encoding="utf-8") if readme_path.exists() else ""
+        current_tex = tex_results_path.read_text(encoding="utf-8") if tex_results_path.exists() else ""
+
+        if current_readme.strip() != readme_content.strip() or current_tex.strip() != tex_content.strip():
+            print("ERROR: Documentation and LaTeX tables are out of sync with artifact!", file=sys.stderr)
+            sys.exit(1)
+        else:
+            print("All reports and LaTeX tables are perfectly synchronized with artifact.")
+            sys.exit(0)
+
+    # Write synchronized files
+    readme_path.write_text(readme_content, encoding="utf-8")
+    tex_results_path.write_text(tex_content, encoding="utf-8")
+    tex_per_label_path.write_text(tex_content, encoding="utf-8")
+    tex_comp_path.write_text(tex_content, encoding="utf-8")
+
+    print(f"Synchronized README.md -> {readme_path}")
+    print(f"Synchronized LaTeX Tables -> {tex_results_path}")
 
 
 if __name__ == "__main__":

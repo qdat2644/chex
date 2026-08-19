@@ -11,11 +11,12 @@ from pathlib import Path
 from typing import Sequence
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
+import yaml
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Subset
-from tqdm.auto import tqdm
 from torchvision import transforms
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -38,10 +39,6 @@ def compute_file_sha256(filepath: Path) -> str:
 
 
 class AsymmetricLoss(torch.nn.Module):
-    """
-    Asymmetric Loss for Multi-Label Classification with strict masking.
-    Reduces the impact of easy negative examples and emphasizes hard positive examples.
-    """
     def __init__(self, gamma_neg: float = 4.0, gamma_pos: float = 1.0, clip: float = 0.05, eps: float = 1e-8):
         super().__init__()
         self.gamma_neg = gamma_neg
@@ -75,9 +72,6 @@ class AsymmetricLoss(torch.nn.Module):
 
 
 class FocalLoss(torch.nn.Module):
-    """
-    Multi-label Focal Loss with optional masking.
-    """
     def __init__(self, alpha: float = 0.25, gamma: float = 2.0):
         super().__init__()
         self.alpha = alpha
@@ -93,47 +87,15 @@ class FocalLoss(torch.nn.Module):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train an optimized leak-free CheXpert multi-label classifier.")
-    parser.add_argument("--data-root", type=Path, required=True, help="Data root directory containing images")
-    parser.add_argument("--split-manifest", type=Path, help="Path to outputs/splits/manifest.json (preferred)")
-    parser.add_argument("--train-csv", type=Path, help="Explicit path to train.csv split")
-    parser.add_argument("--val-csv", type=Path, help="Explicit path to internal_val.csv split")
-    parser.add_argument("--limit", type=int, help="Use a small subset for quick smoke tests.")
-    parser.add_argument("--output", type=Path, default=Path("checkpoints/chexpert_model.pt"))
-    parser.add_argument("--resume", type=Path, help="Path to checkpoint .pt to resume training from.")
-    parser.add_argument("--backup-dir", type=Path, help="Directory to automatically backup checkpoints to.")
-    parser.add_argument(
-        "--arch",
-        choices=SUPPORTED_ARCHITECTURES,
-        default="convnext_small",
-        help="Backbone architecture: convnext_small, densenet121, efficientnet_v2_m, resnet50",
-    )
-    parser.add_argument(
-        "--loss",
-        choices=["asl", "focal", "bce"],
-        default="asl",
-        help="Loss function: asl (Asymmetric Loss), focal (Focal Loss), bce (Binary Cross Entropy)",
-    )
-    parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE, help="Input resolution (e.g. 224, 384)")
-    parser.add_argument("--epochs", type=int, default=20, help="Total training epochs (default protocol: 20)")
-    parser.add_argument("--patience", type=int, default=5, help="Early stopping patience epochs (default: 5)")
-    parser.add_argument("--weight-decay", type=float, default=1e-2, help="Optimizer weight decay (default: 0.01)")
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument(
-        "--uncertain-policy",
-        choices=["u_ones_zeros", "smooth", "zero", "one", "ignore"],
-        default="u_ones_zeros",
-        help="Policy for -1 uncertainty labels (u_ones_zeros=Stanford baseline, smooth=0.6, zero=0, one=1, ignore=masked)",
-    )
-    parser.add_argument("--label-preset", choices=["competition", "all"], default="competition")
-    parser.add_argument("--view", choices=["frontal", "lateral", "all"], default="frontal")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--pos-weight", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--pretrained", action="store_true", help="Initialize backbone with ImageNet pretrained weights.")
-    parser.add_argument("--horizontal-flip", action="store_true", default=False, help="Enable horizontal flip augmentation (default: False)")
+    parser = argparse.ArgumentParser(description="Protocol-Compliant CheXpert Multi-Label Training Pipeline.")
+    parser.add_argument("--manifest", type=Path, required=True, help="Path to outputs/splits/protocol_v0_1/manifest.json (MANDATORY)")
+    parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "configs" / "protocol_v0_1.yaml", help="Path to protocol YAML config")
+    parser.add_argument("--data-root", type=Path, default=PROJECT_ROOT / "archive", help="Data root directory containing images")
+    parser.add_argument("--output-dir", type=Path, help="Directory to save run artifacts (e.g. outputs/runs/convnext_small/seed_42)")
+    parser.add_argument("--arch", choices=SUPPORTED_ARCHITECTURES, default="convnext_small", help="Model architecture")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--limit", type=int, help="Optional subset limit for fast smoke testing")
+    parser.add_argument("--resume", type=Path, help="Resume training from an existing checkpoint .pt")
     return parser.parse_args()
 
 
@@ -172,6 +134,61 @@ def calculate_pos_weight(dataset: CheXpertDataset, labels_or_count: int | Sequen
     return torch.tensor(weights, dtype=torch.float32)
 
 
+def run_epoch(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    criterion: torch.nn.Module,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer | None = None,
+    scaler: torch.amp.GradScaler | None = None,
+) -> tuple[float, list[list[float]], list[list[float]], list[list[float]]]:
+    is_train = optimizer is not None
+    model.train() if is_train else model.eval()
+
+    total_loss_numerator = 0.0
+    total_mask_denominator = 0.0
+    targets_all: list[list[float]] = []
+    probs_all: list[list[float]] = []
+    masks_all: list[list[float]] = []
+
+    for item in loader:
+        images = item[0].to(device, non_blocking=True)
+        targets = item[1].to(device, non_blocking=True)
+        masks = item[2].to(device, non_blocking=True) if len(item) > 2 else torch.ones_like(targets)
+
+        if is_train:
+            optimizer.zero_grad()
+
+        with torch.set_grad_enabled(is_train):
+            logits = model(images)
+            if isinstance(criterion, (AsymmetricLoss, FocalLoss)):
+                loss = criterion(logits, targets, mask=masks)
+                batch_loss_val = float(loss.detach().cpu()) * float(masks.sum().clamp(min=1.0).cpu())
+            else:
+                bce = criterion(logits, targets)
+                loss = (bce * masks).sum() / masks.sum().clamp(min=1.0)
+                batch_loss_val = float((bce * masks).sum().detach().cpu())
+
+            if is_train:
+                if scaler and scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
+
+        total_loss_numerator += batch_loss_val
+        total_mask_denominator += float(masks.sum().cpu())
+
+        targets_all.extend(targets.detach().cpu().tolist())
+        probs_all.extend(torch.sigmoid(logits).detach().cpu().tolist())
+        masks_all.extend(masks.detach().cpu().tolist())
+
+    epoch_loss = total_loss_numerator / max(1.0, total_mask_denominator)
+    return epoch_loss, targets_all, probs_all, masks_all
+
+
 def checkpoint_payload(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer | None,
@@ -193,108 +210,72 @@ def checkpoint_payload(
     }
 
 
-def run_epoch(
-    model: torch.nn.Module,
-    loader: DataLoader,
-    criterion: torch.nn.Module,
-    device: torch.device,
-    optimizer: torch.optim.Optimizer | None = None,
-    scaler: torch.amp.GradScaler | None = None,
-) -> tuple[float, list[list[float]], list[list[float]], list[list[float]]]:
-    is_train = optimizer is not None
-    model.train() if is_train else model.eval()
-
-    total_loss_sum = 0.0
-    total_mask_sum = 0.0
-    targets_all: list[list[float]] = []
-    probs_all: list[list[float]] = []
-    masks_all: list[list[float]] = []
-
-    for item in loader:
-        images = item[0].to(device)
-        targets = item[1].to(device)
-        masks = item[2].to(device) if len(item) > 2 else torch.ones_like(targets)
-
-        if is_train:
-            optimizer.zero_grad()
-
-        with torch.set_grad_enabled(is_train):
-            logits = model(images)
-            try:
-                loss = criterion(logits, targets, mask=masks)
-                loss_val = float(loss.detach().cpu()) * float(masks.sum().clamp(min=1.0).cpu())
-            except TypeError:
-                bce = criterion(logits, targets)
-                loss = (bce * masks).sum() / masks.sum().clamp(min=1.0)
-                loss_val = float((bce * masks).sum().detach().cpu())
-
-            if is_train:
-                if scaler:
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    optimizer.step()
-
-        total_loss_sum += loss_val
-        total_mask_sum += float(masks.sum().cpu())
-
-        targets_all.extend(targets.detach().cpu().tolist())
-        probs_all.extend(torch.sigmoid(logits).detach().cpu().tolist())
-        masks_all.extend(masks.detach().cpu().tolist())
-
-    epoch_loss = total_loss_sum / max(1.0, total_mask_sum)
-    return epoch_loss, targets_all, probs_all, masks_all
-
-
-def main() -> None:
+def main():
     args = parse_args()
-    set_seed(args.seed)
+    set_seed(args.seed, deterministic=True)
 
-    # 1. Resolve Train & Internal-Val Split Paths
-    train_csv = args.train_csv
-    val_csv = args.val_csv
+    # 1. Validate and Load Protocol Config
+    if not args.config.exists():
+        print(f"Error: Config file not found at {args.config}", file=sys.stderr)
+        sys.exit(1)
+    config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    config_sha256 = compute_file_sha256(args.config)
 
-    if args.split_manifest and args.split_manifest.exists():
-        manifest_data = json.loads(args.split_manifest.read_text(encoding="utf-8"))
-        train_file = manifest_data.get("splits", {}).get("train", {}).get("file", "train.csv")
-        val_file = manifest_data.get("splits", {}).get("internal_val", {}).get("file", "internal_val.csv")
-        train_csv = args.split_manifest.parent / train_file
-        val_csv = args.split_manifest.parent / val_file
+    # 2. Strict Manifest Verification
+    if not args.manifest.exists():
+        print(f"Error: Split manifest not found at {args.manifest}", file=sys.stderr)
+        sys.exit(1)
 
-    if not train_csv or not train_csv.exists():
-        default_train = PROJECT_ROOT / "outputs" / "splits" / "train.csv"
-        if default_train.exists():
-            train_csv = default_train
-        else:
-            train_csv = args.data_root / "train.csv"
+    manifest_data = json.loads(args.manifest.read_text(encoding="utf-8"))
+    manifest_sha256 = compute_file_sha256(args.manifest)
 
-    if not val_csv or not val_csv.exists():
-        default_val = PROJECT_ROOT / "outputs" / "splits" / "internal_val.csv"
-        if default_val.exists():
-            val_csv = default_val
+    # Reject if manifest contains locked_test role
+    splits = manifest_data.get("splits", {})
+    if "locked_test" in splits or manifest_data.get("role") == "locked_test":
+        raise RuntimeError("LEAKAGE PREVENTION ERROR: Manifest contains locked_test! Training is forbidden on locked test set.")
 
-    # 2. Strict Leakage Prevention Guard: Refuse official valid.csv during training
-    for check_path in [train_csv, val_csv]:
-        if check_path and "valid.csv" in check_path.name.lower() and "internal" not in check_path.name.lower():
-            raise RuntimeError(
-                f"LEAKAGE PREVENTION ERROR: '{check_path.name}' detected as training/validation source! "
-                f"The official Stanford validation set ('valid.csv') is strictly reserved as the LOCKED TEST SET. "
-                f"You must use internal validation split generated by scripts/make_splits.py."
-            )
+    train_meta = splits.get("train", {})
+    val_meta = splits.get("internal_validation", {})
 
-    labels = resolve_label_preset(args.label_preset)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training device: {device} | Architecture: {args.arch} | Epochs: {args.epochs} | Seed: {args.seed}")
-    print(f"Train Split: {train_csv}")
-    print(f"Internal Val Split: {val_csv}")
+    if not train_meta or not val_meta:
+        raise RuntimeError("LEAKAGE PREVENTION ERROR: Manifest must contain 'train' and 'internal_validation' split definitions!")
 
-    # Transforms
-    train_transform_list = [
-        transforms.Resize((args.image_size, args.image_size)),
-    ]
-    if args.horizontal_flip:
+    train_csv = args.manifest.parent / train_meta.get("csv", "train.csv")
+    val_csv = args.manifest.parent / val_meta.get("csv", "internal_validation.csv")
+
+    if not train_csv.exists() or not val_csv.exists():
+        raise FileNotFoundError(f"Missing split CSVs referenced in manifest: {train_csv} or {val_csv}")
+
+    # Set Output Directory
+    out_dir = args.output_dir or PROJECT_ROOT / "outputs" / "runs" / args.arch / f"seed_{args.seed}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir = out_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    # Extract Configuration Parameters
+    train_cfg = config.get("training", {})
+    aug_cfg = config.get("augmentation", {})
+    model_cfg = config.get("model", {})
+
+    epochs = int(train_cfg.get("epochs", 20))
+    batch_size = int(train_cfg.get("batch_size", 32))
+    lr = float(train_cfg.get("learning_rate", 1e-4))
+    weight_decay = float(train_cfg.get("weight_decay", 1e-2))
+    patience = int(train_cfg.get("early_stopping_patience", 5))
+    loss_name = str(train_cfg.get("loss", "asl")).lower()
+    unc_policy = str(train_cfg.get("uncertainty_policy", "u_ones_zeros"))
+    use_amp = bool(train_cfg.get("amp", True))
+    image_size = int(model_cfg.get("image_size", 224))
+    pretrained = bool(model_cfg.get("pretrained", True))
+    rot_degrees = float(aug_cfg.get("random_rotation_degrees", 7))
+    h_flip = bool(aug_cfg.get("horizontal_flip", False))
+    labels = model_cfg.get("labels", DEFAULT_LABELS)
+
+    # Preprocessing Pipeline Definition
+    train_transform_list = [transforms.Resize((image_size, image_size))]
+    if rot_degrees > 0:
+        train_transform_list.append(transforms.RandomRotation(degrees=rot_degrees))
+    if h_flip:
         train_transform_list.append(transforms.RandomHorizontalFlip(p=0.5))
     train_transform_list.extend([
         transforms.ToTensor(),
@@ -303,175 +284,207 @@ def main() -> None:
     train_transform = transforms.Compose(train_transform_list)
 
     val_transform = transforms.Compose([
-        transforms.Resize((args.image_size, args.image_size)),
-        transforms.ToTensor],
-    )
-    val_transform = transforms.Compose([
-        transforms.Resize((args.image_size, args.image_size)),
+        transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
+    preprocessing_config = {
+        "image_size": image_size,
+        "random_rotation_degrees": rot_degrees,
+        "horizontal_flip": h_flip,
+        "normalization_mean": [0.485, 0.456, 0.406],
+        "normalization_std": [0.229, 0.224, 0.225],
+    }
+    preprocessing_sha256 = hashlib.sha256(json.dumps(preprocessing_config, sort_keys=True).encode()).hexdigest()
+
+    # Datasets & DataLoaders
     train_dataset = CheXpertDataset(
         train_csv,
         args.data_root,
         train_transform,
         labels=labels,
-        uncertain_policy=args.uncertain_policy,
-        view=args.view,
+        uncertain_policy=unc_policy,
+        view=manifest_data.get("view", "frontal"),
     )
-
-    if val_csv and val_csv.exists():
-        val_dataset = CheXpertDataset(
-            val_csv,
-            args.data_root,
-            val_transform,
-            labels=labels,
-            uncertain_policy=args.uncertain_policy,
-            view=args.view,
-        )
-    else:
-        # Fallback subset split if no explicit internal val
-        total_len = len(train_dataset)
-        val_size = max(1, int(total_len * 0.1))
-        train_dataset, val_dataset = torch.utils.data.random_split(
-            train_dataset,
-            [total_len - val_size, val_size],
-            generator=torch.Generator().manual_seed(args.seed),
-        )
+    val_dataset = CheXpertDataset(
+        val_csv,
+        args.data_root,
+        val_transform,
+        labels=labels,
+        uncertain_policy=unc_policy,
+        view=manifest_data.get("view", "frontal"),
+    )
 
     if args.limit:
         train_dataset = Subset(train_dataset, range(min(args.limit, len(train_dataset))))
         val_dataset = Subset(val_dataset, range(min(max(2, args.limit // 4), len(val_dataset))))
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=0,
         pin_memory=torch.cuda.is_available(),
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
+        num_workers=0,
         pin_memory=torch.cuda.is_available(),
     )
 
-    model = build_model(args.arch, len(labels), pretrained=args.pretrained).to(device)
+    # Initialize Model & Loss
+    model = build_model(args.arch, len(labels), pretrained=pretrained).to(device)
 
-    # Loss Selection
-    if args.loss == "asl":
+    if loss_name == "asl":
         criterion = AsymmetricLoss(gamma_neg=4.0, gamma_pos=1.0, clip=0.05)
-    elif args.loss == "focal":
+    elif loss_name == "focal":
         criterion = FocalLoss(alpha=0.25, gamma=2.0)
     else:
-        if args.pos_weight and hasattr(train_dataset, "frame"):
-            pos_weight = calculate_pos_weight(train_dataset, len(labels)).to(device)
-            criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction="none")
-        else:
-            criterion = torch.nn.BCEWithLogitsLoss(reduction="none")
+        criterion = torch.nn.BCEWithLogitsLoss(reduction="none")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
-    scaler = torch.amp.GradScaler("cuda", enabled=args.amp and torch.cuda.is_available())
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp and torch.cuda.is_available())
 
+    start_epoch = 1
     best_val_auc = 0.0
     patience_counter = 0
+    history = []
 
-    print(f"Starting training loop: {len(train_dataset)} train samples, {len(val_dataset)} internal val samples.")
+    # Handle Resume
+    if args.resume and args.resume.exists():
+        print(f"Resuming training from checkpoint: {args.resume}")
+        loaded = torch.load(args.resume, map_location=device, weights_only=True)
+        model.load_state_dict(loaded["model_state_dict"])
+        if loaded.get("optimizer_state_dict"):
+            optimizer.load_state_dict(loaded["optimizer_state_dict"])
+        if loaded.get("scheduler_state_dict"):
+            scheduler.load_state_dict(loaded["scheduler_state_dict"])
+        meta = loaded.get("metadata", {})
+        start_epoch = int(meta.get("epoch", 0)) + 1
+        best_val_auc = float(meta.get("best_internal_validation_auc", 0.0))
+        history = list(meta.get("metrics_history", []))
 
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        total_loss_numerator = 0.0
-        total_mask_denominator = 0.0
+    print(f"\n=======================================================")
+    print(f"CheXpert Protocol Training: {args.arch} (Seed {args.seed})")
+    print(f"Train samples: {len(train_dataset)} | Val samples: {len(val_dataset)}")
+    print(f"Epochs: {epochs} | Batch size: {batch_size} | LR: {lr} | Loss: {loss_name}")
+    print(f"=======================================================\n")
 
-        for images, targets, masks in train_loader:
-            images = images.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
-            masks = masks.to(device, non_blocking=True)
-
-            optimizer.zero_grad()
-
-            with torch.amp.autocast("cuda", enabled=args.amp and torch.cuda.is_available()):
-                logits = model(images)
-                if args.loss in ("asl", "focal"):
-                    loss = criterion(logits, targets, mask=masks)
-                    loss_batch_sum = float(loss.detach().cpu()) * float(masks.sum().clamp(min=1.0).cpu())
-                else:
-                    bce = criterion(logits, targets)
-                    loss = (bce * masks).sum() / masks.sum().clamp(min=1.0)
-                    loss_batch_sum = float((bce * masks).sum().detach().cpu())
-
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
-            total_loss_numerator += loss_batch_sum
-            total_mask_denominator += float(masks.sum().cpu())
-
+    for epoch in range(start_epoch, epochs + 1):
+        t0 = time.time()
+        train_loss, _, _, _ = run_epoch(model, train_loader, criterion, device, optimizer=optimizer, scaler=scaler)
         scheduler.step()
-        epoch_loss = total_loss_numerator / max(1.0, total_mask_denominator)
 
         # Validation Step
-        model.eval()
-        val_targets: list[list[float]] = []
-        val_probs: list[list[float]] = []
-        val_masks: list[list[float]] = []
+        val_loss, val_targets, val_probs, val_masks = run_epoch(model, val_loader, criterion, device)
 
-        with torch.no_grad():
-            for images, targets, masks in val_loader:
-                images = images.to(device, non_blocking=True)
-                logits = model(images)
-                probs = torch.sigmoid(logits)
-
-                val_targets.extend(targets.cpu().tolist())
-                val_probs.extend(probs.cpu().tolist())
-                val_masks.extend(masks.cpu().tolist())
-
+        # Compute Internal Validation AUC
         val_targets_arr = np.array(val_targets)
         val_probs_arr = np.array(val_probs)
         val_masks_arr = np.array(val_masks)
 
-        aucs = []
-        for l_idx in range(len(labels)):
-            v_idx = np.where(val_masks_arr[:, l_idx] > 0.5)[0]
-            if len(v_idx) > 0 and len(np.unique(val_targets_arr[v_idx, l_idx])) > 1:
+        label_aucs = {}
+        valid_auc_list = []
+
+        for idx, label in enumerate(labels):
+            v_idx = np.where(val_masks_arr[:, idx] > 0.5)[0]
+            if len(v_idx) > 0 and len(np.unique(val_targets_arr[v_idx, idx])) > 1:
                 try:
-                    auc = float(roc_auc_score(val_targets_arr[v_idx, l_idx], val_probs_arr[v_idx, l_idx]))
-                    aucs.append(auc)
+                    auc = float(roc_auc_score(val_targets_arr[v_idx, idx], val_probs_arr[v_idx, idx]))
+                    label_aucs[label] = auc
+                    valid_auc_list.append(auc)
                 except Exception:
-                    pass
+                    label_aucs[label] = None
+            else:
+                label_aucs[label] = None
 
-        mean_val_auc = float(np.mean(aucs)) if aucs else 0.0
-        print(f"Epoch [{epoch:02d}/{args.epochs:02d}] Train Loss: {epoch_loss:.4f} | Internal Val AUC: {mean_val_auc:.4f}")
+        mean_val_auc = float(np.mean(valid_auc_list)) if valid_auc_list else 0.0
+        elapsed = time.time() - t0
 
-        # Checkpoint Saving & Early Stopping
+        epoch_record = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "mean_val_auc": mean_val_auc,
+            "label_aucs": label_aucs,
+            "learning_rate": optimizer.param_groups[0]["lr"],
+            "elapsed_seconds": elapsed,
+        }
+        history.append(epoch_record)
+
+        print(f"Epoch [{epoch:02d}/{epochs:02d}] Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val AUC: {mean_val_auc:.4f} ({elapsed:.1f}s)")
+
+        metadata_dict = {
+            "epoch": epoch,
+            "architecture": args.arch,
+            "seed": args.seed,
+            "best_internal_validation_auc": max(best_val_auc, mean_val_auc),
+            "config_sha256": config_sha256,
+            "split_manifest_sha256": manifest_sha256,
+            "preprocessing_sha256": preprocessing_sha256,
+            "uncertainty_policy": unc_policy,
+            "labels": labels,
+            "metrics_history": history,
+        }
+
+        # Save last checkpoint
+        last_ckpt = out_dir / "last.pt"
+        payload_last = checkpoint_payload(model, optimizer, scheduler, labels, metadata=metadata_dict)
+        payload_last["scaler_state_dict"] = scaler.state_dict() if scaler else None
+        torch.save(payload_last, last_ckpt)
+
+        # Check for improvement & save best checkpoint
         if mean_val_auc > best_val_auc:
             best_val_auc = mean_val_auc
             patience_counter = 0
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({
-                "model_state_dict": model.state_dict(),
-                "labels": labels,
-                "metadata": {
-                    "architecture": args.arch,
-                    "image_size": args.image_size,
-                    "best_val_auc": best_val_auc,
-                    "epoch": epoch,
-                    "uncertain_policy": args.uncertain_policy,
-                    "seed": args.seed,
-                },
-            }, args.output)
-            print(f"  -> Best model saved to {args.output} (Val AUC: {best_val_auc:.4f})")
+            best_ckpt = out_dir / "best.pt"
+            metadata_dict["best_internal_validation_auc"] = best_val_auc
+            payload_best = checkpoint_payload(model, optimizer, scheduler, labels, metadata=metadata_dict)
+            payload_best["scaler_state_dict"] = scaler.state_dict() if scaler else None
+            torch.save(payload_best, best_ckpt)
+            print(f"  -> Best model saved to: {best_ckpt} (AUC: {best_val_auc:.4f})")
+
+            # Export internal validation predictions
+            pred_records = []
+            underlying_df = val_dataset.dataset.frame if isinstance(val_dataset, Subset) else val_dataset.frame
+            for i in range(len(val_dataset)):
+                row_item = underlying_df.iloc[val_dataset.indices[i]] if isinstance(val_dataset, Subset) else underlying_df.iloc[i]
+                rec = {
+                    "study_id": str(row_item.get("study_id", f"study_{i+1}")),
+                    "patient_id": str(row_item.get("patient_id", f"patient_{i+1}")),
+                }
+                for idx, label in enumerate(labels):
+                    rec[f"{label}_prob"] = float(val_probs_arr[i, idx])
+                    rec[f"{label}_target"] = float(val_targets_arr[i, idx])
+                    rec[f"{label}_mask"] = float(val_masks_arr[i, idx])
+                pred_records.append(rec)
+            pd.DataFrame(pred_records).to_csv(out_dir / "internal_validation_predictions.csv", index=False)
         else:
             patience_counter += 1
-            if patience_counter >= args.patience:
-                print(f"Early stopping triggered after {epoch} epochs (patience={args.patience}).")
+            if patience_counter >= patience:
+                print(f"Early stopping triggered at epoch {epoch} (patience={patience}).")
                 break
 
-    print(f"\nTraining completed! Best Internal Val AUC: {best_val_auc:.4f}")
+    # Save training history JSON and run manifest
+    (out_dir / "training_history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+    run_manifest = {
+        "architecture": args.arch,
+        "seed": args.seed,
+        "best_val_auc": best_val_auc,
+        "epochs_trained": len(history),
+        "best_checkpoint_sha256": compute_file_sha256(out_dir / "best.pt"),
+        "config_sha256": config_sha256,
+        "split_manifest_sha256": manifest_sha256,
+        "preprocessing_sha256": preprocessing_sha256,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    (out_dir / "run_manifest.json").write_text(json.dumps(run_manifest, indent=2), encoding="utf-8")
+    print(f"\nRun artifacts successfully saved in: {out_dir}")
 
 
 if __name__ == "__main__":

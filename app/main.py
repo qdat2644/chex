@@ -36,7 +36,10 @@ logger = logging.getLogger("chexpert.audit")
 
 try:
     import pydicom
-    from pydicom.pixel_data_handlers.util import apply_voi_lut
+    try:
+        from pydicom.pixels import apply_modality_lut, apply_voi_lut
+    except ImportError:
+        from pydicom.pixel_data_handlers.util import apply_modality_lut, apply_voi_lut
     HAS_PYDICOM = True
 except ImportError:
     HAS_PYDICOM = False
@@ -665,9 +668,12 @@ def decode_image_or_dicom(spool: BinaryIO, filename: str) -> tuple[Image.Image, 
             arr = arr.astype(np.float32)
 
             # 2. Modality LUT / Rescale Slope & Intercept
-            slope = float(getattr(dcm, "RescaleSlope", 1.0))
-            intercept = float(getattr(dcm, "RescaleIntercept", 0.0))
-            arr = (arr * slope) + intercept
+            try:
+                arr = apply_modality_lut(arr, dcm)
+            except Exception:
+                slope = float(getattr(dcm, "RescaleSlope", 1.0))
+                intercept = float(getattr(dcm, "RescaleIntercept", 0.0))
+                arr = (arr * slope) + intercept
 
             # 3. VOI LUT / Windowing
             try:
@@ -691,7 +697,8 @@ def decode_image_or_dicom(spool: BinaryIO, filename: str) -> tuple[Image.Image, 
             if "MONOCHROME1" in photometric:
                 arr = np.amax(arr) - arr
 
-            # 5. Normalization
+            # 5. Finite-Value Validation & Normalization
+            arr = np.nan_to_num(arr, nan=0.0, posinf=255.0, neginf=0.0)
             arr_min = float(np.min(arr))
             arr_max = float(np.max(arr))
             if arr_max > arr_min:

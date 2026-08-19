@@ -19,9 +19,6 @@ from app.config import DEFAULT_LABELS
 
 
 def compute_midrank(x: np.ndarray) -> np.ndarray:
-    """
-    Computes midranks for DeLong's test.
-    """
     J = np.argsort(x)
     Z = x[J]
     N = len(x)
@@ -39,12 +36,6 @@ def compute_midrank(x: np.ndarray) -> np.ndarray:
 
 
 def fast_delong(predictions: np.ndarray, ground_truth: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Fast DeLong algorithm for calculating AUC covariance.
-    predictions: shape (n_models, n_samples)
-    ground_truth: shape (n_samples,) binary {0, 1}
-    Returns: (aucs, cov_matrix)
-    """
     n_models = predictions.shape[0]
     pos_mask = (ground_truth == 1)
     neg_mask = (ground_truth == 0)
@@ -54,7 +45,6 @@ def fast_delong(predictions: np.ndarray, ground_truth: np.ndarray) -> tuple[np.n
     if m == 0 or n == 0:
         return np.zeros(n_models), np.zeros((n_models, n_models))
 
-    # Structural components
     V10 = np.empty((n_models, m), dtype=float)
     V01 = np.empty((n_models, n), dtype=float)
     aucs = np.empty(n_models, dtype=float)
@@ -64,14 +54,12 @@ def fast_delong(predictions: np.ndarray, ground_truth: np.ndarray) -> tuple[np.n
         pos_preds = preds[pos_mask]
         neg_preds = preds[neg_mask]
 
-        # Combine and compute ranks
         all_preds = np.concatenate([pos_preds, neg_preds])
         ranks = compute_midrank(all_preds)
 
         pos_ranks = ranks[:m]
         neg_ranks = ranks[m:]
 
-        # Placements
         V10[k] = (pos_ranks - compute_midrank(pos_preds)) / n
         V01[k] = 1.0 - (neg_ranks - compute_midrank(neg_preds)) / m
         aucs[k] = np.mean(V10[k])
@@ -92,10 +80,6 @@ def delong_paired_test(
     preds_b: np.ndarray,
     ground_truth: np.ndarray,
 ) -> tuple[float, float, float, float]:
-    """
-    Computes paired DeLong test between two models on the same ground truth.
-    Returns: (auc_a, auc_b, z_stat, p_value)
-    """
     preds = np.vstack([preds_a, preds_b])
     aucs, sigma = fast_delong(preds, ground_truth)
     auc_diff = aucs[0] - aucs[1]
@@ -110,9 +94,6 @@ def delong_paired_test(
 
 
 def holm_bonferroni_correction(p_values: Sequence[float]) -> list[float]:
-    """
-    Applies Holm-Bonferroni step-down correction for family-wise error rate control.
-    """
     m = len(p_values)
     indexed = sorted(enumerate(p_values), key=lambda x: x[1])
     adjusted = [0.0] * m
@@ -134,9 +115,6 @@ def paired_bootstrap_delta_auc(
     n_boot: int = 2000,
     seed: int = 42,
 ) -> tuple[float, float, float]:
-    """
-    Paired bootstrap for difference in AUC (AUC_A - AUC_B).
-    """
     rng = np.random.RandomState(seed)
     pos_idx = np.where(ground_truth == 1)[0]
     neg_idx = np.where(ground_truth == 0)[0]
@@ -150,7 +128,6 @@ def paired_bootstrap_delta_auc(
         sample_pos = rng.choice(pos_idx, size=m, replace=True)
         sample_neg = rng.choice(neg_idx, size=n, replace=True)
         idx = np.concatenate([sample_pos, sample_neg])
-
         try:
             auc_a = roc_auc_score(ground_truth[idx], preds_a[idx])
             auc_b = roc_auc_score(ground_truth[idx], preds_b[idx])
@@ -165,6 +142,82 @@ def paired_bootstrap_delta_auc(
     return float(np.mean(diffs)), float(lower), float(upper)
 
 
+def patient_level_paired_bootstrap(
+    patient_ids: list[str],
+    merged_df: pd.DataFrame,
+    labels: list[str],
+    n_boot: int = 2000,
+    seed: int = 42,
+) -> tuple[dict[str, tuple[float, float, float]], tuple[float, float, float]]:
+    rng = np.random.RandomState(seed)
+    unique_patients = np.unique(patient_ids)
+    n_patients = len(unique_patients)
+
+    patient_to_indices: dict[str, list[int]] = {}
+    for idx, pid in enumerate(patient_ids):
+        if pid not in patient_to_indices:
+            patient_to_indices[pid] = []
+        patient_to_indices[pid].append(idx)
+
+    label_deltas: dict[str, list[float]] = {lbl: [] for lbl in labels}
+    macro_deltas: list[float] = []
+
+    for _ in range(n_boot):
+        sampled_pids = rng.choice(unique_patients, size=n_patients, replace=True)
+        sampled_indices = []
+        for pid in sampled_pids:
+            sampled_indices.extend(patient_to_indices[pid])
+
+        sub_df = merged_df.iloc[sampled_indices]
+
+        boot_aucs_a = []
+        boot_aucs_b = []
+
+        for label in labels:
+            y_raw = sub_df[f"{label}_target"].values
+            mask_raw = sub_df[f"{label}_mask"].values if f"{label}_mask" in sub_df.columns else np.ones(len(sub_df))
+            v_idx = np.where(mask_raw > 0.5)[0]
+
+            if len(v_idx) == 0:
+                continue
+
+            y_t = np.array([1 if y_raw[i] >= 0.5 else 0 for i in v_idx])
+            pa = sub_df[f"{label}_prob_a"].values[v_idx]
+            pb = sub_df[f"{label}_prob_b"].values[v_idx]
+
+            if len(np.unique(y_t)) > 1:
+                try:
+                    auc_a = roc_auc_score(y_t, pa)
+                    auc_b = roc_auc_score(y_t, pb)
+                    d = auc_a - auc_b
+                    label_deltas[label].append(d)
+                    boot_aucs_a.append(auc_a)
+                    boot_aucs_b.append(auc_b)
+                except Exception:
+                    pass
+
+        if boot_aucs_a and boot_aucs_b and len(boot_aucs_a) == len(boot_aucs_b):
+            macro_deltas.append(float(np.mean(boot_aucs_a) - np.mean(boot_aucs_b)))
+
+    # Compute CIs
+    per_label_ci = {}
+    for lbl in labels:
+        dist = label_deltas[lbl]
+        if len(dist) >= 100:
+            low, up = np.percentile(dist, [2.5, 97.5])
+            per_label_ci[lbl] = (float(np.mean(dist)), float(low), float(up))
+        else:
+            per_label_ci[lbl] = (0.0, 0.0, 0.0)
+
+    if len(macro_deltas) >= 100:
+        low, up = np.percentile(macro_deltas, [2.5, 97.5])
+        macro_ci = (float(np.mean(macro_deltas)), float(low), float(up))
+    else:
+        macro_ci = (0.0, 0.0, 0.0)
+
+    return per_label_ci, macro_ci
+
+
 def compare_two_prediction_files(
     csv_a: Path,
     csv_b: Path,
@@ -177,75 +230,113 @@ def compare_two_prediction_files(
 
     target_labels = labels or DEFAULT_LABELS
 
-    # Align strictly on study_id
-    if "study_id" in df_a.columns and "study_id" in df_b.columns:
-        merged = pd.merge(df_a, df_b, on="study_id", suffixes=("_model_a", "_model_b"))
-    else:
-        # Fallback to index alignment if row count matches
-        assert len(df_a) == len(df_b), "Prediction files must contain matching rows or study_id column!"
-        merged = df_a.join(df_b, lsuffix="_model_a", rsuffix="_model_b")
+    # Strict Validation: study_id must exist and be unique in both files
+    if "study_id" not in df_a.columns:
+        raise ValueError(f"CRITICAL ERROR: Prediction file A ({csv_a}) is missing 'study_id' column!")
+    if "study_id" not in df_b.columns:
+        raise ValueError(f"CRITICAL ERROR: Prediction file B ({csv_b}) is missing 'study_id' column!")
 
+    if df_a["study_id"].duplicated().any():
+        raise ValueError(f"CRITICAL ERROR: Duplicate study_id found in Model A predictions ({csv_a})!")
+    if df_b["study_id"].duplicated().any():
+        raise ValueError(f"CRITICAL ERROR: Duplicate study_id found in Model B predictions ({csv_b})!")
+
+    set_a = set(df_a["study_id"])
+    set_b = set(df_b["study_id"])
+    if set_a != set_b:
+        diff_ab = set_a - set_b
+        diff_ba = set_b - set_a
+        raise ValueError(f"STUDY ALIGNMENT MISMATCH: Model A has {len(diff_ab)} unique studies not in B, B has {len(diff_ba)} not in A!")
+
+    # Merge one-to-one strictly
+    merged = pd.merge(df_a, df_b, on="study_id", suffixes=("_a", "_b"), validate="one_to_one")
+    if len(merged) != len(df_a):
+        raise RuntimeError("Inner join lost rows during study_id alignment!")
+
+    # Verify ground truth targets match perfectly
+    for label in target_labels:
+        col_ta = f"{label}_target_a" if f"{label}_target_a" in merged.columns else f"{label}_target"
+        col_tb = f"{label}_target_b" if f"{label}_target_b" in merged.columns else f"{label}_target"
+        if col_ta in merged.columns and col_tb in merged.columns:
+            if not np.allclose(merged[col_ta].fillna(0), merged[col_tb].fillna(0)):
+                raise ValueError(f"TARGET MISMATCH: Ground truth targets for '{label}' differ between Model A and Model B!")
+            merged[f"{label}_target"] = merged[col_ta]
+            if f"{label}_mask_a" in merged.columns:
+                merged[f"{label}_mask"] = merged[f"{label}_mask_a"]
+
+    # Observed point estimates directly from original data
     results_per_label = {}
     p_values_raw = []
+    obs_aucs_a = []
+    obs_aucs_b = []
 
     for label in target_labels:
-        prob_col_a = f"{label}_prob_model_a" if f"{label}_prob_model_a" in merged.columns else f"{label}_prob"
-        prob_col_b = f"{label}_prob_model_b" if f"{label}_prob_model_b" in merged.columns else f"{label}_prob"
-        target_col = f"{label}_target_model_a" if f"{label}_target_model_a" in merged.columns else f"{label}_target"
-        mask_col = f"{label}_mask_model_a" if f"{label}_mask_model_a" in merged.columns else f"{label}_mask"
+        prob_a = merged[f"{label}_prob_a"].values
+        prob_b = merged[f"{label}_prob_b"].values
+        y_raw = merged[f"{label}_target"].values
+        mask_raw = merged[f"{label}_mask"].values if f"{label}_mask" in merged.columns else np.ones(len(merged))
 
-        if target_col not in merged.columns:
-            target_col = label
-
-        y_true_raw = merged[target_col].values
-        probs_a = merged[prob_col_a].values
-        probs_b = merged[prob_col_b].values
-
-        if mask_col in merged.columns:
-            valid_mask = merged[mask_col].values > 0.5
-        else:
-            valid_mask = ~np.isnan(y_true_raw)
-
-        y_true = np.array([1 if val >= 0.5 else 0 for val in y_true_raw[valid_mask]])
-        pa = probs_a[valid_mask]
-        pb = probs_b[valid_mask]
+        v_idx = np.where(mask_raw > 0.5)[0]
+        y_true = np.array([1 if y_raw[i] >= 0.5 else 0 for i in v_idx])
+        pa = prob_a[v_idx]
+        pb = prob_b[v_idx]
 
         if len(np.unique(y_true)) > 1:
             auc_a, auc_b, z_stat, p_val = delong_paired_test(pa, pb, y_true)
-            delta_mean, ci_low, ci_up = paired_bootstrap_delta_auc(pa, pb, y_true, n_boot=n_boot, seed=seed)
+            obs_delta = float(auc_a - auc_b)
+            obs_aucs_a.append(auc_a)
+            obs_aucs_b.append(auc_b)
         else:
-            auc_a, auc_b, z_stat, p_val = None, None, None, 1.0
-            delta_mean, ci_low, ci_up = 0.0, 0.0, 0.0
+            auc_a, auc_b, z_stat, p_val = None, None, 0.0, 1.0
+            obs_delta = 0.0
 
         p_values_raw.append(p_val)
         results_per_label[label] = {
             "model_a_auc": auc_a,
             "model_b_auc": auc_b,
-            "delta_auc_mean": delta_mean,
-            "delta_auc_95_ci": f"{delta_mean:+.4f} ({ci_low:+.4f} to {ci_up:+.4f})",
+            "observed_delta_auc": obs_delta,
             "delong_z": z_stat,
             "delong_p_raw": p_val,
         }
 
-    # Apply Holm-Bonferroni correction
+    # Patient-level paired bootstrap for 95% CIs
+    patient_ids = list(merged.get("patient_id_a", merged.get("patient_id", [f"p_{i}" for i in range(len(merged))])))
+    per_label_ci, macro_ci = patient_level_paired_bootstrap(patient_ids, merged, target_labels, n_boot=n_boot, seed=seed)
+
+    # Apply Holm-Bonferroni correction across 5 labels
     p_adj = holm_bonferroni_correction(p_values_raw)
+
     for idx, label in enumerate(target_labels):
+        ci = per_label_ci.get(label, (0.0, 0.0, 0.0))
+        results_per_label[label]["delta_auc_95_ci"] = f"{results_per_label[label]['observed_delta_auc']:+.4f} ({ci[1]:+.4f} to {ci[2]:+.4f})"
+        results_per_label[label]["ci_lower"] = ci[1]
+        results_per_label[label]["ci_upper"] = ci[2]
         results_per_label[label]["delong_p_holm_adj"] = p_adj[idx]
         results_per_label[label]["statistically_significant"] = bool(p_adj[idx] < 0.05)
 
+    obs_macro_delta = float(np.mean(obs_aucs_a) - np.mean(obs_aucs_b)) if obs_aucs_a and obs_aucs_b else 0.0
+
     return {
+        "schema_version": "1.0",
+        "protocol_version": "0.1",
         "model_a_file": str(csv_a),
         "model_b_file": str(csv_b),
         "aligned_studies": len(merged),
         "bootstrap_resamples": n_boot,
+        "macro_comparison": {
+            "observed_macro_delta_auc": obs_macro_delta,
+            "macro_delta_95_ci": f"{obs_macro_delta:+.4f} ({macro_ci[1]:+.4f} to {macro_ci[2]:+.4f})",
+            "ci_lower": macro_ci[1],
+            "ci_upper": macro_ci[2],
+        },
         "results_per_label": results_per_label,
     }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Paired Model Comparison with Paired Bootstrap and Holm-Corrected DeLong Test.")
-    parser.add_argument("--model-a-preds", type=Path, required=True, help="Predictions CSV from Model A (e.g. ConvNeXt-Small)")
-    parser.add_argument("--model-b-preds", type=Path, required=True, help="Predictions CSV from Model B (e.g. DenseNet-121)")
+    parser = argparse.ArgumentParser(description="Strict Paired Model Comparison with Patient-Level Bootstrap and Holm-Corrected DeLong Test.")
+    parser.add_argument("--model-a-preds", type=Path, required=True, help="Predictions CSV from Model A")
+    parser.add_argument("--model-b-preds", type=Path, required=True, help="Predictions CSV from Model B")
     parser.add_argument("--n-boot", type=int, default=2000, help="Number of bootstrap resamples (>= 2000)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=Path, help="Save statistical comparison JSON")
@@ -253,8 +344,9 @@ def main():
 
     comparison = compare_two_prediction_files(args.model_a_preds, args.model_b_preds, n_boot=args.n_boot, seed=args.seed)
 
-    print("\n=== PAIRED STATISTICAL COMPARISON REPORT (Model A vs Model B) ===")
+    print("\n=== PAIRED STATISTICAL COMPARISON REPORT ===")
     print(f"Aligned Studies: {comparison['aligned_studies']} | Bootstrap Resamples: {comparison['bootstrap_resamples']}")
+    print(f"Macro Delta AUROC: {comparison['macro_comparison']['macro_delta_95_ci']}")
     for lbl, res in comparison["results_per_label"].items():
         sig_str = "** SIGNIFICANT **" if res["statistically_significant"] else "Not Significant"
         print(f"  {lbl:20s}: Delta AUC = {res['delta_auc_95_ci']} | p_raw = {res['delong_p_raw']:.4f} | p_adj (Holm) = {res['delong_p_holm_adj']:.4f} [{sig_str}]")

@@ -1,0 +1,48 @@
+protocol_version: "0.1"
+
+model:
+  architectures:
+    - convnext_small
+    - densenet121
+  pretrained: true
+  image_size: 224
+  labels:
+    - Atelectasis
+    - Cardiomegaly
+    - Consolidation
+    - Edema
+    - Pleural Effusion
+
+training:
+  epochs: 20
+  batch_size: 32
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  optimizer: adamw
+  scheduler: cosine
+  loss: asl
+  early_stopping_patience: 5
+  uncertainty_policy: u_ones_zeros
+  amp: true
+
+augmentation:
+  random_rotation_degrees: 7
+  horizontal_flip: false
+
+calibration:
+  threshold_bounds:
+    - 0.0
+    - 1.0
+  selection_method: max_f1
+
+evaluation:
+  bootstrap_replicates: 2000
+  bootstrap_unit: patient
+  ece_bins: 15
+
+seeds:
+  - 42
+  - 43
+  - 44
+  - 45
+  - 46

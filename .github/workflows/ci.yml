@@ -1,0 +1,65 @@
+name: Scientific Protocol & Pipeline CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  syntax:
+    name: Code Syntax & Compilability
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Check compilation
+        run: |
+          python -m compileall -q app/ scripts/ tests/
+
+  unit-tests:
+    name: Test Suite & Protocol Integrity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install fastapi pydicom scikit-learn scipy pandas pyyaml pillow starlette uvicorn
+      - name: Run Unit & Protocol Integrity Tests
+        run: |
+          python -m unittest discover tests/
+
+  security:
+    name: Security & Anti-Leakage Static Verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for Unsafe weights_only=False in App Code
+        run: |
+          if grep -rn "weights_only=False" app/; then
+            echo "ERROR: Unsafe weights_only=False detected in app codebase!"
+            exit 1
+          fi
+          echo "weights_only=True check passed."
+
+  report-sync-check:
+    name: Report & LaTeX Synchronization Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Verify Documentation Sync
+        run: |
+          python scripts/sync_reports.py --check

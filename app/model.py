@@ -138,10 +138,7 @@ class CheXpertPredictor:
             except ImportError:
                 raise RuntimeError("safetensors package is required to load .safetensors checkpoints.")
         else:
-            try:
-                checkpoint = torch.load(path, map_location=self.device, weights_only=True)
-            except Exception:
-                checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+            checkpoint = torch.load(path, map_location=self.device, weights_only=True)
 
         labels = checkpoint.get("labels") if isinstance(checkpoint, dict) else None
         if labels:
