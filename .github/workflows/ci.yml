@@ -33,10 +33,11 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install fastapi pydicom scikit-learn scipy pandas pyyaml pillow starlette uvicorn
+          pip install -r requirements.txt
+          pip install scipy pyyaml
       - name: Run Unit & Protocol Integrity Tests
         run: |
-          python -m unittest discover tests/
+          python -m unittest discover -s tests -p "test_*.py" -v
 
   security:
     name: Security & Anti-Leakage Static Verification

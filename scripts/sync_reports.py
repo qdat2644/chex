@@ -163,8 +163,10 @@ def main():
         (tex_results_path, tex_content),
         (tex_per_label_path, tex_content),
         (tex_comp_path, tex_content),
-        (tex_final_results, tex_content),
     ]
+
+    if artifact_file.exists():
+        targets.append((tex_final_results, tex_content))
 
     if args.check:
         all_ok = True
