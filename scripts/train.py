@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
+import os
 import random
 import sys
 import time
@@ -13,10 +15,11 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+import torchvision
+from torchvision import transforms
 import yaml
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Subset
-from torchvision import transforms
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -24,17 +27,19 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.config import DEFAULT_LABELS, SUPPORTED_ARCHITECTURES
 from app.dataset import CheXpertDataset
+from app.experiment_integrity import (
+    atomic_save_torch,
+    build_resolved_scientific_config,
+    canonical_json_sha256,
+    compute_file_sha256,
+    get_git_commit,
+    get_safe_rng_state,
+    restore_safe_rng_state,
+    sanitize_for_json,
+    seed_worker,
+    unwrap_model,
+)
 from app.model import build_model
-
-
-def compute_file_sha256(filepath: Path) -> str:
-    if not filepath.exists():
-        return "NOT_FOUND"
-    h = hashlib.sha256()
-    with filepath.open("rb") as f:
-        while chunk := f.read(65536):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 class AsymmetricLoss(torch.nn.Module):
@@ -98,6 +103,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=None, help="DataLoader worker processes")
     parser.add_argument("--limit", type=int, help="Optional subset limit for fast smoke testing")
     parser.add_argument("--resume", type=Path, help="Resume training from an existing checkpoint .pt")
+    parser.add_argument("--stop-after-epoch", type=int, default=None, help="Operational option to interrupt training after N epochs for resume verification")
+    parser.add_argument("--run-mode", choices=["smoke", "full"], default=None, help="Execution run mode (smoke or full)")
     return parser.parse_args()
 
 
@@ -191,41 +198,6 @@ def run_epoch(
     return epoch_loss, targets_all, probs_all, masks_all
 
 
-def get_safe_rng_state() -> dict[str, object]:
-    np_state = np.random.get_state()
-    # np_state is (str, ndarray, int, int, float). Convert ndarray to list for PyTorch 2.6+ weights_only=True compatibility
-    np_state_safe = (np_state[0], np_state[1].tolist(), np_state[2], np_state[3], np_state[4])
-    cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-    return {
-        "python": random.getstate(),
-        "numpy": np_state_safe,
-        "torch": torch.get_rng_state(),
-        "cuda": cuda_rng,
-    }
-
-
-def restore_safe_rng_state(rng: dict[str, object] | None) -> None:
-    if not rng or not isinstance(rng, dict):
-        return
-    if "python" in rng and rng["python"] is not None:
-        random.setstate(rng["python"])
-    if "numpy" in rng and rng["numpy"] is not None:
-        np_st = rng["numpy"]
-        if isinstance(np_st, (tuple, list)) and len(np_st) == 5:
-            arr_part = np_st[1]
-            if isinstance(arr_part, list):
-                arr_part = np.array(arr_part, dtype=np.uint32)
-            np.random.set_state((np_st[0], arr_part, np_st[2], np_st[3], np_st[4]))
-        else:
-            np.random.set_state(np_st)
-    if "torch" in rng and rng["torch"] is not None:
-        torch.set_rng_state(rng["torch"])
-    if "cuda" in rng and rng["cuda"] is not None and torch.cuda.is_available():
-        try:
-            torch.cuda.set_rng_state_all(rng["cuda"])
-        except Exception:
-            pass
-
 
 def checkpoint_payload(
     model: torch.nn.Module,
@@ -233,47 +205,86 @@ def checkpoint_payload(
     scheduler: torch.optim.lr_scheduler._LRScheduler | None,
     scaler: torch.amp.GradScaler | None,
     epoch: int,
-    best_val_auc: float,
+    planned_max_epochs: int,
+    best_val_auc: float | None,
     architecture: str,
     seed: int,
     config_sha256: str,
+    resolved_config_sha256: str,
     manifest_sha256: str,
     labels: list[str],
+    run_mode: str,
     generator: torch.Generator | None = None,
-    metadata: dict[str, object] | None = None,
+    git_commit: str = "UNKNOWN",
+    history: list[dict[str, Any]] | None = None,
+    protocol_version: str = "0.1",
 ) -> dict[str, object]:
-    raw_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+    """
+    Constructs Checkpoint Schema Version 2 payload with backward compatibility aliases.
+    Always unwraps DataParallel models before serializing weights.
+    """
+    raw_model = unwrap_model(model)
+    raw_weights = raw_model.state_dict()
+    clean_weights = {k[7:] if k.startswith("module.") else k: v for k, v in raw_weights.items()}
+
     scaler_st = scaler.state_dict() if scaler else None
     gen_st = generator.get_state() if generator else None
-    meta = metadata.copy() if metadata else {}
-    meta.update({
-        "epoch": epoch,
-        "architecture": architecture,
-        "seed": seed,
-        "best_internal_validation_auc": best_val_auc,
-        "config_sha256": config_sha256,
-        "split_manifest_sha256": manifest_sha256,
-        "labels": labels,
-    })
+    rng = get_safe_rng_state()
+
+    safe_auc = best_val_auc if (best_val_auc is not None and not math.isnan(best_val_auc) and not math.isinf(best_val_auc)) else None
+
+    # Checkpoint Schema Version 2
     return {
-        "model_state_dict": raw_model.state_dict(),
+        "checkpoint_schema_version": 2,
+        "protocol_version": str(protocol_version),
+        "run_mode": str(run_mode),
+        "architecture": str(architecture),
+        "seed": int(seed),
+        "epoch": int(epoch),
+        "planned_max_epochs": int(planned_max_epochs),
+        "best_val_auc": safe_auc,
+        "labels": list(labels),
+        "model_state": clean_weights,
+        "optimizer_state": optimizer.state_dict() if optimizer else None,
+        "scheduler_state": scheduler.state_dict() if scheduler else None,
+        "scaler_state": scaler_st,
+        "rng_state": {
+            "python": rng["python"],
+            "numpy": rng["numpy"],
+            "torch_cpu": rng["torch_cpu"],
+            "torch_cuda": rng["torch_cuda"],
+        },
+        "train_loader_generator_state": gen_st,
+        "config_sha256": str(config_sha256),
+        "resolved_config_sha256": str(resolved_config_sha256),
+        "manifest_sha256": str(manifest_sha256),
+        "git_commit": str(git_commit),
+        # Backwards compatibility aliases
+        "model_state_dict": clean_weights,
         "optimizer_state_dict": optimizer.state_dict() if optimizer else None,
         "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
         "scaler_state_dict": scaler_st,
-        "epoch": epoch,
-        "best_val_auc": best_val_auc,
-        "architecture": architecture,
-        "seed": seed,
-        "config_sha256": config_sha256,
-        "manifest_sha256": manifest_sha256,
-        "labels": labels,
-        "rng_state": get_safe_rng_state(),
         "dataloader_generator_state": gen_st,
-        "metadata": meta,
+        "metadata": {
+            "checkpoint_schema_version": 2,
+            "architecture": str(architecture),
+            "seed": int(seed),
+            "epoch": int(epoch),
+            "planned_max_epochs": int(planned_max_epochs),
+            "best_internal_validation_auc": safe_auc,
+            "config_sha256": str(config_sha256),
+            "resolved_config_sha256": str(resolved_config_sha256),
+            "split_manifest_sha256": str(manifest_sha256),
+            "labels": list(labels),
+            "run_mode": str(run_mode),
+            "git_commit": str(git_commit),
+            "metrics_history": history or [],
+        },
     }
 
 
 def main():
+    started_at_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     args = parse_args()
     set_seed(args.seed, deterministic=True)
 
@@ -304,7 +315,7 @@ def main():
     if not val_csv.is_file():
         raise FileNotFoundError(f"Missing internal validation CSV: {val_csv}")
 
-    # 3. Setup Hyperparameters & Preprocessing
+    # 3. Setup Hyperparameters & Operational Configurations
     out_dir = args.output_dir or PROJECT_ROOT / "outputs" / "runs" / args.arch / f"seed_{args.seed}"
     out_dir.mkdir(parents=True, exist_ok=True)
     logs_dir = out_dir / "logs"
@@ -326,9 +337,44 @@ def main():
     pretrained = bool(model_cfg.get("pretrained", True))
     rot_degrees = float(aug_cfg.get("random_rotation_degrees", 7))
     h_flip = bool(aug_cfg.get("horizontal_flip", False))
-    labels = model_cfg.get("labels", DEFAULT_LABELS)
+    labels = list(model_cfg.get("labels", DEFAULT_LABELS))
 
-    # Preprocessing Pipeline
+    # Determine execution run mode
+    if args.run_mode:
+        run_mode = args.run_mode
+    else:
+        run_mode = "smoke" if (args.limit or (args.epochs and args.epochs <= 2)) else "full"
+
+    git_commit = get_git_commit(PROJECT_ROOT)
+
+    # 4. Construct Resolved Scientific Config & Canonical Hash (Part A)
+    resolved_config = build_resolved_scientific_config(
+        protocol_version=config.get("protocol_version", "0.1"),
+        architecture=args.arch,
+        seed=args.seed,
+        labels=labels,
+        view=manifest_data.get("view", "frontal"),
+        input_size=image_size,
+        uncertainty_policy=unc_policy,
+        split_manifest_sha256=manifest_sha256,
+        optimizer=train_cfg.get("optimizer", "AdamW"),
+        learning_rate=lr,
+        weight_decay=weight_decay,
+        batch_size=batch_size,
+        max_epochs=epochs,
+        scheduler=train_cfg.get("scheduler", "cosine"),
+        loss=loss_name,
+        early_stopping_patience=patience,
+        mixed_precision=use_amp,
+        rotation_degrees=rot_degrees,
+        horizontal_flip=h_flip,
+        deterministic=True,
+    )
+    resolved_config_sha256 = canonical_json_sha256(resolved_config)
+    resolved_config_path = out_dir / "resolved_config.json"
+    resolved_config_path.write_text(json.dumps(resolved_config, indent=2), encoding="utf-8")
+
+    # 5. Preprocessing Pipelines
     train_transform_list = [transforms.Resize((image_size, image_size))]
     if rot_degrees > 0:
         train_transform_list.append(transforms.RandomRotation(degrees=rot_degrees))
@@ -346,16 +392,7 @@ def main():
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    preprocessing_config = {
-        "image_size": image_size,
-        "random_rotation_degrees": rot_degrees,
-        "horizontal_flip": h_flip,
-        "normalization_mean": [0.485, 0.456, 0.406],
-        "normalization_std": [0.229, 0.224, 0.225],
-    }
-    preprocessing_sha256 = hashlib.sha256(json.dumps(preprocessing_config, sort_keys=True).encode()).hexdigest()
-
-    # Datasets & DataLoaders
+    # 6. Datasets & DataLoaders with Deterministic Worker Init (C5)
     train_dataset = CheXpertDataset(
         train_csv,
         args.data_root,
@@ -377,7 +414,6 @@ def main():
         train_dataset = Subset(train_dataset, range(min(args.limit, len(train_dataset))))
         val_dataset = Subset(val_dataset, range(min(max(2, args.limit // 4), len(val_dataset))))
 
-    import os
     if args.num_workers is not None:
         workers = args.num_workers
     else:
@@ -393,7 +429,8 @@ def main():
         shuffle=True,
         num_workers=workers,
         pin_memory=torch.cuda.is_available(),
-        persistent_workers=(workers > 0),
+        persistent_workers=False,  # C5: persistent_workers=False for strict deterministic reproducibility
+        worker_init_fn=seed_worker,
         generator=train_generator,
     )
     val_loader = DataLoader(
@@ -402,41 +439,16 @@ def main():
         shuffle=False,
         num_workers=workers,
         pin_memory=torch.cuda.is_available(),
-        persistent_workers=(workers > 0),
+        persistent_workers=False,
     )
 
-    # Save resolved config artifact
-    resolved_config = {
-        "architecture": args.arch,
-        "seed": args.seed,
-        "epochs": epochs,
-        "batch_size": batch_size,
-        "learning_rate": lr,
-        "weight_decay": weight_decay,
-        "early_stopping_patience": patience,
-        "loss": loss_name,
-        "uncertainty_policy": unc_policy,
-        "amp": use_amp,
-        "image_size": image_size,
-        "pretrained": pretrained,
-        "random_rotation_degrees": rot_degrees,
-        "horizontal_flip": h_flip,
-        "labels": labels,
-        "config_sha256": config_sha256,
-        "manifest_sha256": manifest_sha256,
-        "preprocessing_sha256": preprocessing_sha256,
-    }
-    resolved_config_sha256 = hashlib.sha256(json.dumps(resolved_config, sort_keys=True).encode()).hexdigest()
-    resolved_config["resolved_config_sha256"] = resolved_config_sha256
-    (out_dir / "resolved_config.json").write_text(json.dumps(resolved_config, indent=2), encoding="utf-8")
-
-    # Initialize Model & Loss
+    # 7. Initialize Model, Loss, Optimizer
     model = build_model(args.arch, len(labels), pretrained=pretrained).to(device)
     if torch.cuda.is_available() and torch.cuda.device_count() > 1:
         print(f"[Multi-GPU] Detected {torch.cuda.device_count()} GPUs. Wrapping model with DataParallel.")
         model = torch.nn.DataParallel(model)
 
-    if loss_name == "asl":
+    if loss_name in ["asl", "asymmetric"]:
         criterion = AsymmetricLoss(gamma_neg=4.0, gamma_pos=1.0, clip=0.05)
     elif loss_name == "focal":
         criterion = FocalLoss(alpha=0.25, gamma=2.0)
@@ -448,11 +460,12 @@ def main():
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp and torch.cuda.is_available())
 
     start_epoch = 1
-    best_val_auc = -1.0
+    best_val_auc = -float("inf")
+    best_epoch = 1
     patience_counter = 0
-    history = []
+    history: list[dict[str, Any]] = []
 
-    # Handle Resume (fail-closed integrity checks)
+    # 8. Resume Validation & State Restoration (Part C)
     if args.resume:
         resume_path = Path(args.resume)
         if not resume_path.is_file():
@@ -463,66 +476,95 @@ def main():
             raise RuntimeError(f"Cannot compute SHA-256 for checkpoint {resume_path}")
 
         print(f"Resuming training from checkpoint: {resume_path} (SHA-256: {ckpt_sha})")
-        loaded = torch.load(resume_path, map_location=device, weights_only=True)
-        if not isinstance(loaded, dict) or "model_state_dict" not in loaded:
+        loaded = torch.load(resume_path, map_location="cpu", weights_only=True)
+        if not isinstance(loaded, dict):
             raise RuntimeError(f"Invalid checkpoint format in {resume_path}")
 
-        meta = loaded.get("metadata", {})
-        ckpt_arch = loaded.get("architecture") or meta.get("architecture")
-        ckpt_seed = loaded.get("seed") if "seed" in loaded and loaded["seed"] is not None else meta.get("seed")
-        ckpt_config_sha = loaded.get("config_sha256") or meta.get("config_sha256")
-        ckpt_manifest_sha = loaded.get("manifest_sha256") or meta.get("split_manifest_sha256")
+        ckpt_meta = loaded.get("metadata", {})
+        ckpt_arch = loaded.get("architecture") or ckpt_meta.get("architecture")
+        ckpt_seed = loaded.get("seed") if "seed" in loaded and loaded["seed"] is not None else ckpt_meta.get("seed")
+        ckpt_labels = loaded.get("labels") or ckpt_meta.get("labels")
+        ckpt_resolved_cfg = loaded.get("resolved_config_sha256") or ckpt_meta.get("resolved_config_sha256")
+        ckpt_config_sha = loaded.get("config_sha256") or ckpt_meta.get("config_sha256")
+        ckpt_manifest = loaded.get("manifest_sha256") or ckpt_meta.get("split_manifest_sha256")
+        ckpt_run_mode = loaded.get("run_mode") or ckpt_meta.get("run_mode")
+        ckpt_epoch = loaded.get("epoch", ckpt_meta.get("epoch"))
 
+        model_st = loaded.get("model_state") or loaded.get("model_state_dict")
+        opt_st = loaded.get("optimizer_state") or loaded.get("optimizer_state_dict")
+        sched_st = loaded.get("scheduler_state") or loaded.get("scheduler_state_dict")
+        scaler_st = loaded.get("scaler_state") or loaded.get("scaler_state_dict")
+        rng_st = loaded.get("rng_state")
+        gen_st = loaded.get("train_loader_generator_state") or loaded.get("dataloader_generator_state")
+
+        # C2: Fail-closed verification before loading state
+        if run_mode == "full":
+            missing_fields = []
+            if ckpt_arch is None: missing_fields.append("architecture")
+            if ckpt_seed is None: missing_fields.append("seed")
+            if ckpt_labels is None: missing_fields.append("labels")
+            if ckpt_resolved_cfg is None: missing_fields.append("resolved_config_sha256")
+            if ckpt_manifest is None: missing_fields.append("manifest_sha256")
+            if ckpt_epoch is None: missing_fields.append("epoch")
+            if model_st is None: missing_fields.append("model_state")
+            if opt_st is None: missing_fields.append("optimizer_state")
+            if sched_st is None: missing_fields.append("scheduler_state")
+            if scaler_st is None and use_amp and torch.cuda.is_available(): missing_fields.append("scaler_state")
+            if rng_st is None: missing_fields.append("rng_state")
+            if gen_st is None: missing_fields.append("train_loader_generator_state")
+            if missing_fields:
+                raise RuntimeError(f"Resume checkpoint is missing mandatory fields in full mode: {missing_fields}")
+
+        # Absolute comparisons
         if ckpt_arch is None or str(ckpt_arch) != str(args.arch):
-            raise RuntimeError(
-                f"Resume architecture mismatch: checkpoint has {ckpt_arch!r}, expected {args.arch!r}"
-            )
+            raise RuntimeError(f"Resume architecture mismatch: checkpoint has {ckpt_arch!r}, expected {args.arch!r}")
         if ckpt_seed is None or int(ckpt_seed) != int(args.seed):
+            raise RuntimeError(f"Resume seed mismatch: checkpoint has {ckpt_seed!r}, expected {args.seed!r}")
+        if ckpt_labels is None or list(ckpt_labels) != list(labels):
+            raise RuntimeError(f"Resume label order mismatch: checkpoint has {ckpt_labels!r}, expected {labels!r}")
+        if ckpt_resolved_cfg is not None and str(ckpt_resolved_cfg) != str(resolved_config_sha256):
             raise RuntimeError(
-                f"Resume seed mismatch: checkpoint has {ckpt_seed!r}, expected {args.seed!r}"
+                f"Resume resolved config hash mismatch: checkpoint has {ckpt_resolved_cfg!r}, expected {resolved_config_sha256!r}"
             )
-        if ckpt_config_sha is None or str(ckpt_config_sha) != str(config_sha256):
-            raise RuntimeError(
-                f"Resume config hash mismatch: checkpoint has {ckpt_config_sha!r}, expected {config_sha256!r}"
-            )
-        if ckpt_manifest_sha is None or str(ckpt_manifest_sha) != str(manifest_sha256):
-            raise RuntimeError(
-                f"Resume manifest hash mismatch: checkpoint has {ckpt_manifest_sha!r}, expected {manifest_sha256!r}"
-            )
-        ckpt_labels = loaded.get("labels") or meta.get("labels")
-        if ckpt_labels is not None and list(ckpt_labels) != list(labels):
-            raise RuntimeError(
-                f"Resume label order mismatch: checkpoint has {ckpt_labels!r}, expected {labels!r}"
-            )
+        if ckpt_manifest is None or str(ckpt_manifest) != str(manifest_sha256):
+            raise RuntimeError(f"Resume manifest hash mismatch: checkpoint has {ckpt_manifest!r}, expected {manifest_sha256!r}")
+        if ckpt_run_mode is not None and str(ckpt_run_mode) != str(run_mode):
+            raise RuntimeError(f"Resume run mode mismatch: checkpoint has {ckpt_run_mode!r}, expected {run_mode!r}")
 
-        # Load weights into model.module if DataParallel, else model (strip "module." if present)
-        raw_model = model.module if isinstance(model, torch.nn.DataParallel) else model
-        state_dict = loaded["model_state_dict"]
-        if any(k.startswith("module.") for k in state_dict.keys()):
-            state_dict = {k[7:] if k.startswith("module.") else k: v for k, v in state_dict.items()}
-        raw_model.load_state_dict(state_dict)
+        # C1: Load state into unwrap_model(model), stripping module. prefixes if any
+        raw_target = unwrap_model(model)
+        clean_model_st = {k[7:] if k.startswith("module.") else k: v for k, v in model_st.items()}
+        raw_target.load_state_dict(clean_model_st)
 
-        if loaded.get("optimizer_state_dict") and optimizer:
-            optimizer.load_state_dict(loaded["optimizer_state_dict"])
-        if loaded.get("scheduler_state_dict") and scheduler:
-            scheduler.load_state_dict(loaded["scheduler_state_dict"])
-        if loaded.get("scaler_state_dict") and scaler:
-            scaler.load_state_dict(loaded["scaler_state_dict"])
+        # C4: Full state restoration
+        if opt_st and optimizer:
+            optimizer.load_state_dict(opt_st)
+        if sched_st and scheduler:
+            scheduler.load_state_dict(sched_st)
+        if scaler_st and scaler:
+            scaler.load_state_dict(scaler_st)
+        if rng_st:
+            restore_safe_rng_state(rng_st)
+        if gen_st is not None and train_generator is not None:
+            train_generator.set_state(gen_st)
 
-        restore_safe_rng_state(loaded.get("rng_state"))
-        if loaded.get("dataloader_generator_state") is not None and train_generator is not None:
-            train_generator.set_state(loaded["dataloader_generator_state"])
-
-        start_epoch = int(loaded.get("epoch", meta.get("epoch", 0))) + 1
-        best_val_auc = float(loaded.get("best_val_auc", meta.get("best_internal_validation_auc", -1.0)))
-        history = list(meta.get("metrics_history", []))
+        start_epoch = int(ckpt_epoch) + 1
+        raw_best_auc = loaded.get("best_val_auc", ckpt_meta.get("best_internal_validation_auc"))
+        if raw_best_auc is not None and not math.isnan(raw_best_auc) and not math.isinf(raw_best_auc):
+            best_val_auc = float(raw_best_auc)
+        best_epoch = int(ckpt_epoch)
+        history = list(ckpt_meta.get("metrics_history", []))
 
     print(f"\n=======================================================")
-    print(f"CheXpert Protocol Training: {args.arch} (Seed {args.seed})")
+    print(f"CheXpert Protocol Training: {args.arch} (Seed {args.seed}) | Mode: {run_mode}")
     print(f"Train samples: {len(train_dataset)} | Val samples: {len(val_dataset)}")
     print(f"Epochs: {epochs} | Batch size: {batch_size} | LR: {lr} | Loss: {loss_name}")
+    print(f"Resolved Config SHA-256: {resolved_config_sha256}")
     print(f"=======================================================\n")
 
+    training_status = "completed"
+
+    # 9. Training Loop (B2, B3, B4, C6)
     for epoch in range(start_epoch, epochs + 1):
         t0 = time.time()
         train_loss, _, _, _ = run_epoch(model, train_loader, criterion, device, optimizer=optimizer, scaler=scaler)
@@ -531,7 +573,7 @@ def main():
         # Validation Step
         val_loss, val_targets, val_probs, val_masks = run_epoch(model, val_loader, criterion, device)
 
-        # Compute Internal Validation AUC
+        # Compute Internal Validation AUROC
         val_targets_arr = np.array(val_targets)
         val_probs_arr = np.array(val_probs)
         val_masks_arr = np.array(val_masks)
@@ -551,7 +593,7 @@ def main():
             else:
                 label_aucs[label] = None
 
-        mean_val_auc = float(np.mean(valid_auc_list)) if valid_auc_list else 0.0
+        mean_val_auc = float(np.mean(valid_auc_list)) if valid_auc_list else None
         elapsed = time.time() - t0
 
         epoch_record = {
@@ -565,101 +607,140 @@ def main():
         }
         history.append(epoch_record)
 
-        print(f"Epoch [{epoch:02d}/{epochs:02d}] Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val AUC: {mean_val_auc:.4f} ({elapsed:.1f}s)")
+        auc_display = f"{mean_val_auc:.4f}" if mean_val_auc is not None else "N/A"
+        print(f"Epoch [{epoch:02d}/{epochs:02d}] Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val AUC: {auc_display} ({elapsed:.1f}s)")
 
-        metadata_dict = {
-            "epoch": epoch,
-            "architecture": args.arch,
-            "seed": args.seed,
-            "best_internal_validation_auc": max(best_val_auc, mean_val_auc),
-            "config_sha256": config_sha256,
-            "split_manifest_sha256": manifest_sha256,
-            "preprocessing_sha256": preprocessing_sha256,
-            "uncertainty_policy": unc_policy,
-            "labels": labels,
-            "metrics_history": history,
-        }
+        # B2: Update best_val_auc BEFORE creating payload
+        current_auc = mean_val_auc if (mean_val_auc is not None and not math.isnan(mean_val_auc)) else None
+        is_best = (current_auc is not None and current_auc > best_val_auc)
+        if is_best:
+            best_val_auc = current_auc
+            best_epoch = epoch
+            patience_counter = 0
+        else:
+            patience_counter += 1
 
-        # Save last checkpoint
-        last_ckpt = out_dir / "last.pt"
-        payload_last = checkpoint_payload(
+        payload = checkpoint_payload(
             model=model,
             optimizer=optimizer,
             scheduler=scheduler,
             scaler=scaler,
             epoch=epoch,
-            best_val_auc=best_val_auc,
+            planned_max_epochs=epochs,
+            best_val_auc=best_val_auc if best_val_auc != -float("inf") else None,
             architecture=args.arch,
             seed=args.seed,
             config_sha256=config_sha256,
+            resolved_config_sha256=resolved_config_sha256,
             manifest_sha256=manifest_sha256,
             labels=labels,
+            run_mode=run_mode,
             generator=train_generator,
-            metadata=metadata_dict,
+            git_commit=git_commit,
+            history=history,
+            protocol_version=config.get("protocol_version", "0.1"),
         )
-        torch.save(payload_last, last_ckpt)
 
-        # Check for improvement & save best checkpoint (always saved on first epoch if missing)
-        is_best = (mean_val_auc > best_val_auc) or not (out_dir / "best.pt").exists()
-        if is_best:
-            best_val_auc = max(best_val_auc, mean_val_auc)
-            patience_counter = 0
-            best_ckpt = out_dir / "best.pt"
-            metadata_dict["best_internal_validation_auc"] = best_val_auc
-            payload_best = checkpoint_payload(
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=scaler,
-                epoch=epoch,
-                best_val_auc=best_val_auc,
-                architecture=args.arch,
-                seed=args.seed,
-                config_sha256=config_sha256,
-                manifest_sha256=manifest_sha256,
-                labels=labels,
-                generator=train_generator,
-                metadata=metadata_dict,
-            )
-            torch.save(payload_best, best_ckpt)
-            print(f"  -> Best model saved to: {best_ckpt} (AUC: {best_val_auc:.4f})")
+        # B4: Atomic write for last.pt
+        last_ckpt = out_dir / "last.pt"
+        atomic_save_torch(payload, last_ckpt)
 
-            # Export internal validation predictions
-            pred_records = []
-            underlying_df = val_dataset.dataset.frame if isinstance(val_dataset, Subset) else val_dataset.frame
-            for i in range(len(val_dataset)):
-                row_item = underlying_df.iloc[val_dataset.indices[i]] if isinstance(val_dataset, Subset) else underlying_df.iloc[i]
-                rec = {
-                    "study_id": str(row_item.get("study_id", f"study_{i+1}")),
-                    "patient_id": str(row_item.get("patient_id", f"patient_{i+1}")),
-                }
-                for idx, label in enumerate(labels):
-                    rec[f"{label}_prob"] = float(val_probs_arr[i, idx])
-                    rec[f"{label}_target"] = float(val_targets_arr[i, idx])
-                    rec[f"{label}_mask"] = float(val_masks_arr[i, idx])
-                pred_records.append(rec)
-            pd.DataFrame(pred_records).to_csv(out_dir / "internal_validation_predictions.csv", index=False)
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f"Early stopping triggered at epoch {epoch} (patience={patience}).")
-                break
+        # B3: Epoch 1 always creates best.pt, or if improvement detected
+        best_ckpt = out_dir / "best.pt"
+        if is_best or not best_ckpt.exists():
+            best_epoch = epoch
+            atomic_save_torch(payload, best_ckpt)
+            print(f"  -> Best model saved to: {best_ckpt} (AUC: {auc_display})")
 
-    # Save training history JSON and run manifest
-    (out_dir / "training_history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+        # Early stopping check (only in full mode)
+        if run_mode == "full" and patience_counter >= patience:
+            print(f"Early stopping triggered at epoch {epoch} (patience={patience}).")
+            break
+
+        # C6: Operational --stop-after-epoch check
+        if args.stop_after_epoch is not None and epoch >= args.stop_after_epoch:
+            print(f"Operational stop reached at epoch {epoch} (stop_after_epoch={args.stop_after_epoch}).")
+            training_status = "interrupted"
+            break
+
+    # Save training history JSON
+    (out_dir / "training_history.json").write_text(json.dumps(sanitize_for_json(history), indent=2), encoding="utf-8")
+
+    # 10. Re-inference on Internal Validation split using best.pt weights (Part E)
+    best_ckpt = out_dir / "best.pt"
+    if best_ckpt.is_file():
+        best_payload = torch.load(best_ckpt, map_location=device, weights_only=True)
+        best_weights = best_payload.get("model_state") or best_payload.get("model_state_dict")
+        clean_weights = {k[7:] if k.startswith("module.") else k: v for k, v in best_weights.items()}
+        unwrap_model(model).load_state_dict(clean_weights)
+
+    model.eval()
+    val_targets_all, val_probs_all, val_masks_all = [], [], []
+    with torch.no_grad():
+        for item in val_loader:
+            imgs = item[0].to(device, non_blocking=True)
+            tgts = item[1].to(device, non_blocking=True)
+            msks = item[2].to(device, non_blocking=True) if len(item) > 2 else torch.ones_like(tgts)
+            logits = model(imgs)
+            probs = torch.sigmoid(logits)
+            val_targets_all.extend(tgts.cpu().tolist())
+            val_probs_all.extend(probs.cpu().tolist())
+            val_masks_all.extend(msks.cpu().tolist())
+
+    underlying_df = val_dataset.dataset.frame if isinstance(val_dataset, Subset) else val_dataset.frame
+    pred_records = []
+    for i in range(len(val_dataset)):
+        row_item = underlying_df.iloc[val_dataset.indices[i]] if isinstance(val_dataset, Subset) else underlying_df.iloc[i]
+        rec = {
+            "study_id": str(row_item.get("study_id", f"study_{i+1}")),
+            "patient_id": str(row_item.get("patient_id", f"patient_{i+1}")),
+            "image_path": str(row_item.get("Path", row_item.get("image_path", ""))),
+        }
+        for idx, lbl in enumerate(labels):
+            safe_lbl = lbl.replace(" ", "_")
+            rec[f"{safe_lbl}_target"] = float(val_targets_all[i][idx])
+            rec[f"{safe_lbl}_mask"] = float(val_masks_all[i][idx])
+            rec[f"{safe_lbl}_prob"] = float(val_probs_all[i][idx])
+        pred_records.append(rec)
+
+    pred_csv_path = out_dir / "internal_validation_predictions.csv"
+    pd.DataFrame(pred_records).to_csv(pred_csv_path, index=False)
+    pred_csv_sha256 = compute_file_sha256(pred_csv_path)
+
+    # 11. Run Manifest Schema Version 1 (Part D)
+    gpu_names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())] if torch.cuda.is_available() else []
+    cudnn_version = str(torch.backends.cudnn.version()) if (torch.cuda.is_available() and hasattr(torch.backends, "cudnn")) else "None"
+    cuda_version = str(torch.version.cuda) if torch.cuda.is_available() else "None"
+
     run_manifest = {
-        "architecture": args.arch,
-        "seed": args.seed,
-        "best_val_auc": best_val_auc,
-        "epochs_trained": len(history),
+        "schema_version": 1,
+        "protocol_version": str(config.get("protocol_version", "0.1")),
+        "run_mode": str(run_mode),
+        "status": str(training_status),
+        "architecture": str(args.arch),
+        "seed": int(args.seed),
+        "git_commit": str(git_commit),
+        "resolved_config_sha256": str(resolved_config_sha256),
+        "manifest_sha256": str(manifest_sha256),
         "best_checkpoint_sha256": compute_file_sha256(out_dir / "best.pt"),
-        "config_sha256": config_sha256,
-        "resolved_config_sha256": resolved_config_sha256,
-        "split_manifest_sha256": manifest_sha256,
-        "preprocessing_sha256": preprocessing_sha256,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "last_checkpoint_sha256": compute_file_sha256(out_dir / "last.pt"),
+        "predictions_sha256": str(pred_csv_sha256),
+        "best_epoch": int(best_epoch),
+        "best_val_auc": best_val_auc if (best_val_auc is not None and best_val_auc != -float("inf") and not math.isnan(best_val_auc) and not math.isinf(best_val_auc)) else None,
+        "started_at_utc": started_at_utc,
+        "completed_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "environment": {
+            "python": sys.version.split()[0],
+            "pytorch": torch.__version__,
+            "torchvision": torchvision.__version__,
+            "cuda": cuda_version,
+            "cudnn": cudnn_version,
+            "gpu_names": gpu_names,
+            "gpu_count": len(gpu_names),
+        },
     }
-    (out_dir / "run_manifest.json").write_text(json.dumps(run_manifest, indent=2), encoding="utf-8")
+    sanitized_manifest = sanitize_for_json(run_manifest)
+    (out_dir / "run_manifest.json").write_text(json.dumps(sanitized_manifest, indent=2), encoding="utf-8")
     print(f"\nRun artifacts successfully saved in: {out_dir}")
 
 
