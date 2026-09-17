@@ -142,7 +142,7 @@ class TestProductionHardening(unittest.TestCase):
     def test_dirty_git_is_rejected_in_full_mode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
-            subprocess.check_call(["git", "init", "-q"], cwd=repo)
+            subprocess.check_call(["git", "init", "-q", "--initial-branch=main"], cwd=repo)
             subprocess.check_call(["git", "config", "user.email", "test@example.com"], cwd=repo)
             subprocess.check_call(["git", "config", "user.name", "Test"], cwd=repo)
             (repo / "tracked.txt").write_text("clean", encoding="utf-8")
@@ -150,7 +150,7 @@ class TestProductionHardening(unittest.TestCase):
             subprocess.check_call(["git", "commit", "-qm", "initial"], cwd=repo)
             commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
             (repo / "tracked.txt").write_text("dirty", encoding="utf-8")
-            with self.assertRaises(RuntimeError):
+            with self.assertRaisesRegex(RuntimeError, "clean Git working tree"):
                 validate_git_integrity(repo, commit, "full")
             self.assertTrue(validate_git_integrity(repo, "main", "smoke")["git_dirty"])
 
