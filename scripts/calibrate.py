@@ -113,8 +113,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Calibrate decision thresholds on the Calibration split.")
     parser.add_argument("--checkpoint", type=Path, required=True, help="Trained model checkpoint .pt")
     parser.add_argument("--split-manifest", type=Path, required=True, help="Path to outputs/splits/protocol_v0_1/manifest.json")
+    parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "configs" / "protocol_v0_1.yaml", help="Path to protocol YAML config")
     parser.add_argument("--data-root", type=Path, default=PROJECT_ROOT / "archive", help="Data root directory")
     parser.add_argument("--output", type=Path, help="Target output path for frozen thresholds artifact")
+    parser.add_argument("--arch", type=str, default=None, help="Model architecture")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--limit", type=int, help="Optional limit for testing")
     parser.add_argument("--seed", type=int, default=42)
@@ -147,6 +149,9 @@ def main():
 
     calib_csv_sha256 = compute_file_sha256(calib_csv)
 
+    # Config verification
+    config_sha256 = compute_file_sha256(args.config) if args.config and args.config.is_file() else None
+
     # 2. Verify Checkpoint Integrity & Linkage
     if not args.checkpoint.exists():
         print(f"Error: Checkpoint not found at {args.checkpoint}", file=sys.stderr)
@@ -156,9 +161,32 @@ def main():
     loaded_ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     ckpt_meta = loaded_ckpt.get("metadata", {})
 
-    # Check that checkpoint was trained on this split manifest
-    if ckpt_meta.get("split_manifest_sha256") and ckpt_meta["split_manifest_sha256"] != manifest_sha256:
-        print(f"WARNING: Checkpoint split_manifest_sha256 ({ckpt_meta['split_manifest_sha256']}) does not match manifest ({manifest_sha256})!", file=sys.stderr)
+    # Fail-closed checks: checkpoint must strictly match split manifest, config, arch, and seed
+    ckpt_manifest = loaded_ckpt.get("manifest_sha256") or ckpt_meta.get("split_manifest_sha256")
+    if ckpt_manifest and ckpt_manifest != manifest_sha256:
+        raise RuntimeError(
+            f"INTEGRITY ERROR: Checkpoint split_manifest_sha256 ({ckpt_manifest}) "
+            f"does not match manifest ({manifest_sha256})!"
+        )
+
+    ckpt_cfg = loaded_ckpt.get("config_sha256") or ckpt_meta.get("config_sha256")
+    if ckpt_cfg and config_sha256 and ckpt_cfg != config_sha256:
+        raise RuntimeError(
+            f"INTEGRITY ERROR: Checkpoint config_sha256 ({ckpt_cfg}) "
+            f"does not match protocol config ({config_sha256})!"
+        )
+
+    ckpt_arch = loaded_ckpt.get("architecture") or ckpt_meta.get("architecture")
+    if ckpt_arch and args.arch and ckpt_arch != args.arch:
+        raise RuntimeError(
+            f"INTEGRITY ERROR: Checkpoint architecture ({ckpt_arch}) does not match --arch ({args.arch})!"
+        )
+
+    ckpt_seed = loaded_ckpt.get("seed") if "seed" in loaded_ckpt and loaded_ckpt["seed"] is not None else ckpt_meta.get("seed")
+    if ckpt_seed is not None and int(ckpt_seed) != int(args.seed):
+        raise RuntimeError(
+            f"INTEGRITY ERROR: Checkpoint seed ({ckpt_seed}) does not match --seed ({args.seed})!"
+        )
 
     labels = loaded_ckpt.get("labels") or manifest_data.get("labels") or DEFAULT_LABELS
     unc_policy = ckpt_meta.get("uncertainty_policy") or manifest_data.get("uncertainty_policy", "u_ones_zeros")
@@ -210,7 +238,10 @@ def main():
     artifact = {
         "schema_version": "1.0",
         "role": "calibration_artifact",
+        "architecture": str(args.arch or predictor.architecture),
+        "seed": int(args.seed),
         "checkpoint_sha256": ckpt_sha256,
+        "config_sha256": config_sha256,
         "split_manifest_sha256": manifest_sha256,
         "calibration_csv_sha256": calib_csv_sha256,
         "labels": labels,

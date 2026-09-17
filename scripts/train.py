@@ -191,25 +191,85 @@ def run_epoch(
     return epoch_loss, targets_all, probs_all, masks_all
 
 
+def get_safe_rng_state() -> dict[str, object]:
+    np_state = np.random.get_state()
+    # np_state is (str, ndarray, int, int, float). Convert ndarray to list for PyTorch 2.6+ weights_only=True compatibility
+    np_state_safe = (np_state[0], np_state[1].tolist(), np_state[2], np_state[3], np_state[4])
+    cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    return {
+        "python": random.getstate(),
+        "numpy": np_state_safe,
+        "torch": torch.get_rng_state(),
+        "cuda": cuda_rng,
+    }
+
+
+def restore_safe_rng_state(rng: dict[str, object] | None) -> None:
+    if not rng or not isinstance(rng, dict):
+        return
+    if "python" in rng and rng["python"] is not None:
+        random.setstate(rng["python"])
+    if "numpy" in rng and rng["numpy"] is not None:
+        np_st = rng["numpy"]
+        if isinstance(np_st, (tuple, list)) and len(np_st) == 5:
+            arr_part = np_st[1]
+            if isinstance(arr_part, list):
+                arr_part = np.array(arr_part, dtype=np.uint32)
+            np.random.set_state((np_st[0], arr_part, np_st[2], np_st[3], np_st[4]))
+        else:
+            np.random.set_state(np_st)
+    if "torch" in rng and rng["torch"] is not None:
+        torch.set_rng_state(rng["torch"])
+    if "cuda" in rng and rng["cuda"] is not None and torch.cuda.is_available():
+        try:
+            torch.cuda.set_rng_state_all(rng["cuda"])
+        except Exception:
+            pass
+
+
 def checkpoint_payload(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer | None,
     scheduler: torch.optim.lr_scheduler._LRScheduler | None,
+    scaler: torch.amp.GradScaler | None,
+    epoch: int,
+    best_val_auc: float,
+    architecture: str,
+    seed: int,
+    config_sha256: str,
+    manifest_sha256: str,
     labels: list[str],
+    generator: torch.Generator | None = None,
     metadata: dict[str, object] | None = None,
 ) -> dict[str, object]:
     raw_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+    scaler_st = scaler.state_dict() if scaler else None
+    gen_st = generator.get_state() if generator else None
+    meta = metadata.copy() if metadata else {}
+    meta.update({
+        "epoch": epoch,
+        "architecture": architecture,
+        "seed": seed,
+        "best_internal_validation_auc": best_val_auc,
+        "config_sha256": config_sha256,
+        "split_manifest_sha256": manifest_sha256,
+        "labels": labels,
+    })
     return {
         "model_state_dict": raw_model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict() if optimizer else None,
         "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
-        "rng_state": {
-            "python": random.getstate(),
-            "numpy": np.random.get_state(),
-            "torch": torch.get_rng_state(),
-        },
+        "scaler_state_dict": scaler_st,
+        "epoch": epoch,
+        "best_val_auc": best_val_auc,
+        "architecture": architecture,
+        "seed": seed,
+        "config_sha256": config_sha256,
+        "manifest_sha256": manifest_sha256,
         "labels": labels,
-        "metadata": metadata or {},
+        "rng_state": get_safe_rng_state(),
+        "dataloader_generator_state": gen_st,
+        "metadata": meta,
     }
 
 
@@ -324,6 +384,9 @@ def main():
         workers = min(4, os.cpu_count() or 2) if torch.cuda.is_available() else 0
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    train_generator = torch.Generator()
+    train_generator.manual_seed(args.seed)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -331,6 +394,7 @@ def main():
         num_workers=workers,
         pin_memory=torch.cuda.is_available(),
         persistent_workers=(workers > 0),
+        generator=train_generator,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -340,6 +404,29 @@ def main():
         pin_memory=torch.cuda.is_available(),
         persistent_workers=(workers > 0),
     )
+
+    # Save resolved config artifact
+    resolved_config = {
+        "architecture": args.arch,
+        "seed": args.seed,
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "learning_rate": lr,
+        "weight_decay": weight_decay,
+        "early_stopping_patience": patience,
+        "loss": loss_name,
+        "uncertainty_policy": unc_policy,
+        "amp": use_amp,
+        "image_size": image_size,
+        "pretrained": pretrained,
+        "random_rotation_degrees": rot_degrees,
+        "horizontal_flip": h_flip,
+        "labels": labels,
+        "config_sha256": config_sha256,
+        "manifest_sha256": manifest_sha256,
+        "preprocessing_sha256": preprocessing_sha256,
+    }
+    (out_dir / "resolved_config.json").write_text(json.dumps(resolved_config, indent=2), encoding="utf-8")
 
     # Initialize Model & Loss
     model = build_model(args.arch, len(labels), pretrained=pretrained).to(device)
@@ -359,22 +446,68 @@ def main():
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp and torch.cuda.is_available())
 
     start_epoch = 1
-    best_val_auc = 0.0
+    best_val_auc = -1.0
     patience_counter = 0
     history = []
 
-    # Handle Resume
-    if args.resume and args.resume.exists():
-        print(f"Resuming training from checkpoint: {args.resume}")
-        loaded = torch.load(args.resume, map_location=device, weights_only=True)
-        model.load_state_dict(loaded["model_state_dict"])
-        if loaded.get("optimizer_state_dict"):
-            optimizer.load_state_dict(loaded["optimizer_state_dict"])
-        if loaded.get("scheduler_state_dict"):
-            scheduler.load_state_dict(loaded["scheduler_state_dict"])
+    # Handle Resume (fail-closed integrity checks)
+    if args.resume:
+        resume_path = Path(args.resume)
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"Resume checkpoint not found at: {resume_path}")
+
+        ckpt_sha = compute_file_sha256(resume_path)
+        if not ckpt_sha or ckpt_sha == "NOT_FOUND":
+            raise RuntimeError(f"Cannot compute SHA-256 for checkpoint {resume_path}")
+
+        print(f"Resuming training from checkpoint: {resume_path} (SHA-256: {ckpt_sha})")
+        loaded = torch.load(resume_path, map_location=device, weights_only=True)
+        if not isinstance(loaded, dict) or "model_state_dict" not in loaded:
+            raise RuntimeError(f"Invalid checkpoint format in {resume_path}")
+
         meta = loaded.get("metadata", {})
-        start_epoch = int(meta.get("epoch", 0)) + 1
-        best_val_auc = float(meta.get("best_internal_validation_auc", 0.0))
+        ckpt_arch = loaded.get("architecture") or meta.get("architecture")
+        ckpt_seed = loaded.get("seed") if "seed" in loaded and loaded["seed"] is not None else meta.get("seed")
+        ckpt_config_sha = loaded.get("config_sha256") or meta.get("config_sha256")
+        ckpt_manifest_sha = loaded.get("manifest_sha256") or meta.get("split_manifest_sha256")
+
+        if ckpt_arch is None or str(ckpt_arch) != str(args.arch):
+            raise RuntimeError(
+                f"Resume architecture mismatch: checkpoint has {ckpt_arch!r}, expected {args.arch!r}"
+            )
+        if ckpt_seed is None or int(ckpt_seed) != int(args.seed):
+            raise RuntimeError(
+                f"Resume seed mismatch: checkpoint has {ckpt_seed!r}, expected {args.seed!r}"
+            )
+        if ckpt_config_sha is None or str(ckpt_config_sha) != str(config_sha256):
+            raise RuntimeError(
+                f"Resume config hash mismatch: checkpoint has {ckpt_config_sha!r}, expected {config_sha256!r}"
+            )
+        if ckpt_manifest_sha is None or str(ckpt_manifest_sha) != str(manifest_sha256):
+            raise RuntimeError(
+                f"Resume manifest hash mismatch: checkpoint has {ckpt_manifest_sha!r}, expected {manifest_sha256!r}"
+            )
+
+        # Load weights into model.module if DataParallel, else model (strip "module." if present)
+        raw_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+        state_dict = loaded["model_state_dict"]
+        if any(k.startswith("module.") for k in state_dict.keys()):
+            state_dict = {k[7:] if k.startswith("module.") else k: v for k, v in state_dict.items()}
+        raw_model.load_state_dict(state_dict)
+
+        if loaded.get("optimizer_state_dict") and optimizer:
+            optimizer.load_state_dict(loaded["optimizer_state_dict"])
+        if loaded.get("scheduler_state_dict") and scheduler:
+            scheduler.load_state_dict(loaded["scheduler_state_dict"])
+        if loaded.get("scaler_state_dict") and scaler:
+            scaler.load_state_dict(loaded["scaler_state_dict"])
+
+        restore_safe_rng_state(loaded.get("rng_state"))
+        if loaded.get("dataloader_generator_state") is not None and train_generator is not None:
+            train_generator.set_state(loaded["dataloader_generator_state"])
+
+        start_epoch = int(loaded.get("epoch", meta.get("epoch", 0))) + 1
+        best_val_auc = float(loaded.get("best_val_auc", meta.get("best_internal_validation_auc", -1.0)))
         history = list(meta.get("metrics_history", []))
 
     print(f"\n=======================================================")
@@ -442,18 +575,45 @@ def main():
 
         # Save last checkpoint
         last_ckpt = out_dir / "last.pt"
-        payload_last = checkpoint_payload(model, optimizer, scheduler, labels, metadata=metadata_dict)
-        payload_last["scaler_state_dict"] = scaler.state_dict() if scaler else None
+        payload_last = checkpoint_payload(
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            epoch=epoch,
+            best_val_auc=best_val_auc,
+            architecture=args.arch,
+            seed=args.seed,
+            config_sha256=config_sha256,
+            manifest_sha256=manifest_sha256,
+            labels=labels,
+            generator=train_generator,
+            metadata=metadata_dict,
+        )
         torch.save(payload_last, last_ckpt)
 
-        # Check for improvement & save best checkpoint
-        if mean_val_auc > best_val_auc:
-            best_val_auc = mean_val_auc
+        # Check for improvement & save best checkpoint (always saved on first epoch if missing)
+        is_best = (mean_val_auc > best_val_auc) or not (out_dir / "best.pt").exists()
+        if is_best:
+            best_val_auc = max(best_val_auc, mean_val_auc)
             patience_counter = 0
             best_ckpt = out_dir / "best.pt"
             metadata_dict["best_internal_validation_auc"] = best_val_auc
-            payload_best = checkpoint_payload(model, optimizer, scheduler, labels, metadata=metadata_dict)
-            payload_best["scaler_state_dict"] = scaler.state_dict() if scaler else None
+            payload_best = checkpoint_payload(
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                epoch=epoch,
+                best_val_auc=best_val_auc,
+                architecture=args.arch,
+                seed=args.seed,
+                config_sha256=config_sha256,
+                manifest_sha256=manifest_sha256,
+                labels=labels,
+                generator=train_generator,
+                metadata=metadata_dict,
+            )
             torch.save(payload_best, best_ckpt)
             print(f"  -> Best model saved to: {best_ckpt} (AUC: {best_val_auc:.4f})")
 
