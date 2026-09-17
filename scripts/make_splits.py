@@ -306,6 +306,13 @@ def main():
         study_ids.append(generate_stable_study_id(pid, path_str, idx))
 
         full_img_path = args.data_root / path_str
+        if not full_img_path.exists():
+            p_obj = Path(path_str)
+            if p_obj.parts and p_obj.parts[0].startswith("CheXpert"):
+                alt_path = args.data_root / Path(*p_obj.parts[1:])
+                if alt_path.exists():
+                    full_img_path = alt_path
+
         if full_img_path.exists():
             image_hashes.append(compute_image_sha256(full_img_path))
         else:
