@@ -60,10 +60,10 @@ figure { margin: 0; }
 .app-shell {
   max-width: 1200px;
   margin: 0 auto;
-  padding: 30px 20px 60px;
+  padding: 32px 24px 64px;
   display: flex;
   flex-direction: column;
-  gap: 20px;
+  gap: 28px;
 }
 
 /* -----------------------------------------
@@ -83,10 +83,10 @@ figure { margin: 0; }
 }
 
 .hero-card {
-  padding: 26px 30px;
+  padding: 28px 32px;
   display: grid;
   grid-template-columns: 1fr auto;
-  gap: 16px;
+  gap: 20px;
   align-items: center;
 }
 
@@ -212,15 +212,15 @@ figure { margin: 0; }
 }
 
 /* -----------------------------------------
-   Workspace Mode Switcher Tabs
+   Workspace Mode Switcher Tabs & Layout Containers
 ----------------------------------------- */
 .mode-tabs {
   display: flex;
-  gap: 8px;
-  margin-top: 18px;
-  margin-bottom: 6px;
+  gap: 10px;
+  margin-top: 4px;
+  margin-bottom: 4px;
   border-bottom: 1px solid var(--border);
-  padding-bottom: 8px;
+  padding-bottom: 12px;
 }
 
 .mode-tab {
@@ -250,11 +250,17 @@ figure { margin: 0; }
   box-shadow: 0 0 12px var(--primary-glow);
 }
 
+.mode-view {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
 /* -----------------------------------------
    Batch Processing Mode Styles
 ----------------------------------------- */
 .batch-results-panel {
-  margin-top: 20px;
+  margin-top: 0;
 }
 
 .batch-actions-toolbar {
@@ -418,20 +424,20 @@ figure { margin: 0; }
 .upload-card {
   display: grid;
   grid-template-columns: auto 1fr;
-  gap: 22px;
-  padding: 22px 28px;
+  gap: 28px;
+  padding: 24px 30px;
   align-items: center;
 }
 
 .upload-info {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 16px;
 }
 
 .upload-glyph {
-  width: 50px;
-  height: 50px;
+  width: 52px;
+  height: 52px;
   border-radius: 12px;
   background: var(--primary-subtle);
   border: 1px solid rgba(45, 212, 191, 0.2);
@@ -448,7 +454,7 @@ figure { margin: 0; }
 .upload-form {
   display: grid;
   grid-template-columns: 1fr 140px;
-  gap: 12px;
+  gap: 14px;
   align-items: stretch;
 }
 
@@ -566,17 +572,11 @@ input[type="file"] {
 .workspace-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 20px;
-}
-
-@media (max-width: 900px) {
-  .workspace-grid, .upload-card, .hero-card {
-    grid-template-columns: 1fr;
-  }
+  gap: 28px;
 }
 
 .panel {
-  padding: 22px 24px;
+  padding: 26px 28px;
   display: flex;
   flex-direction: column;
 }
@@ -585,8 +585,8 @@ input[type="file"] {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 16px;
-  gap: 12px;
+  margin-bottom: 20px;
+  gap: 14px;
 }
 
 .panel-label {
@@ -606,7 +606,7 @@ input[type="file"] {
 .panel-desc {
   font-size: 12px;
   color: var(--text-muted);
-  margin-top: 2px;
+  margin-top: 3px;
 }
 
 /* PACS Toolbar & Controls */
@@ -633,19 +633,19 @@ input[type="file"] {
 
 .pacs-controls {
   display: flex;
-  gap: 16px;
-  padding: 10px 14px;
+  gap: 20px;
+  padding: 12px 18px;
   background: var(--surface-2);
   border-radius: var(--radius-md);
-  margin-bottom: 12px;
-  font-size: 11.5px;
+  margin-bottom: 16px;
+  font-size: 12px;
   color: var(--text-muted);
 }
 
 .ctrl-group {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   flex: 1;
 }
 
@@ -665,7 +665,7 @@ input[type="file"] {
   background: #000;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  min-height: 380px;
+  min-height: 400px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -696,20 +696,20 @@ input[type="file"] {
 .findings-hint {
   font-size: 11.5px;
   color: var(--text-dim);
-  margin-bottom: 10px;
+  margin-bottom: 14px;
 }
 
 .findings-list {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
 }
 
 .finding-card {
   background: var(--surface-2);
   border: 1.5px solid var(--border);
   border-radius: var(--radius-md);
-  padding: 12px 16px;
+  padding: 14px 18px;
   cursor: pointer;
   transition: all var(--transition);
   position: relative;
@@ -812,17 +812,17 @@ input[type="file"] {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
-  padding: 10px 16px;
+  gap: 18px;
+  padding: 12px 18px;
   background: var(--surface-2);
   border-radius: var(--radius-md);
-  margin-bottom: 14px;
+  margin-bottom: 18px;
   flex-wrap: wrap;
 }
 
 .finding-tabs {
   display: flex;
-  gap: 6px;
+  gap: 8px;
   flex-wrap: wrap;
 }
 
@@ -830,8 +830,8 @@ input[type="file"] {
   background: var(--surface-3);
   color: var(--text-muted);
   border: 1px solid var(--border);
-  padding: 5px 12px;
-  font-size: 11.5px;
+  padding: 6px 14px;
+  font-size: 12px;
   font-weight: 600;
   border-radius: 999px;
   transition: all var(--transition);
@@ -853,8 +853,8 @@ input[type="file"] {
 .opacity-control {
   display: flex;
   align-items: center;
-  gap: 10px;
-  font-size: 12px;
+  gap: 12px;
+  font-size: 12.5px;
   color: var(--text);
   min-width: 220px;
 }
@@ -862,14 +862,14 @@ input[type="file"] {
 .dual-viewer {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 16px;
+  gap: 24px;
 }
 
 .viewer-box {
   background: #000;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  padding: 8px;
+  padding: 12px 14px;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -880,7 +880,7 @@ input[type="file"] {
   font-weight: 700;
   color: var(--text-muted);
   text-transform: uppercase;
-  margin-bottom: 6px;
+  margin-bottom: 10px;
   letter-spacing: 0.05em;
 }
 
@@ -913,9 +913,9 @@ input[type="file"] {
 
 #heatmap-caption {
   text-align: center;
-  font-size: 11.5px;
+  font-size: 12px;
   color: var(--text-dim);
-  margin-top: 10px;
+  margin-top: 14px;
 }
 
 /* -----------------------------------------
@@ -927,24 +927,24 @@ input[type="file"] {
   align-items: center;
   justify-content: center;
   text-align: center;
-  padding: 40px 20px;
+  padding: 48px 24px;
   color: var(--text-dim);
 }
 
 .empty-icon {
-  width: 44px;
-  height: 44px;
-  border-radius: 12px;
+  width: 48px;
+  height: 48px;
+  border-radius: 14px;
   background: var(--surface-2);
   display: flex;
   align-items: center;
   justify-content: center;
   color: var(--text-muted);
-  margin-bottom: 12px;
+  margin-bottom: 14px;
 }
 
 .empty-state strong { color: var(--text-muted); font-size: 14px; }
-.empty-state span { font-size: 12px; margin-top: 4px; }
+.empty-state span { font-size: 12.5px; margin-top: 6px; }
 
 .alert {
   padding: 12px 16px;
@@ -957,16 +957,16 @@ input[type="file"] {
 .alert-error { background: var(--danger-bg); border: 1px solid rgba(239, 68, 68, 0.3); color: #fca5a5; }
 
 .disclaimer {
-  padding: 14px 20px;
+  padding: 16px 24px;
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 14px;
   background: var(--surface-2);
 }
 
 .disclaimer-icon {
-  width: 22px;
-  height: 22px;
+  width: 24px;
+  height: 24px;
   border-radius: 50%;
   background: var(--warning-bg);
   color: var(--warning);
@@ -977,7 +977,58 @@ input[type="file"] {
   flex-shrink: 0;
 }
 
-.disclaimer p { font-size: 12px; color: var(--text-dim); }
+.disclaimer p { font-size: 12px; color: var(--text-dim); line-height: 1.5; }
+
+/* -----------------------------------------
+   Responsive Layout & Breakpoints
+----------------------------------------- */
+@media (max-width: 900px) {
+  .app-shell {
+    padding: 20px 14px 40px;
+    gap: 20px;
+  }
+  .mode-view {
+    gap: 20px;
+  }
+  .workspace-grid {
+    grid-template-columns: 1fr;
+    gap: 20px;
+  }
+  .upload-card, .hero-card {
+    grid-template-columns: 1fr;
+    gap: 20px;
+  }
+  .dual-viewer {
+    grid-template-columns: 1fr;
+    gap: 20px;
+  }
+  .panel {
+    padding: 20px 18px;
+  }
+}
+
+@media (max-width: 640px) {
+  .upload-form {
+    grid-template-columns: 1fr;
+  }
+  .hero-badges {
+    justify-content: flex-start;
+  }
+  .pacs-controls {
+    flex-direction: column;
+    gap: 12px;
+  }
+  .finding-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+  }
+  .finding-right {
+    margin-left: 0;
+    width: 100%;
+    justify-content: space-between;
+  }
+}
 
 /* -----------------------------------------
    Printable Medical Report (A4 Format)
