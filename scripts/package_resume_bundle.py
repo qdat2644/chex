@@ -78,8 +78,11 @@ def package_resume_bundle(
             for name, source in sources.items():
                 archive.write(source, arcname=name)
             archive.write(ledger_path, arcname="checksums.json")
-    verify_resume_bundle(temporary_output)
+    # Producer verification; consumers must obtain this digest independently.
+    bundle_sha256 = _sha256(temporary_output)
+    verify_resume_bundle(temporary_output, expected_sha256=bundle_sha256)
     temporary_output.replace(output)
+    print(f"Record externally as EXPECTED_RESUME_BUNDLE_SHA256: {bundle_sha256}")
     return output
 
 

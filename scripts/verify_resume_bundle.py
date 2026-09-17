@@ -16,7 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.experiment_integrity import canonical_json_sha256
+from app.experiment_integrity import canonical_json_sha256, compute_file_sha256
 
 
 EXPECTED_MEMBERS = {
@@ -28,10 +28,14 @@ EXPECTED_MEMBERS = {
 }
 
 
-def verify_resume_bundle(path: Path, extract_dir: Path | None = None) -> dict[str, object]:
+def verify_resume_bundle(path: Path, extract_dir: Path | None = None, *, expected_sha256: str | None = None) -> dict[str, object]:
     bundle = Path(path)
+    if not expected_sha256:
+        raise RuntimeError("External expected resume bundle SHA-256 is mandatory")
     if not bundle.is_file():
         raise FileNotFoundError(bundle)
+    if compute_file_sha256(bundle) != expected_sha256:
+        raise RuntimeError("Resume bundle ZIP SHA-256 mismatch")
     try:
         with zipfile.ZipFile(bundle, "r") as archive:
             names = archive.namelist()
@@ -95,12 +99,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Verify and optionally extract a resume bundle")
     parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--extract-dir", type=Path)
+    parser.add_argument("--expected-sha256", required=True)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    ledger = verify_resume_bundle(args.bundle, args.extract_dir)
+    ledger = verify_resume_bundle(args.bundle, args.extract_dir, expected_sha256=args.expected_sha256)
     print(json.dumps(ledger, indent=2))
 
 

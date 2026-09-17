@@ -192,9 +192,11 @@ def get_safe_rng_state() -> dict[str, Any]:
     }
 
 
-def restore_safe_rng_state(rng: dict[str, Any] | None) -> None:
+def restore_safe_rng_state(rng: dict[str, Any] | None, strict: bool = False) -> None:
     """Restores Python, NumPy, PyTorch CPU, and PyTorch CUDA RNG states safely."""
     if not rng or not isinstance(rng, dict):
+        if strict:
+            raise RuntimeError("Missing RNG state in full resume")
         return
     if "python" in rng and rng["python"] is not None:
         random.setstate(rng["python"])
@@ -213,8 +215,11 @@ def restore_safe_rng_state(rng: dict[str, Any] | None) -> None:
         torch.set_rng_state(rng["torch"])
 
     cuda_st = rng.get("torch_cuda") if "torch_cuda" in rng else rng.get("cuda")
+    if strict and len(cuda_st or []) != torch.cuda.device_count():
+        raise RuntimeError("CUDA RNG state count does not match device count")
     if cuda_st is not None and torch.cuda.is_available():
         try:
             torch.cuda.set_rng_state_all(cuda_st)
-        except Exception:
-            pass
+        except Exception as exc:
+            if strict:
+                raise RuntimeError("CUDA RNG restoration failed") from exc

@@ -132,7 +132,29 @@ def load_resume_checkpoint(path: Path, expected_sha256: str | None) -> tuple[dic
     loaded = torch.load(resume_path, map_location="cpu", weights_only=True)
     if not isinstance(loaded, dict):
         raise RuntimeError(f"Invalid checkpoint format in {resume_path}")
+    validate_resume_progress(loaded)
     return loaded, actual.lower()
+
+
+def validate_resume_progress(checkpoint):
+    for field in ("best_epoch", "patience_counter"):
+        value = checkpoint.get(field)
+        if type(value) is not int or value < 0:
+            raise RuntimeError(f"Missing or invalid resume {field}")
+
+
+def restore_training_state(checkpoint, model, optimizer, scheduler, scaler=None, generator=None, run_mode="smoke"):
+    validate_resume_progress(checkpoint)
+    unwrap_model(model).load_state_dict(checkpoint["model_state"])
+    optimizer.load_state_dict(checkpoint["optimizer_state"])
+    scheduler.load_state_dict(checkpoint["scheduler_state"])
+    if scaler is not None and checkpoint.get("scaler_state"):
+        scaler.load_state_dict(checkpoint["scaler_state"])
+    restore_safe_rng_state(checkpoint["rng_state"], strict=run_mode == "full")
+    if generator is not None:
+        generator.set_state(checkpoint["train_loader_generator_state"])
+    return (checkpoint["epoch"] + 1, checkpoint["best_val_auc"], checkpoint["best_epoch"],
+            checkpoint["patience_counter"], list(checkpoint["metadata"]["metrics_history"]))
 
 
 def set_seed(seed: int = 42, deterministic: bool = True) -> None:
@@ -246,6 +268,8 @@ def checkpoint_payload(
     git_dirty: bool = False,
     history: list[dict[str, Any]] | None = None,
     protocol_version: str = "0.1",
+    best_epoch: int = 0,
+    patience_counter: int = 0,
 ) -> dict[str, object]:
     """
     Constructs Checkpoint Schema Version 2 payload with backward compatibility aliases.
@@ -269,6 +293,8 @@ def checkpoint_payload(
         "architecture": str(architecture),
         "seed": int(seed),
         "epoch": int(epoch),
+        "best_epoch": int(best_epoch),
+        "patience_counter": int(patience_counter),
         "planned_max_epochs": int(planned_max_epochs),
         "best_val_auc": safe_auc,
         "labels": list(labels),
@@ -521,7 +547,9 @@ def main():
         sched_st = loaded.get("scheduler_state") or loaded.get("scheduler_state_dict")
         scaler_st = loaded.get("scaler_state") or loaded.get("scaler_state_dict")
         rng_st = loaded.get("rng_state")
-        gen_st = loaded.get("train_loader_generator_state") or loaded.get("dataloader_generator_state")
+        gen_st = loaded.get("train_loader_generator_state")
+        if gen_st is None:
+            gen_st = loaded.get("dataloader_generator_state")
 
         # C2: Fail-closed verification before loading state
         if run_mode == "full":
@@ -557,30 +585,10 @@ def main():
         if ckpt_run_mode is not None and str(ckpt_run_mode) != str(run_mode):
             raise RuntimeError(f"Resume run mode mismatch: checkpoint has {ckpt_run_mode!r}, expected {run_mode!r}")
 
-        # C1: Load state into unwrap_model(model), stripping module. prefixes if any
-        raw_target = unwrap_model(model)
-        clean_model_st = {k[7:] if k.startswith("module.") else k: v for k, v in model_st.items()}
-        raw_target.load_state_dict(clean_model_st)
-
-        # C4: Full state restoration
-        if opt_st and optimizer:
-            optimizer.load_state_dict(opt_st)
-        if sched_st and scheduler:
-            scheduler.load_state_dict(sched_st)
-        if scaler_st and scaler:
-            scaler.load_state_dict(scaler_st)
-        if rng_st:
-            restore_safe_rng_state(rng_st)
-        if gen_st is not None and train_generator is not None:
-            train_generator.set_state(gen_st)
-
-        start_epoch = int(ckpt_epoch) + 1
-        raw_best_auc = loaded.get("best_val_auc", ckpt_meta.get("best_internal_validation_auc"))
-        if raw_best_auc is not None and not math.isnan(raw_best_auc) and not math.isinf(raw_best_auc):
-            best_val_auc = float(raw_best_auc)
-        best_epoch = int(ckpt_epoch)
-        history = list(ckpt_meta.get("metrics_history", []))
-
+        start_epoch, restored_best, best_epoch, patience_counter, history = restore_training_state(
+            loaded, model, optimizer, scheduler, scaler, train_generator, run_mode
+        )
+        best_val_auc = restored_best if restored_best is not None else -float("inf")
     print(f"\n=======================================================")
     print(f"CheXpert Protocol Training: {args.arch} (Seed {args.seed}) | Mode: {run_mode}")
     print(f"Train samples: {len(train_dataset)} | Val samples: {len(val_dataset)}")
@@ -646,6 +654,9 @@ def main():
         else:
             patience_counter += 1
 
+        if not (out_dir / "best.pt").exists() and not args.resume:
+            best_epoch = epoch
+
         payload = checkpoint_payload(
             model=model,
             optimizer=optimizer,
@@ -666,6 +677,8 @@ def main():
             git_dirty=git_dirty,
             history=history,
             protocol_version=config.get("protocol_version", "0.1"),
+            best_epoch=best_epoch,
+            patience_counter=patience_counter,
         )
 
         # B4: Atomic write for last.pt
@@ -675,7 +688,6 @@ def main():
         # B3: Epoch 1 always creates best.pt, or if improvement detected
         best_ckpt = out_dir / "best.pt"
         if is_best or not best_ckpt.exists():
-            best_epoch = epoch
             atomic_save_torch(payload, best_ckpt)
             print(f"  -> Best model saved to: {best_ckpt} (AUC: {auc_display})")
 

@@ -102,8 +102,10 @@ def validate_artifact_sources(
     seed = _equal("seed", {
         "best.pt": best["seed"], "last.pt": last["seed"], "run_manifest": run.get("seed"),
         "resolved_config": resolved.get("seed"), "calibration": calibration.get("seed"),
-        "development_manifest": manifest.get("seed"),
     })
+    split_seed = manifest.get("split_seed", manifest.get("seed"))
+    if not isinstance(split_seed, int):
+        raise RuntimeError("PACKAGING ERROR: missing split_seed in development manifest")
     run_mode = _equal("run_mode", {
         "best.pt": best["run_mode"], "last.pt": last["run_mode"],
         "run_manifest": run.get("run_mode"), "calibration": calibration.get("run_mode"),
@@ -172,7 +174,8 @@ def validate_artifact_sources(
         "manifest.json": Path(manifest_file), "protocol_v0_1.yaml": Path(config_file),
     }
     metadata = {
-        "architecture": architecture, "seed": int(seed), "run_mode": run_mode,
+        "architecture": architecture, "seed": int(seed), "training_seed": int(seed),
+        "split_seed": split_seed, "run_mode": run_mode,
         "protocol_version": protocol_version, "labels": labels, "git_commit": git_commit,
         "resolved_config_sha256": resolved_hash, "manifest_sha256": manifest_hash,
         "status": "NON_FINAL_SMOKE_TEST" if run_mode == "smoke" else "COMPLIANT_PROTOCOL_RUN",
@@ -226,7 +229,7 @@ def verify_artifact_zip(path: Path) -> dict[str, object]:
                     str(ledger.get("run_mode")),
                 )
                 for field in (
-                    "architecture", "seed", "run_mode", "protocol_version", "labels",
+                    "architecture", "seed", "training_seed", "split_seed", "run_mode", "protocol_version", "labels",
                     "git_commit", "resolved_config_sha256", "manifest_sha256", "status", "git_dirty",
                 ):
                     if ledger.get(field) != derived.get(field):

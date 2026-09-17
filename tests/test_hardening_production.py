@@ -30,6 +30,8 @@ class TestProductionHardening(unittest.TestCase):
     def _checkpoint(self, run_mode: str = "smoke") -> dict[str, object]:
         return {
             "checkpoint_schema_version": 2,
+            "best_epoch": 1,
+            "patience_counter": 0,
             "architecture": "convnext_small",
             "seed": 42,
             "run_mode": run_mode,
@@ -73,7 +75,7 @@ class TestProductionHardening(unittest.TestCase):
             bundle = package_resume_bundle(checkpoint, resolved, manifest, protocol, root / "resume.zip")
             with zipfile.ZipFile(bundle) as archive:
                 self.assertEqual(set(archive.namelist()), EXPECTED_MEMBERS)
-            verify_resume_bundle(bundle, root / "verified")
+            verify_resume_bundle(bundle, root / "verified", expected_sha256=compute_file_sha256(bundle))
 
             tampered = root / "tampered.zip"
             with zipfile.ZipFile(bundle) as source, zipfile.ZipFile(tampered, "w") as target:
@@ -81,7 +83,7 @@ class TestProductionHardening(unittest.TestCase):
                     data = source.read(name)
                     target.writestr(name, data + b"x" if name == "last.pt" else data)
             with self.assertRaises(RuntimeError):
-                verify_resume_bundle(tampered)
+                verify_resume_bundle(tampered, expected_sha256=compute_file_sha256(bundle))
 
     def test_notebook_has_no_assert_in_code_cells(self) -> None:
         notebook = json.loads((Path(__file__).parents[1] / "train_on_kaggle.ipynb").read_text(encoding="utf-8"))

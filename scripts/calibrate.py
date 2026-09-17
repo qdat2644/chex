@@ -114,9 +114,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arch", type=str, default=None, help="Model architecture")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--limit", type=int, help="Optional limit for testing")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--run-mode", choices=["smoke", "full"], default=None, help="Override or specify run mode")
     return parser.parse_args()
+
+
+def validate_calibration_config(checkpoint, checkpoint_path, config_path, run_mode=None, limit=None):
+    required = ("architecture", "seed", "labels", "run_mode", "config_sha256",
+                "resolved_config_sha256", "manifest_sha256", "git_commit")
+    if not isinstance(checkpoint, dict) or any(checkpoint.get(k) is None or checkpoint.get(k) == "" for k in required):
+        raise RuntimeError("Calibration checkpoint is missing required metadata")
+    mode = checkpoint["run_mode"]
+    if mode not in ("smoke", "full") or (run_mode is not None and mode != run_mode):
+        raise RuntimeError("Calibration run-mode mismatch")
+    if mode == "full" and limit is not None:
+        raise RuntimeError("Full calibration forbids --limit")
+    resolved_path = Path(checkpoint_path).parent / "resolved_config.json"
+    if not resolved_path.is_file() or not Path(config_path).is_file():
+        raise RuntimeError("Calibration requires resolved_config.json and protocol YAML")
+    try:
+        resolved = json.loads(resolved_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as exc:
+        raise RuntimeError("Invalid resolved_config.json") from exc
+    if canonical_json_sha256(resolved) != checkpoint["resolved_config_sha256"]:
+        raise RuntimeError("Calibration resolved-config hash mismatch")
+    if compute_file_sha256(config_path) != checkpoint["config_sha256"]:
+        raise RuntimeError("Calibration protocol YAML hash mismatch")
+    return mode
 
 
 @torch.inference_mode()
@@ -150,6 +174,7 @@ def main():
 
     ckpt_sha256 = compute_file_sha256(args.checkpoint)
     loaded_ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+    validate_calibration_config(loaded_ckpt, args.checkpoint, args.config, args.run_mode, args.limit)
     if not isinstance(loaded_ckpt, dict):
         raise RuntimeError(f"Invalid checkpoint dictionary format at {args.checkpoint}")
 
