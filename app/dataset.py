@@ -31,11 +31,13 @@ class CheXpertDataset(Dataset):
         missing = [label for label in self.labels if label not in self.frame.columns]
         if missing:
             raise ValueError(f"Missing label columns in {self.csv_path}: {missing}")
-        if "Path" not in self.frame.columns:
+        path_col = "Path" if "Path" in self.frame.columns else ("image_path" if "image_path" in self.frame.columns else None)
+        if path_col is None:
             raise ValueError(f"Missing Path column in {self.csv_path}")
-        if self.view != "all":
-            if "Frontal/Lateral" not in self.frame.columns:
-                raise ValueError(f"Missing Frontal/Lateral column in {self.csv_path}")
+        if path_col != "Path":
+            self.frame["Path"] = self.frame[path_col]
+
+        if self.view != "all" and "Frontal/Lateral" in self.frame.columns:
             expected = "Frontal" if self.view == "frontal" else "Lateral"
             self.frame = self.frame[self.frame["Frontal/Lateral"].astype(str).str.lower() == expected.lower()].reset_index(drop=True)
             if self.frame.empty:

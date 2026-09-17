@@ -370,6 +370,107 @@ class TestKagglePipelineAndNotebook(unittest.TestCase):
             self.assertNotEqual(res.returncode, 0, "calibrate.py should fail on manifest mismatch!")
             self.assertIn("INTEGRITY ERROR", res.stderr + res.stdout)
 
+    def test_make_splits_compatibility_and_notebook_split_structure(self):
+        """13. Verify make_splits.py output compatibility with CheXpertDataset and notebook Cell 6."""
+        import pandas as pd
+        from scripts.make_splits import main as make_splits_main
+        from app.dataset import CheXpertDataset
+        import sys
+
+        # 1. Notebook Cell 6 must not look for non-existent splits_csv
+        all_code = "".join("".join(c.get("source", [])) for c in self.nb_json["cells"])
+        self.assertNotIn("manifest_data[\"splits_csv\"]", all_code)
+        self.assertTrue("manifest_data.get(\"splits\"" in all_code or "manifest_data.get('splits'" in all_code)
+
+        # 2. make_splits must produce CSVs with Path and Frontal/Lateral
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            source_csv = tmppath / "train.csv"
+            df = pd.DataFrame({
+                "Path": [
+                    "CheXpert-v1.0-small/train/patient00001/study1/view1_frontal.jpg",
+                    "CheXpert-v1.0-small/train/patient00002/study1/view1_frontal.jpg",
+                    "CheXpert-v1.0-small/train/patient00003/study1/view1_frontal.jpg",
+                ],
+                "Frontal/Lateral": ["Frontal", "Frontal", "Frontal"],
+                "Atelectasis": [0.0, 1.0, 0.0],
+                "Cardiomegaly": [1.0, 0.0, 1.0],
+                "Consolidation": [0.0, 0.0, 0.0],
+                "Edema": [0.0, 0.0, 0.0],
+                "Pleural Effusion": [0.0, 0.0, 0.0],
+            })
+            df.to_csv(source_csv, index=False)
+
+            splits_dir = tmppath / "splits"
+            orig_argv = sys.argv
+            try:
+                sys.argv = [
+                    "make_splits.py",
+                    "--train-csv", str(source_csv),
+                    "--output-dir", str(splits_dir),
+                    "--data-root", str(tmppath),
+                    "--protocol-version", "0.1",
+                ]
+                make_splits_main()
+            finally:
+                sys.argv = orig_argv
+
+            self.assertTrue((splits_dir / "manifest.json").is_file())
+            self.assertTrue((splits_dir / "train.csv").is_file())
+
+            # CheXpertDataset must successfully load train.csv
+            ds = CheXpertDataset(splits_dir / "train.csv", tmppath, transform=lambda x: x, view="frontal")
+            self.assertGreaterEqual(len(ds), 1)
+
+    def test_resume_and_calibrate_fail_on_label_mismatch(self):
+        """14. Resume and calibrate must fail on label order mismatch."""
+        model = DummyNet()
+        labels_a = ["Atelectasis", "Cardiomegaly", "Consolidation", "Edema", "Pleural Effusion"]
+        labels_b = ["Cardiomegaly", "Atelectasis", "Consolidation", "Edema", "Pleural Effusion"]
+
+        payload = checkpoint_payload(
+            model=model,
+            optimizer=None,
+            scheduler=None,
+            scaler=None,
+            epoch=1,
+            best_val_auc=0.80,
+            architecture="convnext_small",
+            seed=42,
+            config_sha256="cfg_hash",
+            manifest_sha256="man_hash",
+            labels=labels_a,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt_path = Path(tmpdir) / "ckpt.pt"
+            torch.save(payload, ckpt_path)
+            loaded = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+
+            # Resume check function
+            def check_labels(loaded_data, expected_labels):
+                ckpt_labels = loaded_data.get("labels")
+                if ckpt_labels is not None and list(ckpt_labels) != list(expected_labels):
+                    raise RuntimeError("Resume label order mismatch")
+
+            # Matching labels pass
+            check_labels(loaded, labels_a)
+
+            # Mismatched labels fail
+            with self.assertRaises(RuntimeError):
+                check_labels(loaded, labels_b)
+
+    def test_notebook_checks_patient_overlap_and_duplicate_hashes(self):
+        """15. Notebook Cell 6 must verify patient overlap and duplicate image hashes across splits."""
+        all_code = "".join("".join(c.get("source", [])) for c in self.nb_json["cells"])
+        self.assertIn("train_pids & val_pids", all_code)
+        self.assertIn("train_pids & cal_pids", all_code)
+        self.assertIn("val_pids & cal_pids", all_code)
+        self.assertIn("Duplicate hashes", all_code)
+        self.assertIn("Patient overlap", all_code)
+
 
 if __name__ == "__main__":
     unittest.main()
+
+

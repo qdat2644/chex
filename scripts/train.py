@@ -426,6 +426,8 @@ def main():
         "manifest_sha256": manifest_sha256,
         "preprocessing_sha256": preprocessing_sha256,
     }
+    resolved_config_sha256 = hashlib.sha256(json.dumps(resolved_config, sort_keys=True).encode()).hexdigest()
+    resolved_config["resolved_config_sha256"] = resolved_config_sha256
     (out_dir / "resolved_config.json").write_text(json.dumps(resolved_config, indent=2), encoding="utf-8")
 
     # Initialize Model & Loss
@@ -486,6 +488,11 @@ def main():
         if ckpt_manifest_sha is None or str(ckpt_manifest_sha) != str(manifest_sha256):
             raise RuntimeError(
                 f"Resume manifest hash mismatch: checkpoint has {ckpt_manifest_sha!r}, expected {manifest_sha256!r}"
+            )
+        ckpt_labels = loaded.get("labels") or meta.get("labels")
+        if ckpt_labels is not None and list(ckpt_labels) != list(labels):
+            raise RuntimeError(
+                f"Resume label order mismatch: checkpoint has {ckpt_labels!r}, expected {labels!r}"
             )
 
         # Load weights into model.module if DataParallel, else model (strip "module." if present)
@@ -647,6 +654,7 @@ def main():
         "epochs_trained": len(history),
         "best_checkpoint_sha256": compute_file_sha256(out_dir / "best.pt"),
         "config_sha256": config_sha256,
+        "resolved_config_sha256": resolved_config_sha256,
         "split_manifest_sha256": manifest_sha256,
         "preprocessing_sha256": preprocessing_sha256,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

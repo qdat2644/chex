@@ -213,6 +213,7 @@ def main():
     parser.add_argument("--validation-ratio", type=float, default=0.1, help="Internal validation split ratio (default: 0.10)")
     parser.add_argument("--uncertainty-policy", choices=["u_ones_zeros", "smooth", "zero", "one", "ignore"], default="u_ones_zeros")
     parser.add_argument("--view", choices=["frontal", "all"], default="frontal")
+    parser.add_argument("--protocol-version", type=str, default="0.1", help="Protocol version (default: 0.1)")
     args = parser.parse_args()
 
     if not args.train_csv.exists():
@@ -329,8 +330,17 @@ def main():
         print(f"CRITICAL ERROR: {len(cross_split_duplicates)} duplicate image hashes found across different splits!", file=sys.stderr)
         sys.exit(1)
 
-    # Format output CSVs
-    output_cols = ["study_id", "patient_id", "image_path", "split_role", "image_sha256"] + target_labels
+    # Format output CSVs (preserving Path and Frontal/Lateral for CheXpertDataset compatibility)
+    output_cols = ["study_id", "patient_id"]
+    if "Path" in df.columns:
+        output_cols.append("Path")
+    if "image_path" in df.columns and "image_path" not in output_cols:
+        output_cols.append("image_path")
+    if "Frontal/Lateral" in df.columns:
+        output_cols.append("Frontal/Lateral")
+    output_cols.extend(["split_role", "image_sha256"])
+    output_cols.extend(target_labels)
+
     train_df = df[df["split_role"] == "training"][output_cols].reset_index(drop=True)
     calib_df = df[df["split_role"] == "calibration"][output_cols].reset_index(drop=True)
     val_df = df[df["split_role"] == "internal_validation"][output_cols].reset_index(drop=True)
@@ -377,7 +387,7 @@ def main():
     # Generate Manifest & Integrity Report
     manifest = {
         "schema_version": "1.0",
-        "protocol_version": "0.1",
+        "protocol_version": getattr(args, "protocol_version", "0.1"),
         "seed": args.seed,
         "source_csv": str(args.train_csv),
         "source_csv_sha256": compute_file_sha256(args.train_csv),

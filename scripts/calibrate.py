@@ -188,7 +188,13 @@ def main():
             f"INTEGRITY ERROR: Checkpoint seed ({ckpt_seed}) does not match --seed ({args.seed})!"
         )
 
-    labels = loaded_ckpt.get("labels") or manifest_data.get("labels") or DEFAULT_LABELS
+    ckpt_labels = loaded_ckpt.get("labels") or ckpt_meta.get("labels")
+    manifest_labels = manifest_data.get("labels")
+    if ckpt_labels and manifest_labels and list(ckpt_labels) != list(manifest_labels):
+        raise RuntimeError(
+            f"INTEGRITY ERROR: Checkpoint labels ({ckpt_labels}) do not match manifest labels ({manifest_labels})!"
+        )
+    labels = ckpt_labels or manifest_labels or DEFAULT_LABELS
     unc_policy = ckpt_meta.get("uncertainty_policy") or manifest_data.get("uncertainty_policy", "u_ones_zeros")
     preprocessing_sha256 = ckpt_meta.get("preprocessing_sha256", "UNKNOWN")
 
