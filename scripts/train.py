@@ -33,6 +33,7 @@ from app.experiment_integrity import (
     canonical_json_sha256,
     compute_file_sha256,
     get_git_commit,
+    get_git_dirty,
     get_safe_rng_state,
     restore_safe_rng_state,
     sanitize_for_json,
@@ -103,9 +104,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=None, help="DataLoader worker processes")
     parser.add_argument("--limit", type=int, help="Optional subset limit for fast smoke testing")
     parser.add_argument("--resume", type=Path, help="Resume training from an existing checkpoint .pt")
+    parser.add_argument(
+        "--expected-resume-sha256",
+        type=str,
+        help="Pre-registered SHA-256 for --resume; mandatory whenever --resume is used",
+    )
     parser.add_argument("--stop-after-epoch", type=int, default=None, help="Operational option to interrupt training after N epochs for resume verification")
     parser.add_argument("--run-mode", choices=["smoke", "full"], default=None, help="Execution run mode (smoke or full)")
     return parser.parse_args()
+
+
+def load_resume_checkpoint(path: Path, expected_sha256: str | None) -> tuple[dict[str, object], str]:
+    """Authenticate checkpoint bytes before deserializing them."""
+    resume_path = Path(path)
+    if not expected_sha256:
+        raise RuntimeError("--expected-resume-sha256 is mandatory whenever --resume is used")
+    expected = str(expected_sha256).strip().lower()
+    if len(expected) != 64 or any(ch not in "0123456789abcdef" for ch in expected):
+        raise RuntimeError("Expected resume SHA-256 must be exactly 64 hexadecimal characters")
+    if not resume_path.is_file():
+        raise FileNotFoundError(f"Resume checkpoint not found at: {resume_path}")
+    actual = compute_file_sha256(resume_path)
+    if actual.lower() != expected:
+        raise RuntimeError(
+            f"Resume checkpoint SHA-256 mismatch: expected {expected}, got {actual.lower()}"
+        )
+    loaded = torch.load(resume_path, map_location="cpu", weights_only=True)
+    if not isinstance(loaded, dict):
+        raise RuntimeError(f"Invalid checkpoint format in {resume_path}")
+    return loaded, actual.lower()
 
 
 def set_seed(seed: int = 42, deterministic: bool = True) -> None:
@@ -216,6 +243,7 @@ def checkpoint_payload(
     run_mode: str,
     generator: torch.Generator | None = None,
     git_commit: str = "UNKNOWN",
+    git_dirty: bool = False,
     history: list[dict[str, Any]] | None = None,
     protocol_version: str = "0.1",
 ) -> dict[str, object]:
@@ -259,6 +287,7 @@ def checkpoint_payload(
         "resolved_config_sha256": str(resolved_config_sha256),
         "manifest_sha256": str(manifest_sha256),
         "git_commit": str(git_commit),
+        "git_dirty": bool(git_dirty),
         # Backwards compatibility aliases
         "model_state_dict": clean_weights,
         "optimizer_state_dict": optimizer.state_dict() if optimizer else None,
@@ -278,6 +307,7 @@ def checkpoint_payload(
             "labels": list(labels),
             "run_mode": str(run_mode),
             "git_commit": str(git_commit),
+            "git_dirty": bool(git_dirty),
             "metrics_history": history or [],
         },
     }
@@ -346,6 +376,11 @@ def main():
         run_mode = "smoke" if (args.limit or (args.epochs and args.epochs <= 2)) else "full"
 
     git_commit = get_git_commit(PROJECT_ROOT)
+    git_dirty = get_git_dirty(PROJECT_ROOT)
+    if run_mode == "full" and git_dirty:
+        raise RuntimeError("Full-mode training requires a clean Git working tree")
+    if run_mode == "full" and git_commit == "UNKNOWN":
+        raise RuntimeError("Full-mode training requires a known Git commit")
 
     # 4. Construct Resolved Scientific Config & Canonical Hash (Part A)
     resolved_config = build_resolved_scientific_config(
@@ -468,17 +503,8 @@ def main():
     # 8. Resume Validation & State Restoration (Part C)
     if args.resume:
         resume_path = Path(args.resume)
-        if not resume_path.is_file():
-            raise FileNotFoundError(f"Resume checkpoint not found at: {resume_path}")
-
-        ckpt_sha = compute_file_sha256(resume_path)
-        if not ckpt_sha or ckpt_sha == "NOT_FOUND":
-            raise RuntimeError(f"Cannot compute SHA-256 for checkpoint {resume_path}")
-
+        loaded, ckpt_sha = load_resume_checkpoint(resume_path, args.expected_resume_sha256)
         print(f"Resuming training from checkpoint: {resume_path} (SHA-256: {ckpt_sha})")
-        loaded = torch.load(resume_path, map_location="cpu", weights_only=True)
-        if not isinstance(loaded, dict):
-            raise RuntimeError(f"Invalid checkpoint format in {resume_path}")
 
         ckpt_meta = loaded.get("metadata", {})
         ckpt_arch = loaded.get("architecture") or ckpt_meta.get("architecture")
@@ -637,6 +663,7 @@ def main():
             run_mode=run_mode,
             generator=train_generator,
             git_commit=git_commit,
+            git_dirty=git_dirty,
             history=history,
             protocol_version=config.get("protocol_version", "0.1"),
         )
@@ -719,7 +746,9 @@ def main():
         "status": str(training_status),
         "architecture": str(args.arch),
         "seed": int(args.seed),
+        "labels": list(labels),
         "git_commit": str(git_commit),
+        "git_dirty": bool(git_dirty),
         "resolved_config_sha256": str(resolved_config_sha256),
         "manifest_sha256": str(manifest_sha256),
         "best_checkpoint_sha256": compute_file_sha256(out_dir / "best.pt"),

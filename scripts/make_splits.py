@@ -300,6 +300,7 @@ def main():
     # Generate stable study IDs and compute image hashes
     study_ids = []
     image_hashes = []
+    missing_images: list[str] = []
 
     for idx, row in df.iterrows():
         path_str = str(row["Path"])
@@ -317,7 +318,15 @@ def main():
         if full_img_path.exists():
             image_hashes.append(compute_image_sha256(full_img_path))
         else:
-            image_hashes.append(hashlib.sha256(path_str.encode()).hexdigest())
+            missing_images.append(path_str)
+            image_hashes.append("")
+
+    if missing_images:
+        samples = "\n".join(f"  - {path}" for path in missing_images[:20])
+        raise FileNotFoundError(
+            f"Cannot create integrity-valid splits: {len(missing_images)} image files are missing. "
+            f"First {min(20, len(missing_images))}:\n{samples}"
+        )
 
     df["study_id"] = study_ids
     df["image_path"] = df["Path"]

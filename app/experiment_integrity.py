@@ -162,6 +162,21 @@ def get_git_commit(cwd: Path | str | None = None) -> str:
         return "UNKNOWN"
 
 
+def get_git_dirty(cwd: Path | str | None = None) -> bool:
+    """Return whether the repository has tracked or untracked changes, failing closed."""
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(cwd) if cwd else None,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+    except Exception as exc:
+        raise RuntimeError("Unable to determine Git working-tree status") from exc
+    return bool(result.stdout.strip())
+
+
 def get_safe_rng_state() -> dict[str, Any]:
     """Captures Python, NumPy, PyTorch CPU, and PyTorch CUDA RNG states safely."""
     np_state = np.random.get_state()
@@ -203,4 +218,3 @@ def restore_safe_rng_state(rng: dict[str, Any] | None) -> None:
             torch.cuda.set_rng_state_all(cuda_st)
         except Exception:
             pass
-
