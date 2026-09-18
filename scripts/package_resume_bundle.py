@@ -14,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.verify_resume_bundle import verify_resume_bundle
+from scripts.verify_resume_bundle import validate_checkpoint_pair, verify_resume_bundle
 from app.experiment_integrity import canonical_json_sha256
 
 
@@ -29,6 +29,7 @@ def _sha256(path: Path) -> str:
 
 
 def package_resume_bundle(
+    best_checkpoint: Path,
     last_checkpoint: Path,
     resolved_config: Path,
     manifest: Path,
@@ -36,17 +37,21 @@ def package_resume_bundle(
     output: Path,
 ) -> Path:
     sources = {
+        "best.pt": Path(best_checkpoint),
         "last.pt": Path(last_checkpoint),
         "resolved_config.json": Path(resolved_config),
         "manifest.json": Path(manifest),
         "protocol_v0_1.yaml": Path(protocol_config),
     }
     hashes = {name: _sha256(path) for name, path in sources.items()}
-    checkpoint = torch.load(sources["last.pt"], map_location="cpu", weights_only=True)
-    if not isinstance(checkpoint, dict):
-        raise RuntimeError("last.pt is not a checkpoint dictionary")
-    if checkpoint.get("run_mode") != "smoke":
-        raise RuntimeError("Resume bundle creation is restricted to smoke checkpoints")
+    try:
+        best = torch.load(sources["best.pt"], map_location="cpu", weights_only=True)
+        checkpoint = torch.load(sources["last.pt"], map_location="cpu", weights_only=True)
+    except Exception as exc:
+        raise RuntimeError("Resume bundle checkpoints cannot be parsed") from exc
+    if not isinstance(best, dict) or not isinstance(checkpoint, dict):
+        raise RuntimeError("Resume bundle checkpoints must be dictionaries")
+    shared_metadata = validate_checkpoint_pair(best, checkpoint)
     resolved_payload = json.loads(sources["resolved_config.json"].read_text(encoding="utf-8"))
     cross_links = {
         "resolved_config_sha256": canonical_json_sha256(resolved_payload),
@@ -54,18 +59,20 @@ def package_resume_bundle(
         "config_sha256": hashes["protocol_v0_1.yaml"],
     }
     for field, actual in cross_links.items():
-        expected = checkpoint.get(field) or checkpoint.get("metadata", {}).get(
-            "split_manifest_sha256" if field == "manifest_sha256" else field
-        )
+        expected = checkpoint[field]
         if expected != actual:
             raise RuntimeError(f"Resume bundle {field} does not match last.pt metadata")
 
     ledger = {
         "schema_version": 1,
-        "status": "NON_FINAL_SMOKE_TEST",
-        "architecture": checkpoint.get("architecture"),
-        "seed": checkpoint.get("seed"),
-        "run_mode": checkpoint.get("run_mode"),
+        "status": (
+            "NON_FINAL_SMOKE_TEST"
+            if checkpoint["run_mode"] == "smoke"
+            else "COMPLIANT_PROTOCOL_RESUME_BUNDLE"
+        ),
+        "architecture": shared_metadata["architecture"],
+        "seed": shared_metadata["seed"],
+        "run_mode": shared_metadata["run_mode"],
         "files": hashes,
     }
     output = Path(output)
@@ -87,7 +94,8 @@ def package_resume_bundle(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Create a verified non-final smoke resume bundle")
+    parser = argparse.ArgumentParser(description="Create a verified protocol resume bundle")
+    parser.add_argument("--best-checkpoint", type=Path, required=True)
     parser.add_argument("--last-checkpoint", type=Path, required=True)
     parser.add_argument("--resolved-config", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
@@ -99,6 +107,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     result = package_resume_bundle(
+        args.best_checkpoint,
         args.last_checkpoint,
         args.resolved_config,
         args.manifest,

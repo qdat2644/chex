@@ -426,7 +426,8 @@ class TestKagglePipelineAndNotebook(unittest.TestCase):
         self.assertIn('RUN_MODE = "smoke"', config_cell)
         self.assertIn('SMOKE_PHASE = "fresh"', config_cell)
         self.assertIn("BATCH_SIZE = 32", config_cell)
-        self.assertIn("RESUME_CHECKPOINT = None", config_cell)
+        self.assertIn("RESUME_BUNDLE = None", config_cell)
+        self.assertNotIn("RESUME_CHECKPOINT", config_cell)
         self.assertIn('REPO_REF = "main"', config_cell)
 
         all_code = "".join("".join(c.get("source", [])) for c in self.nb_json["cells"])

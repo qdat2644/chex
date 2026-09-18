@@ -39,9 +39,17 @@ class TestProductionHardening(unittest.TestCase):
             "git_commit": "abc123",
             "git_dirty": True,
             "labels": ["L1"],
+            "epoch": 1,
+            "best_val_auc": 0.8,
             "resolved_config_sha256": "pending",
             "manifest_sha256": "pending",
+            "config_sha256": "pending",
             "model_state": {"weight": torch.tensor([1.0])},
+            "optimizer_state": {"state": {}, "param_groups": []},
+            "scheduler_state": {"last_epoch": 1},
+            "rng_state": {"python": (), "numpy": (), "torch_cpu": torch.zeros(1, dtype=torch.uint8), "torch_cuda": None},
+            "train_loader_generator_state": torch.zeros(1, dtype=torch.uint8),
+            "metadata": {"metrics_history": [{"epoch": 1}]},
         }
 
     def test_resume_requires_expected_checksum_and_rejects_mismatch(self) -> None:
@@ -60,6 +68,7 @@ class TestProductionHardening(unittest.TestCase):
     def test_resume_bundle_complete_and_tampering_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            best_checkpoint = root / "best.pt"
             checkpoint = root / "last.pt"
             resolved = root / "resolved_config.json"
             resolved.write_text("{}", encoding="utf-8")
@@ -71,8 +80,9 @@ class TestProductionHardening(unittest.TestCase):
             checkpoint_payload["resolved_config_sha256"] = canonical_json_sha256({})
             checkpoint_payload["manifest_sha256"] = compute_file_sha256(manifest)
             checkpoint_payload["config_sha256"] = compute_file_sha256(protocol)
+            torch.save(checkpoint_payload, best_checkpoint)
             torch.save(checkpoint_payload, checkpoint)
-            bundle = package_resume_bundle(checkpoint, resolved, manifest, protocol, root / "resume.zip")
+            bundle = package_resume_bundle(best_checkpoint, checkpoint, resolved, manifest, protocol, root / "resume.zip")
             with zipfile.ZipFile(bundle) as archive:
                 self.assertEqual(set(archive.namelist()), EXPECTED_MEMBERS)
             verify_resume_bundle(bundle, root / "verified", expected_sha256=compute_file_sha256(bundle))
@@ -89,7 +99,7 @@ class TestProductionHardening(unittest.TestCase):
         notebook = json.loads((Path(__file__).parents[1] / "train_on_kaggle.ipynb").read_text(encoding="utf-8"))
         code = "\n".join("".join(cell.get("source", [])) for cell in notebook["cells"] if cell["cell_type"] == "code")
         self.assertNotIn("assert ", code)
-        self.assertIn("scripts/verify_resume_bundle.py", code)
+        self.assertIn("scripts.verify_resume_bundle", code)
         self.assertIn("--expected-resume-sha256", code)
 
     def test_image_hash_validation_fails_closed(self) -> None:

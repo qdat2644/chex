@@ -129,7 +129,10 @@ def load_resume_checkpoint(path: Path, expected_sha256: str | None) -> tuple[dic
         raise RuntimeError(
             f"Resume checkpoint SHA-256 mismatch: expected {expected}, got {actual.lower()}"
         )
-    loaded = torch.load(resume_path, map_location="cpu", weights_only=True)
+    try:
+        loaded = torch.load(resume_path, map_location="cpu", weights_only=True)
+    except Exception as exc:
+        raise RuntimeError(f"Resume checkpoint cannot be parsed: {resume_path}") from exc
     if not isinstance(loaded, dict):
         raise RuntimeError(f"Invalid checkpoint format in {resume_path}")
     validate_resume_progress(loaded)
@@ -137,15 +140,59 @@ def load_resume_checkpoint(path: Path, expected_sha256: str | None) -> tuple[dic
 
 
 def validate_resume_progress(checkpoint):
-    for field in ("best_epoch", "patience_counter"):
-        value = checkpoint.get(field)
-        if type(value) is not int or value < 0:
-            raise RuntimeError(f"Missing or invalid resume {field}")
+    required = (
+        "run_mode",
+        "resolved_config_sha256",
+        "manifest_sha256",
+        "config_sha256",
+        "epoch",
+        "best_epoch",
+        "patience_counter",
+        "best_val_auc",
+        "model_state",
+        "optimizer_state",
+        "scheduler_state",
+        "rng_state",
+        "train_loader_generator_state",
+    )
+    missing = [
+        field
+        for field in required
+        if field not in checkpoint or (checkpoint[field] is None and field != "best_val_auc")
+    ]
+    if missing:
+        raise RuntimeError(f"Resume checkpoint is missing mandatory fields: {missing}")
+    if checkpoint["run_mode"] not in {"smoke", "full"}:
+        raise RuntimeError(f"Invalid resume run_mode: {checkpoint['run_mode']!r}")
+    epoch = checkpoint["epoch"]
+    best_epoch = checkpoint["best_epoch"]
+    patience_counter = checkpoint["patience_counter"]
+    if type(epoch) is not int or epoch < 1:
+        raise RuntimeError("Missing or invalid resume epoch")
+    if type(best_epoch) is not int or not 1 <= best_epoch <= epoch:
+        raise RuntimeError("Missing or invalid resume best_epoch; expected 1 <= best_epoch <= epoch")
+    if type(patience_counter) is not int or not 0 <= patience_counter <= epoch:
+        raise RuntimeError("Missing or invalid resume patience_counter; expected 0 <= patience_counter <= epoch")
+    for field in ("model_state", "optimizer_state", "scheduler_state", "rng_state"):
+        if not isinstance(checkpoint[field], dict):
+            raise RuntimeError(f"Invalid resume {field}; expected a state dictionary")
+    missing_rng = [field for field in ("python", "numpy", "torch_cpu", "torch_cuda") if field not in checkpoint["rng_state"]]
+    if missing_rng:
+        raise RuntimeError(f"Resume checkpoint RNG state is incomplete: {missing_rng}")
+    if not isinstance(checkpoint["train_loader_generator_state"], torch.Tensor):
+        raise RuntimeError("Invalid resume train_loader_generator_state")
+    metadata = checkpoint.get("metadata")
+    if not isinstance(metadata, dict) or not isinstance(metadata.get("metrics_history"), list):
+        raise RuntimeError("Resume checkpoint is missing metadata.metrics_history")
 
 
 def restore_training_state(checkpoint, model, optimizer, scheduler, scaler=None, generator=None, run_mode="smoke"):
     validate_resume_progress(checkpoint)
-    unwrap_model(model).load_state_dict(checkpoint["model_state"])
+    clean_weights = {
+        key[7:] if key.startswith("module.") else key: value
+        for key, value in checkpoint["model_state"].items()
+    }
+    unwrap_model(model).load_state_dict(clean_weights)
     optimizer.load_state_dict(checkpoint["optimizer_state"])
     scheduler.load_state_dict(checkpoint["scheduler_state"])
     if scaler is not None and checkpoint.get("scaler_state"):
@@ -155,6 +202,18 @@ def restore_training_state(checkpoint, model, optimizer, scheduler, scaler=None,
         generator.set_state(checkpoint["train_loader_generator_state"])
     return (checkpoint["epoch"] + 1, checkpoint["best_val_auc"], checkpoint["best_epoch"],
             checkpoint["patience_counter"], list(checkpoint["metadata"]["metrics_history"]))
+
+
+def save_training_checkpoints(payload: dict[str, object], output_dir: Path, *, is_best: bool) -> tuple[Path, Path]:
+    """Atomically save last.pt and replace best.pt only for a genuine improvement."""
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    last_checkpoint = destination / "last.pt"
+    best_checkpoint = destination / "best.pt"
+    atomic_save_torch(payload, last_checkpoint)
+    if is_best or not best_checkpoint.is_file():
+        atomic_save_torch(payload, best_checkpoint)
+    return best_checkpoint, last_checkpoint
 
 
 def set_seed(seed: int = 42, deterministic: bool = True) -> None:
@@ -532,42 +591,13 @@ def main():
         loaded, ckpt_sha = load_resume_checkpoint(resume_path, args.expected_resume_sha256)
         print(f"Resuming training from checkpoint: {resume_path} (SHA-256: {ckpt_sha})")
 
-        ckpt_meta = loaded.get("metadata", {})
-        ckpt_arch = loaded.get("architecture") or ckpt_meta.get("architecture")
-        ckpt_seed = loaded.get("seed") if "seed" in loaded and loaded["seed"] is not None else ckpt_meta.get("seed")
-        ckpt_labels = loaded.get("labels") or ckpt_meta.get("labels")
-        ckpt_resolved_cfg = loaded.get("resolved_config_sha256") or ckpt_meta.get("resolved_config_sha256")
-        ckpt_config_sha = loaded.get("config_sha256") or ckpt_meta.get("config_sha256")
-        ckpt_manifest = loaded.get("manifest_sha256") or ckpt_meta.get("split_manifest_sha256")
-        ckpt_run_mode = loaded.get("run_mode") or ckpt_meta.get("run_mode")
-        ckpt_epoch = loaded.get("epoch", ckpt_meta.get("epoch"))
-
-        model_st = loaded.get("model_state") or loaded.get("model_state_dict")
-        opt_st = loaded.get("optimizer_state") or loaded.get("optimizer_state_dict")
-        sched_st = loaded.get("scheduler_state") or loaded.get("scheduler_state_dict")
-        scaler_st = loaded.get("scaler_state") or loaded.get("scaler_state_dict")
-        rng_st = loaded.get("rng_state")
-        gen_st = loaded.get("train_loader_generator_state")
-        if gen_st is None:
-            gen_st = loaded.get("dataloader_generator_state")
-
-        # C2: Fail-closed verification before loading state
-        if run_mode == "full":
-            missing_fields = []
-            if ckpt_arch is None: missing_fields.append("architecture")
-            if ckpt_seed is None: missing_fields.append("seed")
-            if ckpt_labels is None: missing_fields.append("labels")
-            if ckpt_resolved_cfg is None: missing_fields.append("resolved_config_sha256")
-            if ckpt_manifest is None: missing_fields.append("manifest_sha256")
-            if ckpt_epoch is None: missing_fields.append("epoch")
-            if model_st is None: missing_fields.append("model_state")
-            if opt_st is None: missing_fields.append("optimizer_state")
-            if sched_st is None: missing_fields.append("scheduler_state")
-            if scaler_st is None and use_amp and torch.cuda.is_available(): missing_fields.append("scaler_state")
-            if rng_st is None: missing_fields.append("rng_state")
-            if gen_st is None: missing_fields.append("train_loader_generator_state")
-            if missing_fields:
-                raise RuntimeError(f"Resume checkpoint is missing mandatory fields in full mode: {missing_fields}")
+        ckpt_arch = loaded.get("architecture")
+        ckpt_seed = loaded.get("seed")
+        ckpt_labels = loaded.get("labels")
+        ckpt_resolved_cfg = loaded["resolved_config_sha256"]
+        ckpt_config_sha = loaded["config_sha256"]
+        ckpt_manifest = loaded["manifest_sha256"]
+        ckpt_run_mode = loaded["run_mode"]
 
         # Absolute comparisons
         if ckpt_arch is None or str(ckpt_arch) != str(args.arch):
@@ -576,13 +606,15 @@ def main():
             raise RuntimeError(f"Resume seed mismatch: checkpoint has {ckpt_seed!r}, expected {args.seed!r}")
         if ckpt_labels is None or list(ckpt_labels) != list(labels):
             raise RuntimeError(f"Resume label order mismatch: checkpoint has {ckpt_labels!r}, expected {labels!r}")
-        if ckpt_resolved_cfg is not None and str(ckpt_resolved_cfg) != str(resolved_config_sha256):
+        if str(ckpt_resolved_cfg) != str(resolved_config_sha256):
             raise RuntimeError(
                 f"Resume resolved config hash mismatch: checkpoint has {ckpt_resolved_cfg!r}, expected {resolved_config_sha256!r}"
             )
+        if str(ckpt_config_sha) != str(config_sha256):
+            raise RuntimeError(f"Resume protocol config hash mismatch: checkpoint has {ckpt_config_sha!r}, expected {config_sha256!r}")
         if ckpt_manifest is None or str(ckpt_manifest) != str(manifest_sha256):
             raise RuntimeError(f"Resume manifest hash mismatch: checkpoint has {ckpt_manifest!r}, expected {manifest_sha256!r}")
-        if ckpt_run_mode is not None and str(ckpt_run_mode) != str(run_mode):
+        if str(ckpt_run_mode) != str(run_mode):
             raise RuntimeError(f"Resume run mode mismatch: checkpoint has {ckpt_run_mode!r}, expected {run_mode!r}")
 
         start_epoch, restored_best, best_epoch, patience_counter, history = restore_training_state(
@@ -681,14 +713,10 @@ def main():
             patience_counter=patience_counter,
         )
 
-        # B4: Atomic write for last.pt
-        last_ckpt = out_dir / "last.pt"
-        atomic_save_torch(payload, last_ckpt)
-
-        # B3: Epoch 1 always creates best.pt, or if improvement detected
-        best_ckpt = out_dir / "best.pt"
-        if is_best or not best_ckpt.exists():
-            atomic_save_torch(payload, best_ckpt)
+        # B3/B4: last.pt always advances; an existing verified best.pt survives non-improving resume epochs.
+        best_was_present = (out_dir / "best.pt").is_file()
+        best_ckpt, last_ckpt = save_training_checkpoints(payload, out_dir, is_best=is_best)
+        if is_best or not best_was_present:
             print(f"  -> Best model saved to: {best_ckpt} (AUC: {auc_display})")
 
         # Early stopping check (only in full mode)

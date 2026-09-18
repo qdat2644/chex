@@ -85,7 +85,7 @@ class RemainingBlockers(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'last.pt'
             for field in ('best_epoch', 'patience_counter'):
-                ck = dict(best_epoch=1, patience_counter=2)
+                ck = fixtures.TestProductionHardening()._checkpoint()
                 del ck[field]
                 torch.save(ck, path)
                 with self.assertRaisesRegex(RuntimeError, field):
@@ -124,19 +124,19 @@ class RemainingBlockers(unittest.TestCase):
 
         continuous = fresh(42)
         history = []
-        epoch(continuous, 1, history, 1, 3)
-        expected = copy.deepcopy(epoch(continuous, 2, history, 1, 4))
+        epoch(continuous, 1, history, 1, 1)
+        expected = copy.deepcopy(epoch(continuous, 2, history, 1, 2))
         continuous[0].eval()
         prediction = continuous[0](x).detach()
         first = fresh(42)
-        checkpoint = epoch(first, 1, [], 1, 3)
+        checkpoint = epoch(first, 1, [], 1, 1)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'last.pt'
             torch.save(checkpoint, path)
             resumed = fresh(999)
             loaded, _ = load_resume_checkpoint(path, compute_file_sha256(path))
             next_epoch, best, best_epoch, patience, history = restore_training_state(loaded, *resumed[:3], generator=resumed[3])
-            self.assertEqual((next_epoch, best, best_epoch, patience), (2, .8, 1, 3))
+            self.assertEqual((next_epoch, best, best_epoch, patience), (2, .8, 1, 1))
             actual = epoch(resumed, next_epoch, history, best_epoch, patience + 1)
             def compare(a, b):
                 if isinstance(a, torch.Tensor):
