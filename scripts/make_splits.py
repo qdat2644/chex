@@ -54,6 +54,81 @@ def generate_stable_study_id(patient_id: str, path_str: str, index: int) -> str:
     return f"{patient_id}_{study_token}_{path_hash}"
 
 
+def coalesce_duplicate_patient_components(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Keep every patient connected by identical image bytes in one final split."""
+    required = {"patient_id", "image_sha256", "split_role"}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise RuntimeError(f"Cannot coalesce duplicate-image components; missing columns: {missing}")
+
+    frame = df.copy()
+    parent = {str(patient_id): str(patient_id) for patient_id in frame["patient_id"].unique()}
+
+    def find(patient_id: str) -> str:
+        while parent[patient_id] != patient_id:
+            parent[patient_id] = parent[parent[patient_id]]
+            patient_id = parent[patient_id]
+        return patient_id
+
+    def union(left: str, right: str) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root == right_root:
+            return
+        keep, merge = sorted((left_root, right_root))
+        parent[merge] = keep
+
+    duplicate_hash_count = 0
+    for digest, group in frame.groupby("image_sha256", sort=True):
+        value = str(digest).strip().lower()
+        if len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
+            raise RuntimeError(f"Invalid image_sha256 while constructing leakage components: {digest!r}")
+        patients = sorted({str(patient_id) for patient_id in group["patient_id"]})
+        if len(patients) > 1:
+            duplicate_hash_count += 1
+            for patient_id in patients[1:]:
+                union(patients[0], patient_id)
+
+    components: dict[str, list[str]] = {}
+    for patient_id in sorted(parent):
+        components.setdefault(find(patient_id), []).append(patient_id)
+
+    role_priority = {"training": 0, "calibration": 1, "internal_validation": 2}
+    moved_patients = 0
+    cross_split_components = 0
+    for patients in components.values():
+        if len(patients) < 2:
+            continue
+        patient_roles = (
+            frame[frame["patient_id"].astype(str).isin(patients)]
+            .groupby("patient_id")["split_role"]
+            .agg(lambda values: sorted(set(values)))
+        )
+        invalid = {patient_id: roles for patient_id, roles in patient_roles.items() if len(roles) != 1}
+        if invalid:
+            raise RuntimeError(f"Patients already span multiple split roles: {invalid}")
+        role_counts: dict[str, int] = {}
+        for roles in patient_roles:
+            role = str(roles[0])
+            if role not in role_priority:
+                raise RuntimeError(f"Unsupported split role while coalescing duplicates: {role!r}")
+            role_counts[role] = role_counts.get(role, 0) + 1
+        if len(role_counts) == 1:
+            continue
+        cross_split_components += 1
+        target_role = min(role_counts, key=lambda role: (-role_counts[role], role_priority[role]))
+        for patient_id, roles in patient_roles.items():
+            if roles[0] != target_role:
+                frame.loc[frame["patient_id"].astype(str) == str(patient_id), "split_role"] = target_role
+                moved_patients += 1
+
+    return frame, {
+        "duplicate_hash_count": duplicate_hash_count,
+        "cross_split_component_count": cross_split_components,
+        "moved_patient_count": moved_patients,
+    }
+
+
 def normalize_uncertain_label(val: float | None, label_name: str, policy: str = "u_ones_zeros") -> float:
     if pd.isna(val):
         return 0.0
@@ -332,12 +407,27 @@ def main():
     df["image_path"] = df["Path"]
     df["image_sha256"] = image_hashes
 
-    # Check for Duplicate Image Hashes across splits
+    # Treat patients connected by identical image bytes as one leakage component.
+    df, duplicate_component_report = coalesce_duplicate_patient_components(df)
+    train_pids = set(df.loc[df["split_role"] == "training", "patient_id"])
+    calib_pids = set(df.loc[df["split_role"] == "calibration", "patient_id"])
+    val_pids = set(df.loc[df["split_role"] == "internal_validation", "patient_id"])
+    if duplicate_component_report["cross_split_component_count"]:
+        print(
+            "Coalesced "
+            f"{duplicate_component_report['cross_split_component_count']} duplicate-image patient components; "
+            f"moved {duplicate_component_report['moved_patient_count']} patients before finalizing splits."
+        )
+
+    # Final fail-closed duplicate check after component coalescing.
     split_hash_groups = df.groupby("image_sha256")["split_role"].nunique()
     cross_split_duplicates = split_hash_groups[split_hash_groups > 1].index.tolist()
     if cross_split_duplicates:
-        print(f"CRITICAL ERROR: {len(cross_split_duplicates)} duplicate image hashes found across different splits!", file=sys.stderr)
-        sys.exit(1)
+        samples = cross_split_duplicates[:20]
+        raise RuntimeError(
+            f"CRITICAL ERROR: {len(cross_split_duplicates)} duplicate image hashes remain across splits; "
+            f"first {len(samples)}: {samples}"
+        )
 
     # Format output CSVs (preserving Path and Frontal/Lateral for CheXpertDataset compatibility)
     output_cols = ["study_id", "patient_id"]
@@ -429,6 +519,9 @@ def main():
         "patient_overlap": 0,
         "study_overlap": 0,
         "duplicate_image_hash_overlap": 0,
+        "duplicate_image_hashes_in_source": duplicate_component_report["duplicate_hash_count"],
+        "duplicate_patient_components_coalesced": duplicate_component_report["cross_split_component_count"],
+        "patients_moved_for_duplicate_components": duplicate_component_report["moved_patient_count"],
         "label_prevalence": prevalence_table,
     }
 
@@ -438,6 +531,9 @@ def main():
         "patient_overlap_count": 0,
         "study_overlap_count": 0,
         "duplicate_hash_overlap_count": len(cross_split_duplicates),
+        "duplicate_hashes_in_source": duplicate_component_report["duplicate_hash_count"],
+        "duplicate_patient_components_coalesced": duplicate_component_report["cross_split_component_count"],
+        "patients_moved_for_duplicate_components": duplicate_component_report["moved_patient_count"],
         "total_patients": len(unique_patients),
         "total_studies": len(df),
         "created_manifest_sha256": compute_file_sha256(manifest_path),

@@ -12,10 +12,46 @@ import pandas as pd
 
 from scripts.calibrate import calculate_optimal_thresholds
 from scripts.compare_models import compare_two_prediction_files, delong_paired_test, holm_bonferroni_correction
-from scripts.make_splits import extract_patient_id_strict, iterative_multilabel_split
+from scripts.make_splits import (
+    coalesce_duplicate_patient_components,
+    extract_patient_id_strict,
+    iterative_multilabel_split,
+)
 
 
 class TestProtocolIntegrity(unittest.TestCase):
+    def test_duplicate_image_patient_components_are_kept_in_one_split(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "patient_id": ["patient1", "patient2", "patient2", "patient3", "patient4"],
+                "image_sha256": ["a" * 64, "a" * 64, "b" * 64, "b" * 64, "c" * 64],
+                "split_role": [
+                    "training",
+                    "internal_validation",
+                    "internal_validation",
+                    "calibration",
+                    "internal_validation",
+                ],
+            }
+        )
+
+        coalesced, report = coalesce_duplicate_patient_components(frame)
+
+        linked_roles = set(
+            coalesced.loc[
+                coalesced["patient_id"].isin(["patient1", "patient2", "patient3"]),
+                "split_role",
+            ]
+        )
+        self.assertEqual(linked_roles, {"training"})
+        self.assertEqual(report["duplicate_hash_count"], 2)
+        self.assertEqual(report["cross_split_component_count"], 1)
+        self.assertEqual(report["moved_patient_count"], 2)
+        self.assertEqual(
+            set(coalesced.loc[coalesced["patient_id"] == "patient4", "split_role"]),
+            {"internal_validation"},
+        )
+
     def test_strict_patient_regex(self) -> None:
         # Valid CheXpert paths
         self.assertEqual(extract_patient_id_strict("CheXpert-v1.0-small/train/patient00001/study1/view1_frontal.jpg"), "patient00001")
