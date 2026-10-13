@@ -40,6 +40,9 @@ class TestSecretLeakageAndNotebookIntegrity(unittest.TestCase):
                 continue
 
             for pattern in forbidden_patterns:
+                # The Colab notebook intentionally imports the official Drive API.
+                if filepath.name == "train_on_colab.ipynb" and pattern.pattern == r"google\.colab":
+                    continue
                 match = pattern.search(content)
                 self.assertIsNone(
                     match,

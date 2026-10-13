@@ -277,12 +277,17 @@ def run_epoch(
             optimizer.zero_grad()
 
         with torch.set_grad_enabled(is_train):
-            logits = model(images)
+            # GradScaler alone does not enable mixed precision. Use autocast on
+            # CUDA (including Colab A100), with float32 loss math for stability.
+            amp_enabled = device.type == "cuda" and scaler is not None and scaler.is_enabled()
+            with torch.autocast(device_type=device.type, enabled=amp_enabled):
+                logits = model(images)
+            loss_logits = logits.float()
             if isinstance(criterion, (AsymmetricLoss, FocalLoss)):
-                loss = criterion(logits, targets, mask=masks)
+                loss = criterion(loss_logits, targets, mask=masks)
                 batch_loss_val = float(loss.detach().cpu()) * float(masks.sum().clamp(min=1.0).cpu())
             else:
-                bce = criterion(logits, targets)
+                bce = criterion(loss_logits, targets)
                 loss = (bce * masks).sum() / masks.sum().clamp(min=1.0)
                 batch_loss_val = float((bce * masks).sum().detach().cpu())
 
