@@ -77,6 +77,12 @@ class TestFreezeAndEvaluationIntegrity(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_freeze_succeeds_with_complete_artifacts(self) -> None:
+        # Also verify Schema v2 'manifest_sha256' key (without 'split_manifest_sha256') is accepted
+        th_v2 = self.calib_dir / "convnext_small_seed42.json"
+        th_v2_data = json.loads(th_v2.read_text(encoding="utf-8"))
+        th_v2_data["manifest_sha256"] = th_v2_data.pop("split_manifest_sha256")
+        th_v2.write_text(json.dumps(th_v2_data), encoding="utf-8")
+
         ledger = freeze_experiment(
             config_path=self.config_path,
             development_manifest_path=self.dev_manifest_path,

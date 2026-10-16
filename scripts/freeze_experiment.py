@@ -131,10 +131,11 @@ def freeze_experiment(
                     f"FREEZE FAIL-CLOSED ERROR: Threshold artifact '{th_path}' records checkpoint SHA "
                     f"'{th_data.get('checkpoint_sha256')}' which does not match actual checkpoint '{ckpt_sha256}'!"
                 )
-            if th_data.get("split_manifest_sha256") != dev_manifest_sha256:
+            th_manifest_sha = th_data.get("manifest_sha256") or th_data.get("split_manifest_sha256")
+            if th_manifest_sha != dev_manifest_sha256:
                 raise RuntimeError(
                     f"FREEZE FAIL-CLOSED ERROR: Threshold artifact '{th_path}' records manifest SHA "
-                    f"'{th_data.get('split_manifest_sha256')}' which does not match development manifest '{dev_manifest_sha256}'!"
+                    f"'{th_manifest_sha}' which does not match development manifest '{dev_manifest_sha256}'!"
                 )
 
             models_ledger[arch][seed_str] = {

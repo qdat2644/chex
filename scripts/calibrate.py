@@ -354,6 +354,7 @@ def main():
         "checkpoint_sha256": ckpt_sha256,
         "resolved_config_sha256": str(ckpt_resolved_cfg),
         "manifest_sha256": manifest_sha256,
+        "split_manifest_sha256": manifest_sha256,
         "calibration_predictions_sha256": str(calib_pred_sha256),
         "git_commit": str(ckpt_git_commit),
         "threshold_selection": "max_f1",

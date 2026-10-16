@@ -334,6 +334,7 @@ def main() -> None:
     label_metrics = {}
     valid_aucs = []
     valid_f1s = []
+    valid_f1s_05 = []
     valid_auprcs = []
     valid_briers = []
 
@@ -346,6 +347,7 @@ def main() -> None:
         y_prob = probs_arr[valid_idx, idx]
         th = thresholds_dict[label]
         y_pred = (y_prob >= th).astype(int)
+        y_pred_05 = (y_prob >= 0.5).astype(int)
 
         if len(np.unique(y_true)) > 1:
             point_auc = float(roc_auc_score(y_true, y_prob))
@@ -364,7 +366,15 @@ def main() -> None:
         brier = float(brier_score_loss(y_true, y_prob))
         ece = compute_expected_calibration_error(y_true, y_prob, n_bins=15)
 
+        tn05, fp05, fn05, tp05 = confusion_matrix(y_true, y_pred_05, labels=[0, 1]).ravel()
+        sens05 = float(tp05 / max(1, tp05 + fn05))
+        spec05 = float(tn05 / max(1, tn05 + fp05))
+        ppv05 = float(tp05 / max(1, tp05 + fp05))
+        npv05 = float(tn05 / max(1, tn05 + fn05))
+        f1_05 = float(f1_score(y_true, y_pred_05, zero_division=0))
+
         valid_f1s.append(f1)
+        valid_f1s_05.append(f1_05)
         valid_briers.append(brier)
 
         ci_l = ci_results.get(label, {})
@@ -385,6 +395,15 @@ def main() -> None:
             "brier_score": brier,
             "ece_15bins": ece,
             "confusion_matrix": {"tp": int(tp), "fp": int(fp), "tn": int(tn), "fn": int(fn)},
+            "sensitivity_analysis_threshold_0_5": {
+                "threshold": 0.5,
+                "sensitivity": sens05,
+                "specificity": spec05,
+                "ppv": ppv05,
+                "npv": npv05,
+                "f1_score": f1_05,
+                "confusion_matrix": {"tp": int(tp05), "fp": int(fp05), "tn": int(tn05), "fn": int(fn05)},
+            },
             "sample_count": len(valid_idx),
             "positive_count": int(tp + fn),
             "negative_count": int(tn + fp),
@@ -393,6 +412,7 @@ def main() -> None:
     macro_auc = float(np.mean(valid_aucs)) if valid_aucs else 0.0
     macro_auc_ci = ci_results.get("macro", {}).get("auroc", (0.0, 0.0))
     macro_f1 = float(np.mean(valid_f1s)) if valid_f1s else 0.0
+    macro_f1_05 = float(np.mean(valid_f1s_05)) if valid_f1s_05 else 0.0
     macro_auprc = float(np.mean(valid_auprcs)) if valid_auprcs else 0.0
     macro_brier = float(np.mean(valid_briers)) if valid_briers else 0.0
 
@@ -437,6 +457,7 @@ def main() -> None:
             "mean_auroc": macro_auc,
             "mean_auroc_95_ci": f"{macro_auc:.4f} ({macro_auc_ci[0]:.4f}–{macro_auc_ci[1]:.4f})",
             "mean_f1": macro_f1,
+            "mean_f1_threshold_0_5": macro_f1_05,
             "mean_auprc": macro_auprc,
             "mean_brier": macro_brier,
         },

@@ -198,6 +198,8 @@ def run_evaluation_stage(
         valid_aucs = []
         valid_auprcs = []
         valid_f1s = []
+        valid_f1s_05 = []
+        valid_briers = []
 
         for idx, label in enumerate(labels):
             v_idx = np.where(masks_arr[:, idx] > 0.5)[0]
@@ -205,6 +207,7 @@ def run_evaluation_stage(
             y_p = probs_arr[v_idx, idx]
             th = avg_thresholds[label]
             y_pred = (y_p >= th).astype(int)
+            y_pred_05 = (y_p >= 0.5).astype(int)
 
             if len(np.unique(y_t)) > 1:
                 auc_pt = float(roc_auc_score(y_t, y_p))
@@ -217,10 +220,22 @@ def run_evaluation_stage(
             tn, fp, fn, tp = confusion_matrix(y_t, y_pred, labels=[0, 1]).ravel()
             sens = float(tp / max(1, tp + fn))
             spec = float(tn / max(1, tn + fp))
+            ppv = float(tp / max(1, tp + fp))
+            npv = float(tn / max(1, tn + fn))
             f1 = float(f1_score(y_t, y_pred, zero_division=0))
             brier = float(brier_score_loss(y_t, y_p))
             ece = compute_expected_calibration_error(y_t, y_p, n_bins=15)
+
+            tn05, fp05, fn05, tp05 = confusion_matrix(y_t, y_pred_05, labels=[0, 1]).ravel()
+            sens05 = float(tp05 / max(1, tp05 + fn05))
+            spec05 = float(tn05 / max(1, tn05 + fp05))
+            ppv05 = float(tp05 / max(1, tp05 + fp05))
+            npv05 = float(tn05 / max(1, tn05 + fn05))
+            f1_05 = float(f1_score(y_t, y_pred_05, zero_division=0))
+
             valid_f1s.append(f1)
+            valid_f1s_05.append(f1_05)
+            valid_briers.append(brier)
 
             auc_ci = ci_results.get(label, {}).get("auroc", (0.0, 0.0))
             label_metrics[label] = {
@@ -231,10 +246,25 @@ def run_evaluation_stage(
                 "auprc": auprc_pt,
                 "sensitivity": sens,
                 "specificity": spec,
+                "ppv": ppv,
+                "npv": npv,
                 "f1_score": f1,
                 "brier_score": brier,
                 "ece_15bins": ece,
                 "threshold": th,
+                "confusion_matrix": {"tp": int(tp), "fp": int(fp), "tn": int(tn), "fn": int(fn)},
+                "sensitivity_analysis_threshold_0_5": {
+                    "threshold": 0.5,
+                    "sensitivity": sens05,
+                    "specificity": spec05,
+                    "ppv": ppv05,
+                    "npv": npv05,
+                    "f1_score": f1_05,
+                    "confusion_matrix": {"tp": int(tp05), "fp": int(fp05), "tn": int(tn05), "fn": int(fn05)},
+                },
+                "sample_count": len(v_idx),
+                "positive_count": int(tp + fn),
+                "negative_count": int(tn + fp),
             }
 
         macro_auc = float(np.mean(valid_aucs)) if valid_aucs else 0.0
@@ -245,6 +275,8 @@ def run_evaluation_stage(
             "macro_auroc_95_ci": f"{macro_auc:.4f} ({macro_ci[0]:.4f}–{macro_ci[1]:.4f})",
             "macro_auprc": float(np.mean(valid_auprcs)) if valid_auprcs else 0.0,
             "macro_f1": float(np.mean(valid_f1s)) if valid_f1s else 0.0,
+            "macro_f1_threshold_0_5": float(np.mean(valid_f1s_05)) if valid_f1s_05 else 0.0,
+            "macro_brier": float(np.mean(valid_briers)) if valid_briers else 0.0,
             "metrics_per_label": label_metrics,
             "predictions_csv": str(ens_csv.relative_to(PROJECT_ROOT) if ens_csv.is_relative_to(PROJECT_ROOT) else ens_csv),
             "predictions_sha256": compute_file_sha256(ens_csv),
